@@ -79,7 +79,7 @@ alone reported 4 MB for a compile that really held 1793 MB.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/tsc-queue.git
+git clone https://github.com/SpoBo/tsc-queue.git
 cd tsc-queue
 ./install.sh ~/code/my-monorepo
 ```
