@@ -1,4 +1,8 @@
-# tsc-queue settings. Copy to ~/.config/tsc-queue.conf and edit.
+# tsc-queue settings.
+#
+# This file is a TEMPLATE. The installer copies it to ~/.config/tsc-queue.conf
+# on the first install and never touches it again, so edit the copy, not this
+# file. Your live settings never enter the repository.
 #
 # Change a value and the next tsc run picks it up. No reinstall is needed,
 # except after a change to ROOTS or SCAN: run `tsc-queue install` then.
@@ -8,13 +12,30 @@
 # them in your shell looks like it works and silently does nothing.
 
 # ---------------------------------------------------------------- scope ----
-# Individual checkouts to manage. Space separated.
-TSC_QUEUE_ROOTS="$HOME/code/my-monorepo"
+# Which directories tsc-queue is allowed to patch. Nothing outside them is ever
+# read or written, so no other project's compiler is touched.
+#
+# Two knobs. Use either, or both. Both take a space separated list.
 
-# Directories whose immediate children are checkouts. Every child holding a
-# package.json or a .git is managed. Use this for a worktree parent directory:
-# a worktree created a second ago is then covered with no extra step.
-TSC_QUEUE_SCAN=""
+# ROOTS names each checkout exactly. Use it for a repository you keep in one
+# place.
+TSC_QUEUE_ROOTS="$HOME/code/my-monorepo $HOME/code/other-repo"
+
+# SCAN names a PARENT directory. Every immediate child holding a package.json
+# or a .git is managed. Use it for a directory full of git worktrees: a
+# worktree created a second ago is covered with no extra step.
+TSC_QUEUE_SCAN="$HOME/worktrees"
+
+# After a change here:
+#   tsc-queue install    wrap the new set and update the launchd watcher
+#   tsc-queue doctor     list what is covered now
+#
+# TRAP: narrow the scope in this order, or you strand the shims. The tool only
+# walks the directories it currently manages, so a directory you delete from
+# these lines can no longer be found and stays wrapped forever.
+#   1. tsc-queue uninstall   restores every compiler in the CURRENT scope
+#   2. edit these lines
+#   3. tsc-queue install
 
 # ----------------------------------------------------------- admission ----
 # A CEILING, not a target. Memory decides how many really run below it.
@@ -35,10 +56,11 @@ TSC_QUEUE_HIST_KEEP=10    # how many past runs feed the memory prediction
 # Seconds between launchd safety sweeps that re-wrap a restored compiler.
 # TSC_QUEUE_REPAIR_EVERY=30
 
-# Where a compiler is found inside a checkout, one glob per line. The default
-# covers npm, pnpm, yarn and bun, and both the JavaScript entry point and the
-# native Go compiler. Set this only if your layout is unusual, for example a
-# monorepo that keeps a copy of typescript inside every package.
+# WHERE INSIDE a checkout a compiler is found, one glob per line. This is not
+# the scope knob; ROOTS and SCAN above decide which directories are patched.
+# The default covers npm, pnpm, yarn and bun, and both the JavaScript entry
+# point and the native Go compiler. Set this only for an unusual layout, such
+# as a monorepo that keeps a copy of typescript inside every package.
 # TSC_QUEUE_GLOBS='
 # node_modules/typescript/bin/tsc
 # packages/*/node_modules/typescript/bin/tsc

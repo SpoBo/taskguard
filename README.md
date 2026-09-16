@@ -123,8 +123,10 @@ Set `TSC_QUEUE_DISABLE=1` to bypass the queue for one command.
 
 ## Configuration
 
-All settings live in `~/.config/tsc-queue.conf`. See
-[`tsc-queue.conf.example`](tsc-queue.conf.example) for the full list.
+All settings live in `~/.config/tsc-queue.conf`. The repository ships
+[`tsc-queue.conf.example`](tsc-queue.conf.example) as a template. The installer
+copies it on the first install and never touches it again, so your live
+settings stay off the repository.
 
 ```sh
 TSC_QUEUE_ROOTS="$HOME/code/my-monorepo"   # checkouts to manage
@@ -138,6 +140,27 @@ TSC_QUEUE_ASSUME_MB=1500                   # guess for a project with no history
 turbo runs its tasks in a strict environment mode and drops every
 `TSC_QUEUE_*` variable. Exporting them looks like it works and silently does
 nothing. The shim reads the file from disk on every call.
+
+### Which directories get patched
+
+`TSC_QUEUE_ROOTS` names each checkout exactly. `TSC_QUEUE_SCAN` names a parent
+directory, and every immediate child holding a `package.json` or a `.git` is
+managed. Use `SCAN` for a directory full of git worktrees: a worktree created a
+second ago is covered with no extra step. Both take a space separated list, and
+you can set both.
+
+Run `tsc-queue install` after a change, then `tsc-queue doctor` to see what is
+covered.
+
+**Narrow the scope in the right order.** The tool only walks the directories it
+currently manages, so a directory you delete from the config can no longer be
+found and stays wrapped forever.
+
+```sh
+tsc-queue uninstall    # restores every compiler in the CURRENT scope
+# now edit the config
+tsc-queue install      # wraps the new scope
+```
 
 ## Where it hooks in
 

@@ -32,8 +32,12 @@ if [ -f "$CONF" ]; then
   say "kept your existing config at $CONF"
 else
   cp "$SRC/tsc-queue.conf.example" "$CONF"
-  # An example path helps nobody as a live default, so start with no scope.
-  /usr/bin/sed -i '' 's|^TSC_QUEUE_ROOTS=.*|TSC_QUEUE_ROOTS=""|' "$CONF"
+  # The template's paths are illustrations. Patching a directory the user never
+  # chose is exactly what this tool must not do, so a fresh config has no scope.
+  /usr/bin/sed -i '' \
+    -e 's|^TSC_QUEUE_ROOTS=.*|TSC_QUEUE_ROOTS=""|' \
+    -e 's|^TSC_QUEUE_SCAN=.*|TSC_QUEUE_SCAN=""|' \
+    "$CONF"
   say "wrote a starter config at $CONF"
 fi
 
