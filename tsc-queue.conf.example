@@ -1,0 +1,48 @@
+# tsc-queue settings. Copy to ~/.config/tsc-queue.conf and edit.
+#
+# Change a value and the next tsc run picks it up. No reinstall is needed,
+# except after a change to ROOTS or SCAN: run `tsc-queue install` then.
+#
+# These settings must live in this file. A task runner such as turbo runs in a
+# strict environment mode and drops every TSC_QUEUE_* variable, so exporting
+# them in your shell looks like it works and silently does nothing.
+
+# ---------------------------------------------------------------- scope ----
+# Individual checkouts to manage. Space separated.
+TSC_QUEUE_ROOTS="$HOME/code/my-monorepo"
+
+# Directories whose immediate children are checkouts. Every child holding a
+# package.json or a .git is managed. Use this for a worktree parent directory:
+# a worktree created a second ago is then covered with no extra step.
+TSC_QUEUE_SCAN=""
+
+# ----------------------------------------------------------- admission ----
+# A CEILING, not a target. Memory decides how many really run below it.
+TSC_QUEUE_MAX_SLOTS=6
+
+# The real limiter. A compile starts only when
+#   memory in use
+# + what the running compiles still have to grow into (peak so far minus what they hold now)
+# + this compile's own predicted peak
+# stays under this percent of RAM. One 20 GB job therefore runs alone.
+TSC_QUEUE_MEM_MAX=85
+
+TSC_QUEUE_ASSUME_MB=1500  # memory guess for a project with no history yet
+TSC_QUEUE_STATUS_EVERY=15 # seconds between "still waiting" lines
+TSC_QUEUE_HIST_KEEP=10    # how many past runs feed the memory prediction
+
+# ------------------------------------------------------------ advanced ----
+# Seconds between launchd safety sweeps that re-wrap a restored compiler.
+# TSC_QUEUE_REPAIR_EVERY=30
+
+# Where a compiler is found inside a checkout, one glob per line. The default
+# covers npm, pnpm, yarn and bun, and both the JavaScript entry point and the
+# native Go compiler. Set this only if your layout is unusual, for example a
+# monorepo that keeps a copy of typescript inside every package.
+# TSC_QUEUE_GLOBS='
+# node_modules/typescript/bin/tsc
+# packages/*/node_modules/typescript/bin/tsc
+# '
+
+# Reverse-DNS prefix for the two launchd job labels.
+# TSC_QUEUE_LABEL_PREFIX=io.github.tsc-queue

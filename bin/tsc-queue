@@ -1,0 +1,898 @@
+#!/bin/bash
+# tsc-queue - a machine-wide admission queue for real tsc compile runs.
+#
+# One task runner task starts exactly one tsc process, and a task runner only
+# caps tasks inside a single run. Several checkouts compiling at once therefore
+# have no shared ceiling. This wrapper gives every heavy tsc invocation on the
+# machine one queue: a run waits for a free slot, and it also waits until the
+# machine has room for the amount of memory that this exact project needed on
+# its past runs.
+#
+# Light invocations (--version, --help, --init, --showConfig) never queue.
+# Watch mode never queues, because it would hold a slot forever.
+#
+# macOS only. The memory readings use vm_stat, sysctl and /usr/bin/footprint,
+# and the background jobs use launchd.
+#
+# Install with:  tsc-queue install
+# Inspect with:  tsc-queue status | tsc-queue history | tsc-queue doctor
+
+set -u
+
+VERSION="1.0.0"
+
+QDIR="${TSC_QUEUE_DIR:-$HOME/.cache/tsc-queue}"
+LOCK="$QDIR/lock.d"
+WAITD="$QDIR/wait"
+RUND="$QDIR/run"
+SEQF="$QDIR/seq"
+HIST="$QDIR/history.tsv"
+
+# The absolute path of this script, with every symlink resolved. The shims and
+# the launchd jobs are written with this path baked in, so the tool keeps
+# working wherever it was installed.
+self_path() {
+  local s="${BASH_SOURCE[0]}" d
+  while [ -L "$s" ]; do
+    d="$(cd -P "$(dirname "$s")" && pwd)"
+    s="$(readlink "$s")"
+    case "$s" in /*) ;; *) s="$d/$s" ;; esac
+  done
+  printf '%s/%s\n' "$(cd -P "$(dirname "$s")" && pwd)" "$(basename "$s")"
+}
+SELF="$(self_path)"
+
+# Settings come from the config file first, then the environment overrides it.
+# A file is used because a run started by launchd, an editor, or a task runner
+# does not always inherit a login shell's exported variables. Turbo, for one,
+# drops every TSC_QUEUE_* variable: its default env mode is strict.
+CONF="${TSC_QUEUE_CONF:-$HOME/.config/tsc-queue.conf}"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# Only these checkouts are ever touched. Nothing outside them is read or
+# written. This is what keeps the wrapper scoped to the projects you name and
+# away from every other project on the machine.
+#
+# ROOTS is a space separated list of individual checkouts.
+# SCAN is a space separated list of directories whose immediate children are
+# checkouts. Everything under those is picked up automatically, so a worktree
+# created a second ago is covered without asking git anything - which also
+# means this works under launchd's bare PATH.
+ROOTS="${TSC_QUEUE_ROOTS:-}"
+SCAN="${TSC_QUEUE_SCAN:-}"
+
+# Where a compiler binary is found inside a checkout. One glob per line,
+# relative to the checkout. Covers npm, pnpm, yarn and bun layouts, and both
+# the JavaScript entry point and the native Go compiler.
+DEFAULT_GLOBS='
+node_modules/typescript/bin/tsc
+node_modules/.pnpm/typescript@*/node_modules/typescript/bin/tsc
+node_modules/.bun/typescript@*/node_modules/typescript/bin/tsc
+node_modules/@typescript/typescript-darwin-*/lib/tsc
+node_modules/.pnpm/@typescript+typescript-darwin-*@*/node_modules/@typescript/typescript-darwin-*/lib/tsc
+node_modules/.bun/@typescript+typescript-darwin-*@*/node_modules/@typescript/typescript-darwin-*/lib/tsc
+'
+GLOBS="${TSC_QUEUE_GLOBS:-$DEFAULT_GLOBS}"
+
+# A hard ceiling, not a target. Memory is the real limiter below it: small
+# packages run many at a time, one memory-hungry package runs alone.
+MAX_SLOTS="${TSC_QUEUE_MAX_SLOTS:-6}"
+MEM_MAX="${TSC_QUEUE_MEM_MAX:-85}"       # percent of RAM that must not be exceeded
+ASSUME_MB="${TSC_QUEUE_ASSUME_MB:-1500}" # guess for a project with no history yet
+STATUS_EVERY="${TSC_QUEUE_STATUS_EVERY:-15}"
+HIST_KEEP="${TSC_QUEUE_HIST_KEEP:-10}"   # how many past runs feed the prediction
+# Waiters are idle, so polling fast costs nothing but a cheap mkdir, and it is
+# what lets the pool fill quickly when many short compiles arrive at once.
+POLL="${TSC_QUEUE_POLL:-0.1}"
+# Seconds between physical-footprint readings of a running compile.
+FOOTPRINT_EVERY="${TSC_QUEUE_FOOTPRINT_EVERY:-2}"
+# Seconds between safety sweeps of the launchd repair job.
+REPAIR_EVERY="${TSC_QUEUE_REPAIR_EVERY:-30}"
+
+# The saved original sits next to the shim under this name. It must add no file
+# extension: the JavaScript entry point is loaded by node, node picks its loader
+# from the extension, and a name such as "tsc.real" makes every call fail with
+# ERR_UNKNOWN_FILE_EXTENSION. The native Go compiler does not care, so the fault
+# only shows on npm, pnpm and yarn layouts.
+REAL_SUFFIX="-real"
+
+LABEL_PREFIX="${TSC_QUEUE_LABEL_PREFIX:-io.github.tsc-queue}"
+WATCH_LABEL="$LABEL_PREFIX.watch"
+REPAIR_LABEL="$LABEL_PREFIX.repair"
+WATCH_PLIST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
+REPAIR_PLIST="$HOME/Library/LaunchAgents/$REPAIR_LABEL.plist"
+
+mkdir -p "$WAITD" "$RUND" 2>/dev/null
+[ -f "$SEQF" ] || echo 0 > "$SEQF" 2>/dev/null
+[ -f "$HIST" ] || : > "$HIST" 2>/dev/null
+
+say() { printf '[tsc-queue] %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- memory ----
+# Held memory is active + wired + compressor, over hw.memsize. That is the same
+# sum Activity Monitor calls memory used.
+mem_total_kb() { echo $(( $(sysctl -n hw.memsize) / 1024 )); }
+
+# Resident size is NOT what a compile costs. macOS compresses a process's pages
+# under pressure, so `ps -o rss=` fell to 4 GB while the same tsc really held
+# 21 GB - which is the number Activity Monitor shows. Physical footprint counts
+# the compressed pages too, and /usr/bin/footprint reports it in about 120 ms.
+one_footprint_kb() {
+  /usr/bin/footprint "$1" 2>/dev/null | awk '
+    /phys_footprint:/ {
+      v=$2; u=$3
+      if (u=="B")       v=v/1024
+      else if (u=="MB") v=v*1024
+      else if (u=="GB") v=v*1024*1024
+      else if (u=="TB") v=v*1024*1024*1024
+      printf "%d", v; exit
+    }'
+}
+
+# Every descendant of a pid, that pid included. The compiler is not always the
+# process the shim starts: the JavaScript entry point is a node process that
+# spawns the native compiler, and the memory lives in the grandchild.
+descendants() {
+  /bin/ps -Ao pid=,ppid= 2>/dev/null | awk -v r="$1" '
+    { kids[$2] = kids[$2] " " $1 }
+    END {
+      n = 1; stack[1] = r; print r
+      while (n > 0) {
+        p = stack[n--]; m = split(kids[p], a, " ")
+        for (i = 1; i <= m; i++) if (a[i] != "") { print a[i]; stack[++n] = a[i] }
+      }
+    }'
+}
+
+# What the whole compile costs, summed over its process tree.
+footprint_kb() {
+  local p v total=0
+  for p in $(descendants "$1"); do
+    v="$(one_footprint_kb "$p")"
+    case "${v:-}" in ''|*[!0-9]*) v=0 ;; esac
+    total=$(( total + v ))
+  done
+  echo "$total"
+}
+
+mem_used_kb() {
+  vm_stat 2>/dev/null | awk '
+    /page size of/ { for (i=1;i<=NF;i++) if ($i=="of") { ps=$(i+1); break } }
+    /^Pages active/                  { a=$3 }
+    /^Pages wired down/              { w=$4 }
+    /^Pages occupied by compressor/  { c=$5 }
+    END {
+      gsub(/\./,"",a); gsub(/\./,"",w); gsub(/\./,"",c)
+      if (ps=="" || ps==0) ps=16384
+      printf "%d", (a+w+c)*ps/1024
+    }'
+}
+
+mem_used_pct() {
+  vm_stat 2>/dev/null | awk '
+    /page size of/ { for (i=1;i<=NF;i++) if ($i=="of") { ps=$(i+1); break } }
+    /^Pages active/                  { a=$3 }
+    /^Pages wired down/              { w=$4 }
+    /^Pages occupied by compressor/  { c=$5 }
+    END {
+      gsub(/\./,"",a); gsub(/\./,"",w); gsub(/\./,"",c)
+      if (ps=="" || ps==0) ps=16384
+      print (a+w+c)*ps
+    }' | {
+      read -r used_bytes
+      total=$(sysctl -n hw.memsize)
+      [ -z "${used_bytes:-}" ] && used_bytes=0
+      echo $(( used_bytes * 100 / total ))
+    }
+}
+
+# Memory the running compiles have not claimed yet. A compile sitting at 2 GB
+# whose history says it peaks at 20 GB still has 18 GB to take, and that has to
+# be reserved now. Without this the queue admits a second job into space the
+# first one is about to eat.
+reserve_kb() {
+  local f pred live want total=0
+  for f in "$RUND"/*; do
+    [ -e "$f" ] || continue
+    IFS=$'\t' read -r _k _s pred _l live < "$f"
+    case "${live:-}" in ''|*[!0-9]*) live=0 ;; esac
+    want=$(( ${pred:-0} - live ))
+    [ "$want" -gt 0 ] && total=$(( total + want ))
+  done
+  echo "$total"
+}
+
+# ------------------------------------------------------------------ lock ----
+lock() {
+  local tries=0 ts now
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    # A lock older than 30s belongs to a process that died holding it. The age
+    # is stamped inside the lock rather than read with stat: `stat` is GNU
+    # coreutils on some machines and BSD on others, the flags mean opposite
+    # things, and the GNU output fed into an arithmetic expression kills the
+    # script under `set -u`.
+    ts=$(cat "$LOCK/ts" 2>/dev/null || echo 0)
+    case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+    now=$(date +%s)
+    [ "$ts" -gt 0 ] && [ "$(( now - ts ))" -gt 30 ] && rm -rf "$LOCK" 2>/dev/null
+    tries=$((tries+1))
+    [ "$tries" -gt 600 ] && return 1
+    sleep 0.05
+  done
+  date +%s > "$LOCK/ts" 2>/dev/null
+  return 0
+}
+unlock() { rm -rf "$LOCK" 2>/dev/null; }
+
+alive() { kill -0 "$1" 2>/dev/null; }   # `ps -p` can print a full listing and always "succeed"
+
+# Drop wait and run entries whose owning process is gone. This is what reclaims a
+# slot when a run is killed, so a Ctrl-C never wedges the queue.
+reap() {
+  local f pid
+  for f in "$RUND"/* "$WAITD"/*; do
+    [ -e "$f" ] || continue
+    pid="${f##*/}"; pid="${pid##*.}"
+    alive "$pid" || rm -f "$f"
+  done
+}
+
+count_run() { local n=0 f; for f in "$RUND"/*; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+count_wait() { local n=0 f; for f in "$WAITD"/*; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+
+# Rank of my ticket among the live waiters, 1 = next to go.
+my_position() {
+  local mine="$1" pos=1 f t
+  for f in "$WAITD"/*; do
+    [ -e "$f" ] || continue
+    t="${f##*/}"; t="${t%%.*}"
+    [ "$t" -lt "$mine" ] 2>/dev/null && pos=$((pos+1))
+  done
+  echo "$pos"
+}
+
+# --------------------------------------------------------------- history ----
+# Predicted peak for this project: the largest of its last N recorded runs, so a
+# project that once needed 4 GB is not released into a machine with 1 GB spare.
+predict_kb() {
+  local key="$1" v
+  v=$(grep -F "	$key	" "$HIST" 2>/dev/null | tail -n "$HIST_KEEP" | awk -F'\t' '{if($3>m)m=$3} END{print m+0}')
+  if [ -z "$v" ] || [ "$v" -eq 0 ] 2>/dev/null; then
+    echo $(( ASSUME_MB * 1024 )); return
+  fi
+  echo "$v"
+}
+history_count() { grep -cF "	$1	" "$HIST" 2>/dev/null | head -1; }
+
+record() { # key peakKB seconds exit
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$2" "$3" "$4" >> "$HIST" 2>/dev/null
+}
+
+mb() { echo $(( $1 / 1024 )); }
+
+# ------------------------------------------------------------------ keys ----
+repo_root() {
+  local d="$PWD"
+  while [ "$d" != "/" ]; do
+    # .git is a directory in the main checkout and a file in a linked worktree
+    [ -e "$d/.git" ] && { echo "$d"; return; }
+    d="$(dirname "$d")"
+  done
+  echo "$PWD"
+}
+
+# The key is the project path relative to the checkout root, so the same package
+# shares one memory history across every worktree of the repository. Walking up
+# to `.git` is deliberate: many packages own a task runner config file, and
+# stopping at the nearest one collapsed every key to "root".
+make_key() {
+  local proj="$1" root abs rel
+  root="$(repo_root)"
+  abs="$(cd "$proj" 2>/dev/null && pwd)" || abs="$PWD/$proj"
+  case "$abs" in
+    "$root") rel="root" ;;
+    "$root"/*) rel="${abs#"$root"/}" ;;
+    *) rel="$(basename "$abs")" ;;
+  esac
+  echo "$rel" | tr '/ ' '__'
+}
+
+# ------------------------------------------------------------- classify ----
+# Only a real compile is worth queueing. Version, help, init and config dumps
+# finish in milliseconds and must never wait behind a 90 second build. Some
+# repositories fire hundreds of `tsc --showConfig` probes in one task; counting
+# those as compiles makes a correct queue look broken.
+needs_queue() {
+  [ "$#" -eq 0 ] && return 1
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --version|-v|--help|-h|-\?|--init|--showConfig|--listFilesOnly) return 1 ;;
+      --watch|-w) return 1 ;;   # long-lived: would hold a slot for hours
+    esac
+  done
+  return 0
+}
+
+project_of() {
+  local prev="" a
+  for a in "$@"; do
+    case "$a" in --project=*) echo "${a#--project=}"; return ;; esac
+    { [ "$prev" = "-p" ] || [ "$prev" = "--project" ]; } && { echo "$a"; return; }
+    prev="$a"
+  done
+  echo "."
+}
+
+# ------------------------------------------------------------------ exec ----
+cmd_exec() {
+  local real="$1"; shift
+  [ -n "${TSC_QUEUE_TRACE:-}" ] && echo "$(date +%s) ENTER pid=$$ args=$*" >> "$TSC_QUEUE_TRACE"
+  [ -x "$real" ] || { echo "tsc-queue: real tsc missing at $real" >&2; exit 127; }
+
+  # A slot held by an ancestor covers this call too. The JavaScript entry point
+  # is a node process that spawns the native compiler, and both are wrapped, so
+  # one invocation would otherwise take two slots. At the slot ceiling that
+  # deadlocks: every slot is held by an outer shim waiting on an inner one that
+  # can never be admitted.
+  if [ "${TSC_QUEUE_DISABLE:-0}" = "1" ] || [ "${TSC_QUEUE_HELD:-0}" = "1" ] || ! needs_queue "$@"; then
+    exec "$real" "$@"
+  fi
+
+  local proj key label pred predmb total_kb
+  proj="$(project_of "$@")"
+  key="$(make_key "$proj")"
+  label="$key"
+  pred="$(predict_kb "$key")"
+  predmb="$(mb "$pred")"
+  total_kb="$(mem_total_kb)"
+  local pred_pct=$(( pred * 100 / total_kb )) reserve=0 used_kb=0 projected=0 why=""
+  local hc; hc="$(history_count "$key")"
+
+  # ---- take a ticket
+  local ticket mypid wf
+  mypid=$$
+  lock || { say "lock stuck, running without a slot"; exec "$real" "$@"; }
+  ticket=$(( $(cat "$SEQF" 2>/dev/null || echo 0) + 1 ))
+  echo "$ticket" > "$SEQF"
+  wf="$WAITD/$ticket.$mypid"
+  printf '%s\t%s\t%s\n' "$key" "$(date +%s)" "$label" > "$wf"
+  unlock
+
+  local rf="$RUND/$mypid"
+  cleanup() { rm -f "$wf" "$rf" 2>/dev/null; }
+  child=""
+  # shellcheck disable=SC2329  # invoked by trap
+  on_signal() { [ -n "$child" ] && kill -TERM "$child" 2>/dev/null; cleanup; exit 130; }
+  trap on_signal INT TERM HUP
+  trap cleanup EXIT
+
+  # ---- wait for a slot and for room in memory
+  local t0 waited=0 last=0 admitted=0 pos=1 running=0 waiting=1
+  t0=$(date +%s)
+  if [ "$hc" -gt 0 ]; then
+    say "queued: $label - past runs peaked at ${predmb} MB (${hc} recorded)"
+  else
+    say "queued: $label - no history yet, assuming ${predmb} MB"
+  fi
+
+  while [ "$admitted" -eq 0 ]; do
+    if lock; then
+      reap
+      running="$(count_run)"; waiting="$(count_wait)"
+      pos="$(my_position "$ticket")"
+      # Slots are a ceiling; memory decides everything below it. The gate adds
+      # three things: what the machine holds now, what the running compiles have
+      # still to grow into, and what this one is predicted to need.
+      local ok=0
+      if [ "$pos" -eq 1 ] && [ "$running" -lt "$MAX_SLOTS" ]; then
+        if [ "$running" -eq 0 ]; then
+          ok=1; why="first in line"          # always make progress, whatever memory says
+        else
+          reserve="$(reserve_kb)"
+          used_kb="$(mem_used_kb)"
+          projected=$(( (used_kb + reserve + pred) * 100 / total_kb ))
+          [ "$projected" -le "$MEM_MAX" ] && { ok=1; why="${projected}% projected"; }
+        fi
+      fi
+      if [ "$ok" -eq 1 ]; then
+        printf '%s\t%s\t%s\t%s\t0\n' "$key" "$(date +%s)" "$pred" "$label" > "$rf"
+        rm -f "$wf"
+        admitted=1
+        [ -n "${TSC_QUEUE_TRACE:-}" ] && echo "$(date +%s) ADMIT pid=$mypid saw_running=$running max=$MAX_SLOTS label=$label" >> "$TSC_QUEUE_TRACE"
+      fi
+      unlock
+    fi
+    [ "$admitted" -eq 1 ] && break
+
+    waited=$(( $(date +%s) - t0 ))
+    if [ $(( waited - last )) -ge "$STATUS_EVERY" ]; then
+      last="$waited"
+      if [ "$running" -ge "$MAX_SLOTS" ]; then
+        say "waiting ${waited}s: position $pos of $waiting, at the $MAX_SLOTS slot ceiling"
+      elif [ "$pos" -ne 1 ]; then
+        say "waiting ${waited}s: position $pos of $waiting"
+      else
+        say "waiting ${waited}s: position $pos of $waiting, memory-limited - $(( used_kb * 100 / total_kb ))% in use + $(( reserve * 100 / total_kb ))% still to be taken by the $running running + ${pred_pct}% for me = ${projected}%, over the ${MEM_MAX}% limit"
+      fi
+    fi
+    sleep "$POLL"
+  done
+
+  waited=$(( $(date +%s) - t0 ))
+  say "start: $label - $(count_run) of max $MAX_SLOTS running, waited ${waited}s, $why"
+
+  # ---- run the real compiler and watch its peak memory
+  # The marker tells a nested shim that this invocation already holds a slot.
+  TSC_QUEUE_HELD=1 "$real" "$@" &
+  child=$!
+  local peak=0 fp=0 now_s last_fp=0 started_at
+  started_at=$(date +%s)
+  while alive "$child"; do
+    # Physical footprint is the honest number but costs ~120ms, so it is read
+    # every couple of seconds rather than every poll. It is written into the run
+    # file so the admission gate and `status` never have to measure anything.
+    now_s=$(date +%s)
+    if [ "$(( now_s - last_fp ))" -ge "$FOOTPRINT_EVERY" ]; then
+      last_fp="$now_s"
+      fp=$(footprint_kb "$child")
+      case "${fp:-}" in ''|*[!0-9]*) fp=0 ;; esac
+      [ "$fp" -gt "$peak" ] && peak="$fp"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$key" "$started_at" "$pred" "$label" "$fp" > "$rf" 2>/dev/null
+    fi
+    sleep "$POLL"
+  done
+  wait "$child"; local code=$?
+  child=""
+
+  local secs=$(( $(date +%s) - t0 - waited ))
+  record "$key" "$peak" "$secs" "$code"
+  [ -n "${TSC_QUEUE_TRACE:-}" ] && echo "$(date +%s) RELEASE pid=$mypid label=$label" >> "$TSC_QUEUE_TRACE"
+  cleanup
+  trap - EXIT INT TERM HUP
+  say "done: $label - ${secs}s, peak $(mb "$peak") MB, exit $code, slot free ($(count_wait) still queued)"
+  exit "$code"
+}
+
+# --------------------------------------------------------------- install ----
+globs_list() {
+  printf '%s\n' "$GLOBS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;/^$/d'
+}
+
+# Every checkout this tool manages: the named roots, plus every child of the
+# scanned directories that looks like a checkout.
+managed_worktrees() {
+  local r d
+  for r in $ROOTS; do
+    [ -d "$r" ] && echo "$r"
+  done
+  for r in $SCAN; do
+    [ -d "$r" ] || continue
+    for d in "$r"/*; do
+      [ -d "$d" ] || continue
+      [ -e "$d/package.json" ] || [ -e "$d/.git" ] || continue
+      echo "$d"
+    done
+  done
+}
+
+no_targets() {
+  [ -z "$(managed_worktrees)" ]
+}
+
+# A path is only ever modified if it sits inside a managed checkout. Belt and
+# braces: the glob below already starts from those checkouts.
+is_managed() {
+  local w
+  for w in $(managed_worktrees); do
+    case "$1" in "$w"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# The path with every symlinked directory resolved. A package manager reaches
+# one compiler through several names: node_modules/typescript is a symlink into
+# the package store, so two globs find the same file. Each name would bake its
+# own path into the shim and overwrite the other's, and the two would then
+# rewrite each other on every repair sweep, forever.
+resolve_path() {
+  local d
+  d="$(cd -P "$(dirname "$1")" 2>/dev/null && pwd)" || return 1
+  printf '%s/%s\n' "$d" "$(basename "$1")"
+}
+
+# Every distinct compiler inside one checkout.
+worktree_binaries() {
+  local g b
+  while read -r g; do
+    for b in "$1"/$g; do
+      [ -f "$b" ] || continue
+      case "$b" in *"$REAL_SUFFIX") continue ;; esac
+      resolve_path "$b"
+    done
+  done < <(globs_list) | sort -u
+}
+
+real_binaries() {
+  local w
+  for w in $(managed_worktrees); do
+    worktree_binaries "$w"
+  done | sort -u
+}
+
+is_shim() { head -3 "$1" 2>/dev/null | grep -q 'tsc-queue'; }
+
+# The genuine compiler: either the native Go binary or the JavaScript entry
+# point, but never our own shim.
+is_real_binary() {
+  [ -f "$1" ] || return 1
+  is_shim "$1" && return 1
+  case "$(file -b "$1" 2>/dev/null)" in *Mach-O*) return 0 ;; esac
+  [ "$(head -c 2 "$1" 2>/dev/null)" = '#!' ] && return 0
+  return 1
+}
+
+shim_text() {
+  cat <<SHIM
+#!/bin/bash
+# installed by tsc-queue - machine-wide admission queue for tsc compiles
+Q="$SELF"
+R="$1"
+[ -x "\$Q" ] && exec "\$Q" exec "\$R" "\$@"
+exec "\$R" "\$@"
+SHIM
+}
+
+# Writes through a temp file and rename. bash reads a script as it runs, so
+# overwriting a shim in place could corrupt a compile that is running right now;
+# rename swaps the inode instead and leaves the running process on the old one.
+write_shim() {
+  local target="$1" real="$2" tmp
+  tmp="$target.tsc-queue.tmp.$$"
+  shim_text "$real" > "$tmp" || return 1
+  chmod +x "$tmp"
+  mv -f "$tmp" "$target"
+}
+
+cmd_install() {
+  local quiet=0; [ "${1:-}" = "--quiet" ] && quiet=1
+  if no_targets; then
+    [ "$quiet" -eq 1 ] && return 0
+    say "no checkouts configured. Set TSC_QUEUE_ROOTS or TSC_QUEUE_SCAN in $CONF"
+    return 1
+  fi
+  local b real n=0 kept=0 skipped=0
+  for b in $(real_binaries); do
+    is_managed "$b" || { skipped=$((skipped+1)); continue; }
+    real="$b$REAL_SUFFIX"
+    # One-time migration from the older ".real" name. That name broke the
+    # JavaScript entry point: node picks its loader from the file extension and
+    # does not know ".real", so every call died with ERR_UNKNOWN_FILE_EXTENSION.
+    # A rename keeps the inode, so a compile running right now is not disturbed.
+    [ -e "$b.real" ] && [ ! -e "$real" ] && mv -f "$b.real" "$real"
+    if is_shim "$b"; then
+      # already ours: only rewrite when the text actually changed
+      if [ -e "$real" ] && shim_text "$real" | cmp -s - "$b"; then
+        kept=$((kept+1)); continue
+      fi
+      [ -e "$real" ] || { skipped=$((skipped+1)); continue; }
+    elif [ -e "$real" ]; then
+      # This is exactly what a package install leaves behind: it restored the
+      # real compiler over our shim and our saved copy is now the stale one. The
+      # freshly installed binary is authoritative, so promote it and re-shim.
+      # Refusing here used to strand a checkout unprotected forever.
+      if is_real_binary "$b"; then
+        # Hardlink rather than move. A move leaves `tsc` missing for an instant,
+        # and anything invoking tsc in that window dies with "No such file".
+        # A hardlink gives the same inode a second name, and the shim then
+        # replaces the first name by atomic rename, so the path is never absent.
+        ln -f "$b" "$real" || { say "FAILED to link $b"; skipped=$((skipped+1)); continue; }
+      else
+        say "skip: $b is neither a shim nor a compiler"; skipped=$((skipped+1)); continue
+      fi
+    else
+      ln -f "$b" "$real" || { say "FAILED to link $b"; skipped=$((skipped+1)); continue; }
+    fi
+    write_shim "$b" "$real" && n=$((n+1))
+  done
+  if [ "$n" -gt 0 ] || [ "$quiet" -eq 0 ]; then
+    say "installed $n, already current $kept, skipped $skipped"
+  fi
+  cmd_watch >/dev/null 2>&1 || true   # keep the watched path list current
+  # A quiet no-op must still exit 0, or launchd records a failure every run.
+  return 0
+}
+
+cmd_uninstall() {
+  local b n=0
+  for b in $(real_binaries); do
+    is_managed "$b" || continue
+    # The legacy ".real" name is restored too, so an uninstall never strands a
+    # checkout that an older version wrapped.
+    for saved in "$b$REAL_SUFFIX" "$b.real"; do
+      is_shim "$b" && [ -e "$saved" ] || continue
+      mv -f "$saved" "$b" && n=$((n+1)) && break
+    done
+  done
+  say "removed from $n checkout binaries"
+}
+
+cmd_doctor() {
+  local b w state found
+  say "version $VERSION, script at $SELF"
+  say "config file:       $CONF"
+  say "managed checkouts: ${ROOTS:-(none)}"
+  say "scanned for more:  ${SCAN:-(none)}"
+  if no_targets; then
+    say "NOTHING IS MANAGED. Set TSC_QUEUE_ROOTS or TSC_QUEUE_SCAN in $CONF"
+    return 1
+  fi
+  printf '%-52s %s\n' "CHECKOUT" "TSC"
+  for w in $(managed_worktrees); do
+    state="no compiler found"
+    found=0
+    while read -r b; do
+      found=$((found+1))
+      if is_shim "$b"; then state="queued ($found)"; else state="NOT queued (run tsc-queue install)"; break; fi
+    done < <(worktree_binaries "$w")
+    printf '%-52s %s\n' "$(basename "$w")" "$state"
+  done
+  echo
+  say "max slots=$MAX_SLOTS memory limit=${MEM_MAX}% assume=${ASSUME_MB}MB queue dir=$QDIR"
+  if launchctl list 2>/dev/null | grep -q "$REPAIR_LABEL"; then
+    local iv
+    iv=$(plutil -extract StartInterval raw -o - "$REPAIR_PLIST" 2>/dev/null)
+    say "auto-repair: loaded (safety sweep every ${iv:-?}s)"
+  else
+    say "auto-repair: NOT loaded (run tsc-queue repair)"
+  fi
+  if launchctl list 2>/dev/null | grep -q "$WATCH_LABEL"; then
+    say "path watcher: loaded ($(watch_dirs | wc -l | tr -d ' ') paths, fires on change)"
+  else
+    say "path watcher: NOT loaded (run tsc-queue watch)"
+  fi
+}
+
+# ------------------------------------------------------------- launchd ----
+# Rewrites a job only when its text actually changed, so a sweep every half
+# minute does not churn launchd.
+load_plist() { # label plistpath tmppath
+  if [ -f "$2" ] && cmp -s "$3" "$2"; then
+    rm -f "$3"; return 1
+  fi
+  mkdir -p "$(dirname "$2")"
+  mv -f "$3" "$2"
+  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$2" 2>/dev/null
+  return 0
+}
+
+unload_plist() { # label plistpath
+  launchctl bootout "gui/$(id -u)/$1" 2>/dev/null
+  rm -f "$2"
+}
+
+# A git hook cannot do the watcher's job. `post-merge` fires when the merge
+# lands, which is BEFORE the session runs its package install, so it would
+# re-wrap and then be overwritten seconds later. The event that matters is the
+# compiler binary being replaced, so launchd watches those paths directly and
+# reacts in about a second.
+#
+# A brand-new checkout has no compiler yet, so there is nothing precise to
+# watch; the list therefore converges in steps:
+#   1. the scanned parent directory -> fires when a checkout appears
+#   2. a checkout's node_modules    -> fires when install starts creating it
+#   3. the package store directory  -> fires as install unpacks
+#   4. the compiler directory       -> fires when the binary is written
+# Each fire re-runs install, which rewrites this list one step deeper. launchd
+# throttles re-launching the same job to about 10 seconds, so a whole install
+# compressed into 3 seconds takes about 12 seconds to converge.
+watch_dirs() {
+  local r w b found
+  for r in $SCAN; do
+    [ -d "$r" ] && echo "$r"
+  done
+  for w in $(managed_worktrees); do
+    found=0
+    while read -r b; do
+      dirname "$b"; found=1
+    done < <(worktree_binaries "$w")
+    if [ "$found" -eq 0 ]; then
+      # not installed yet: watch the deepest level that already exists
+      for d in "$w/node_modules/.pnpm" "$w/node_modules/.bun" "$w/node_modules" "$w"; do
+        [ -d "$d" ] && { echo "$d"; break; }
+      done
+    fi
+  done | sort -u
+}
+
+cmd_watch() {
+  local dirs tmp
+  dirs="$(watch_dirs)"
+  [ -z "$dirs" ] && { say "no checkouts to watch"; return 0; }
+  tmp="$WATCH_PLIST.new"
+  mkdir -p "$(dirname "$WATCH_PLIST")"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$WATCH_LABEL</string>"
+    echo '  <key>ProgramArguments</key><array>'
+    echo "    <string>$SELF</string><string>install</string><string>--quiet</string>"
+    echo '  </array>'
+    echo '  <key>WatchPaths</key><array>'
+    echo "$dirs" | while read -r d; do [ -n "$d" ] && echo "    <string>$d</string>"; done
+    echo '  </array>'
+    echo '  <key>EnvironmentVariables</key><dict>'
+    echo '    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'
+    echo '  </dict>'
+    echo '  <key>ProcessType</key><string>Background</string>'
+    echo '  <key>LowPriorityIO</key><true/>'
+    echo "  <key>StandardOutPath</key><string>$QDIR/repair.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$QDIR/repair.log</string>"
+    echo '</dict></plist>'
+  } > "$tmp"
+  load_plist "$WATCH_LABEL" "$WATCH_PLIST" "$tmp" \
+    && say "watching $(echo "$dirs" | wc -l | tr -d ' ') compiler paths"
+  return 0
+}
+
+# The timed sweep is the net that also catches a brand-new checkout whose paths
+# the watcher does not know about yet.
+cmd_repair() {
+  local tmp="$REPAIR_PLIST.new"
+  mkdir -p "$(dirname "$REPAIR_PLIST")" "$QDIR"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$REPAIR_LABEL</string>"
+    echo '  <key>ProgramArguments</key><array>'
+    echo "    <string>$SELF</string><string>install</string><string>--quiet</string>"
+    echo '  </array>'
+    echo "  <key>StartInterval</key><integer>$REPAIR_EVERY</integer>"
+    echo '  <key>RunAtLoad</key><true/>'
+    echo '  <key>EnvironmentVariables</key><dict>'
+    echo '    <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'
+    echo '  </dict>'
+    echo '  <key>ProcessType</key><string>Background</string>'
+    echo '  <key>LowPriorityIO</key><true/>'
+    echo '  <key>Nice</key><integer>10</integer>'
+    echo "  <key>StandardOutPath</key><string>$QDIR/repair.log</string>"
+    echo "  <key>StandardErrorPath</key><string>$QDIR/repair.log</string>"
+    echo '</dict></plist>'
+  } > "$tmp"
+  load_plist "$REPAIR_LABEL" "$REPAIR_PLIST" "$tmp" \
+    && say "auto-repair every ${REPAIR_EVERY}s"
+  return 0
+}
+
+cmd_unload() {
+  unload_plist "$WATCH_LABEL" "$WATCH_PLIST"
+  unload_plist "$REPAIR_LABEL" "$REPAIR_PLIST"
+  say "background jobs stopped and removed"
+}
+
+# ---------------------------------------------------------------- report ----
+# One frame of the report. `--watch` just redraws this.
+status_once() {
+  lock && { reap; unlock; }
+  local f key started pred label live now total=0 nrun=0 nwait=0 snap res
+  now=$(date +%s)
+  # Resident size is only the part not squeezed into the compressor, so it is
+  # read alongside the footprint rather than instead of it.
+  snap="$QDIR/.ps"; /bin/ps -Ao ppid=,rss= > "$snap" 2>/dev/null
+
+  local tkb ukb respct usedpct
+  tkb=$(mem_total_kb); ukb=$(mem_used_kb); res=$(reserve_kb)
+  usedpct=$(( ukb * 100 / tkb )); respct=$(( res * 100 / tkb ))
+  printf 'memory %s%% of %s GB held, %s%% reserved for growth   limit %s%%   max slots %s\n' \
+    "$usedpct" "$(( tkb / 1024 / 1024 ))" "$respct" "$MEM_MAX" "$MAX_SLOTS"
+  echo
+  echo "RUNNING"
+  for f in "$RUND"/*; do
+    [ -e "$f" ] || { echo "  (nothing compiling)"; break; }
+    IFS=$'\t' read -r key started pred label live < "$f"
+    case "${live:-}" in ''|*[!0-9]*) live=0 ;; esac
+    local rss; rss=$(awk -v p="${f##*/}" '$1==p{s+=$2} END{print s+0}' "$snap")
+    total=$(( total + live )); nrun=$(( nrun + 1 ))
+    printf '  %-38s %4ss   wants %5s MB (%s MB resident)   predicted %5s MB\n' \
+      "${label:-$key}" "$(( now - ${started:-now} ))" "$(mb "$live")" "$(mb "$rss")" "$(mb "${pred:-0}")"
+  done
+  echo
+  echo "WAITING"
+  for f in "$WAITD"/*; do
+    [ -e "$f" ] || { echo "  (queue empty)"; break; }
+    IFS=$'\t' read -r key started label < "$f"
+    nwait=$(( nwait + 1 ))
+    printf '  %-38s %4ss in the queue\n' "${label:-$key}" "$(( now - ${started:-now} ))"
+  done
+  echo
+  printf '%s of max %s compiling, %s queued, %s MB wanted by them\n' "$nrun" "$MAX_SLOTS" "$nwait" "$(mb "$total")"
+  local nextpct=$(( (ukb + res + ASSUME_MB * 1024) * 100 / tkb ))
+  if [ "$nrun" -ge "$MAX_SLOTS" ]; then
+    echo "room for another: no - at the slot ceiling"
+  elif [ "$nrun" -eq 0 ]; then
+    echo "room for another: yes - nothing is running"
+  elif [ "$nextpct" -le "$MEM_MAX" ]; then
+    echo "room for another: yes - a typical job would land at ${nextpct}%"
+  else
+    echo "room for another: no - a typical job would land at ${nextpct}%, over ${MEM_MAX}%"
+  fi
+}
+
+cmd_status() {
+  local watch=0 interval=2 tty=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -w|--watch) watch=1 ;;
+      --interval=*) interval="${1#--interval=}" ;;
+      [0-9]*) interval="$1" ;;
+    esac
+    shift
+  done
+
+  if [ "$watch" -eq 0 ]; then status_once; return; fi
+
+  [ -t 1 ] && tty=1
+  # Restore the cursor whatever happens, including Ctrl-C.
+  cleanup_watch() { [ "$tty" = 1 ] && printf '\033[?25h'; echo; }
+  trap 'cleanup_watch; exit 0' INT TERM
+  trap cleanup_watch EXIT
+  [ "$tty" = 1 ] && printf '\033[?25l'
+
+  while :; do
+    # Home then clear to end of screen: redraws without the flicker of `clear`.
+    [ "$tty" = 1 ] && printf '\033[H\033[J'
+    printf 'tsc-queue   %s\n\n' "$(date '+%H:%M:%S')"
+    status_once
+    [ "$tty" = 1 ] && printf '\nrefreshing every %ss - Ctrl-C to stop\n' "$interval"
+    sleep "$interval"
+  done
+}
+
+cmd_history() {
+  printf '%-40s %5s %9s %9s\n' "project" "runs" "peak MB" "last MB"
+  awk -F'\t' '{k=$2; n[k]++; if($3>mx[k])mx[k]=$3; last[k]=$3}
+    END{for(k in n) printf "%-40s %5d %9d %9d\n", k, n[k], mx[k]/1024, last[k]/1024}' "$HIST" 2>/dev/null |
+    sort -k3 -rn | head -40
+}
+
+usage() {
+  cat >&2 <<USAGE
+tsc-queue $VERSION - a machine-wide admission queue for tsc compiles
+
+  tsc-queue install [--quiet]   wrap the compiler in every configured checkout
+  tsc-queue uninstall           put the original compiler back
+  tsc-queue repair              install the launchd job that re-wraps after an install
+  tsc-queue watch               install the launchd job that reacts to a new binary
+  tsc-queue unload              stop and remove both launchd jobs
+  tsc-queue status [-w [secs]]  what is compiling and what is waiting
+  tsc-queue history             peak memory per project
+  tsc-queue doctor              configuration and per-checkout state
+  tsc-queue version
+
+Configuration lives in $CONF
+USAGE
+  exit 2
+}
+
+case "${1:-}" in
+  exec) shift; cmd_exec "$@" ;;
+  version|--version|-v) echo "tsc-queue $VERSION" ;;
+  *)
+    [ "$(uname -s)" = "Darwin" ] || { echo "tsc-queue: macOS only" >&2; exit 1; }
+    case "${1:-}" in
+      install) shift; cmd_install "$@" ;;
+      uninstall) cmd_uninstall ;;
+      doctor) cmd_doctor ;;
+      status) shift; cmd_status "$@" ;;
+      history) cmd_history ;;
+      watch) cmd_watch ;;
+      repair) cmd_repair ;;
+      unload) cmd_unload ;;
+      *) usage ;;
+    esac
+    ;;
+esac
