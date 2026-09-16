@@ -94,6 +94,18 @@ Install somewhere else with `PREFIX=/usr/local ./install.sh`.
 To manage several checkouts, or a directory full of git worktrees, edit
 `~/.config/tsc-queue.conf` and run `tsc-queue install`.
 
+## Update
+
+```sh
+cd tsc-queue
+git pull
+./install.sh
+```
+
+`install.sh` copies the new script over `~/.local/bin/tsc-queue`, keeps your
+config, and reloads the two launchd jobs. Both jobs call that path, so the
+next repair sweep already runs the new code. Nothing else has to be redone.
+
 ## Uninstall
 
 ```sh
@@ -220,6 +232,26 @@ is before the session runs its package install, so the hook would re-wrap and
 then be overwritten seconds later.
 
 Logs go to `~/.cache/tsc-queue/repair.log`.
+
+### A patcher can save the shim as its backup
+
+Some packages replace the compiler in place after it is installed. They rename
+whatever sits at the compiler's path aside and keep that file as their backup.
+They do not check that the file is a compiler. When the shim is there, the
+shim becomes the backup, and the patcher's own restore command would put a bash
+script back as the compiler. Every call would then fail, because the path the
+shim runs no longer exists.
+
+`@effect/tsgo patch` does this: it renames `lib/tsc` to `lib/tsc.original`
+whenever no backup is there yet. The compiles themselves stay correct, because
+the patcher copies a whole new compiler in rather than editing the file. Only
+the backup is wrong.
+
+A shim is never a correct backup of anything, so `tsc-queue install` deletes
+any copy of one found beside a managed compiler, and `tsc-queue doctor` counts
+them. The test reads the file, so a true backup is never touched. The next
+patch run then writes a correct backup. The repair sweep does this every 30
+seconds, so nothing has to be run by hand.
 
 ## What is never queued
 
