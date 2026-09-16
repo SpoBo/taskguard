@@ -363,7 +363,8 @@ cmd_exec() {
   local rf="$RUND/$mypid"
   cleanup() { rm -f "$wf" "$rf" 2>/dev/null; }
   child=""
-  # shellcheck disable=SC2329  # invoked by trap
+  # shellcheck disable=SC2329,SC2317  # invoked by trap. Older shellcheck
+  # reports the same false positive under SC2317, so both codes are named.
   on_signal() { [ -n "$child" ] && kill -TERM "$child" 2>/dev/null; cleanup; exit 130; }
   trap on_signal INT TERM HUP
   trap cleanup EXIT
@@ -643,14 +644,15 @@ cmd_install() {
 }
 
 cmd_uninstall() {
-  local b n=0
+  local b saved n=0
   for b in $(real_binaries); do
     is_managed "$b" || continue
+    is_shim "$b" || continue
     # The legacy ".real" name is restored too, so an uninstall never strands a
     # checkout that an older version wrapped.
     for saved in "$b$REAL_SUFFIX" "$b.real"; do
-      is_shim "$b" && [ -e "$saved" ] || continue
-      mv -f "$saved" "$b" && n=$((n+1)) && break
+      [ -e "$saved" ] || continue
+      if mv -f "$saved" "$b"; then n=$((n+1)); break; fi
     done
   done
   say "removed from $n checkout binaries"
