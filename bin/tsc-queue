@@ -447,7 +447,11 @@ cmd_exec() {
   child=""
 
   local secs=$(( $(date +%s) - t0 - waited ))
-  record "$key" "$peak" "$secs" "$code"
+  # A run shorter than one sample interval is only ever measured at its start,
+  # when the compiler holds almost nothing. Recording that zero teaches the
+  # predictor nothing and can only drag a project's estimate down, which would
+  # then admit a heavy run into a machine with no room for it.
+  [ "$peak" -gt 0 ] && record "$key" "$peak" "$secs" "$code"
   [ -n "${TSC_QUEUE_TRACE:-}" ] && echo "$(date +%s) RELEASE pid=$mypid label=$label" >> "$TSC_QUEUE_TRACE"
   cleanup
   trap - EXIT INT TERM HUP
