@@ -20,7 +20,7 @@ check() { # name, then a command that must succeed
   local name="$1"; shift
   if "$@"; then echo "ok   $name"; else echo "FAIL $name"; fail=1; fi
 }
-# shellcheck disable=SC2329  # called through check
+# shellcheck disable=SC2317,SC2329  # called through check; older shellcheck reports SC2317
 queued() { ! grep -q "lock stuck" <<<"$1" && grep -q ADMIT "$2/trace"; }
 
 # 1. The state left behind on a real machine: a lock whose holder died before it
