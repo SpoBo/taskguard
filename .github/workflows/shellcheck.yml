@@ -13,4 +13,12 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck --shell=bash bin/tsc-queue install.sh uninstall.sh
+        run: shellcheck --shell=bash bin/tsc-queue install.sh uninstall.sh test/lock.sh
+
+  test:
+    # The queue reads memory with macOS tools, so the checks run on macOS.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lock checks
+        run: bash test/lock.sh

@@ -22,7 +22,7 @@ set -u
 VERSION="1.0.0"
 
 QDIR="${TSC_QUEUE_DIR:-$HOME/.cache/tsc-queue}"
-LOCK="$QDIR/lock.d"
+LOCK="$QDIR/lock"
 WAITD="$QDIR/wait"
 RUND="$QDIR/run"
 SEQF="$QDIR/seq"
@@ -204,26 +204,32 @@ reserve_kb() {
 }
 
 # ------------------------------------------------------------------ lock ----
+#
+# The lock is a symlink whose target is the time it was taken. Creating a
+# symlink is one atomic step, so the lock never exists without its time. The
+# older form was a directory with the time written into it afterwards; a
+# process killed between the two left a lock with no time, which was never
+# judged old enough to reclaim, and every compile bypassed the queue from then
+# on. The time is stored rather than read with stat: `stat` is GNU coreutils on
+# some machines and BSD on others, the flags mean opposite things, and the GNU
+# output fed into an arithmetic expression kills the script under `set -u`.
 lock() {
-  local tries=0 ts now
-  while ! mkdir "$LOCK" 2>/dev/null; do
-    # A lock older than 30s belongs to a process that died holding it. The age
-    # is stamped inside the lock rather than read with stat: `stat` is GNU
-    # coreutils on some machines and BSD on others, the flags mean opposite
-    # things, and the GNU output fed into an arithmetic expression kills the
-    # script under `set -u`.
-    ts=$(cat "$LOCK/ts" 2>/dev/null || echo 0)
+  local ts now start
+  start=$(date +%s)
+  while ! ln -s "$(date +%s)" "$LOCK" 2>/dev/null; do
+    # A lock older than 30s belongs to a process that died holding it.
+    ts=$(readlink "$LOCK" 2>/dev/null)
     case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
     now=$(date +%s)
-    [ "$ts" -gt 0 ] && [ "$(( now - ts ))" -gt 30 ] && rm -rf "$LOCK" 2>/dev/null
-    tries=$((tries+1))
-    [ "$tries" -gt 600 ] && return 1
+    [ "$ts" -gt 0 ] && [ "$(( now - ts ))" -gt 30 ] && rm -f "$LOCK" 2>/dev/null
+    # Wall clock, not a try count: a count of sleeps ends before a freshly dead
+    # lock turns 30s old on a fast machine, and that run then bypasses the queue.
+    [ "$(( now - start ))" -gt 60 ] && return 1
     sleep 0.05
   done
-  date +%s > "$LOCK/ts" 2>/dev/null
   return 0
 }
-unlock() { rm -rf "$LOCK" 2>/dev/null; }
+unlock() { rm -f "$LOCK" 2>/dev/null; }
 
 alive() { kill -0 "$1" 2>/dev/null; }   # `ps -p` can print a full listing and always "succeed"
 
