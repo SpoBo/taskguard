@@ -23,10 +23,13 @@ check() { # name, then a command that must succeed
 # shellcheck disable=SC2317,SC2329  # called through check; older shellcheck reports SC2317
 queued() { ! grep -q "lock stuck" <<<"$1" && grep -q ADMIT "$2/trace"; }
 
-# 1. The state left behind on a real machine: a lock whose holder died before it
-#    stamped the time. The next compile must still be queued, not bypass it.
-d="$tmp/q1"; mkdir -p "$d/lock.d"
-check "dead unstamped lock does not force a bypass" queued "$(run "$d")" "$d"
+# 1. A malformed lock must be reclaimed rather than disabling the queue.
+for target in '' invalid; do
+  label=${target:-empty}; d="$tmp/q1-$label"; mkdir -p "$d"; ln -s "$target" "$d/lock"
+  start=$(date +%s); out="$(run "$d")"; took=$(( $(date +%s) - start ))
+  check "$label lock target is reclaimed" queued "$out" "$d"
+  check "$label lock reclaimed at once (${took}s)" test "$took" -lt 10
+done
 
 # 2. A lock whose holder died after stamping it is reclaimed once it is old.
 d="$tmp/q2"; mkdir -p "$d"; ln -s "$(( $(date +%s) - 100 ))" "$d/lock"
@@ -35,7 +38,7 @@ check "stale stamped lock is reclaimed" queued "$out" "$d"
 check "reclaimed at once (${took}s)" test "$took" -lt 10
 
 # 3. The lock still excludes: many compiles at once never exceed the slot limit.
-d="$tmp/q3"; mkdir -p "$d"
+d="$tmp/q3"; mkdir -p "$d"; ln -s '' "$d/lock"
 for _ in $(seq 12); do TSC_QUEUE_MAX_SLOTS=2 run "$d" >/dev/null & done; wait
 check "12 parallel compiles, all admitted" test "$(grep -c ADMIT "$d/trace")" -eq 12
 max=$(sed -n 's/.*saw_running=\([0-9]*\).*/\1/p' "$d/trace" | sort -n | tail -1)
