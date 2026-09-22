@@ -23,6 +23,7 @@ VERSION="1.0.0"
 
 QDIR="${TSC_QUEUE_DIR:-$HOME/.cache/tsc-queue}"
 LOCK="$QDIR/lock"
+RECLAIM="$QDIR/reclaim"
 WAITD="$QDIR/wait"
 RUND="$QDIR/run"
 SEQF="$QDIR/seq"
@@ -213,15 +214,25 @@ reserve_kb() {
 # on. The time is stored rather than read with stat: `stat` is GNU coreutils on
 # some machines and BSD on others, the flags mean opposite things, and the GNU
 # output fed into an arithmetic expression kills the script under `set -u`.
+# Serialize recovery so one waiter cannot delete the lock another just acquired.
+reclaim() (
+  local ts now
+  exec 9>"$RECLAIM" || return
+  /usr/bin/lockf -s -t 0 9 || return
+  ts=$(readlink "$LOCK" 2>/dev/null) || return
+  now=$(date +%s)
+  case "$ts" in
+    ''|*[!0-9]*) rm -f "$LOCK" 2>/dev/null ;;
+    *) [ "$(( now - ts ))" -gt 30 ] && rm -f "$LOCK" 2>/dev/null ;;
+  esac
+)
+
 lock() {
-  local ts now start
+  local now start
   start=$(date +%s)
   while ! ln -s "$(date +%s)" "$LOCK" 2>/dev/null; do
-    # A lock older than 30s belongs to a process that died holding it.
-    ts=$(readlink "$LOCK" 2>/dev/null)
-    case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+    reclaim
     now=$(date +%s)
-    [ "$ts" -gt 0 ] && [ "$(( now - ts ))" -gt 30 ] && rm -f "$LOCK" 2>/dev/null
     # Wall clock, not a try count: a count of sleeps ends before a freshly dead
     # lock turns 30s old on a fast machine, and that run then bypasses the queue.
     [ "$(( now - start ))" -gt 60 ] && return 1
