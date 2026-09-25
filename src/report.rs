@@ -335,12 +335,15 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
 
 /// A bar of `width` cells: `#` in use now, `+` promised to running jobs,
 /// `.` free, and `|` at the limit.
-pub fn bar(used: f64, reserved: f64, total: f64, limit: f64, width: usize) -> String {
+/// `#` in use, `!` the part of it that running jobs use above their needs,
+/// `+` promised to running jobs, `|` the limit.
+pub fn bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: usize) -> String {
     if total <= 0.0 {
         return ".".repeat(width);
     }
     let cell = |v: f64| ((v / total) * width as f64).round().clamp(0.0, width as f64) as usize;
     let u = cell(used);
+    let o = cell(used - over.min(used)).min(u);
     let r = cell(used + reserved).max(u);
     // The marker sits in the cell the limit falls into; a limit at 100% has none.
     let l = (((limit / total) * width as f64).floor().max(0.0) as usize).min(width.saturating_sub(1));
@@ -348,8 +351,10 @@ pub fn bar(used: f64, reserved: f64, total: f64, limit: f64, width: usize) -> St
         .map(|i| {
             if i == l && l + 1 < width {
                 '|'
-            } else if i < u {
+            } else if i < o {
                 '#'
+            } else if i < u {
+                '!'
             } else if i < r {
                 '+'
             } else {
@@ -374,25 +379,28 @@ pub fn render_status(s: &Snapshot) -> String {
     let clock = chrono_like(s.now);
     let _ = writeln!(o, "taskguard   {clock}                       machine: {} cores, {}", m.ncpu, gb(m.mem_total_kb));
     let _ = writeln!(o);
+    let (over_cpu, over_mem) = crate::queue::over(&s.running);
     let _ = writeln!(
         o,
-        "CPU     [{}]  {:>5.1} busy  +{:.1} reserved  of {:.1} cores   limit {:.0}%",
-        bar(m.cpu_busy, s.reserve_cpu, m.ncpu as f64, s.cpu_limit, 20),
+        "CPU     [{}]  {:>5.1} busy  +{:.1} reserved  of {:.1} cores   limit {:.0}%{}",
+        bar(m.cpu_busy, over_cpu, s.reserve_cpu, m.ncpu as f64, s.cpu_limit, 20),
         m.cpu_busy,
         s.reserve_cpu,
         m.ncpu as f64,
-        s.limits.cpu_max_pct
+        s.limits.cpu_max_pct,
+        if over_cpu >= 0.05 { format!("   {over_cpu:.1} over estimates") } else { String::new() }
     );
     let _ = writeln!(
         o,
-        "MEMORY  [{}]  {:>8} held  +{} reserved  of {}   limit {:.0}%",
-        bar(m.mem_used_kb as f64, s.reserve_mem_kb as f64, m.mem_total_kb as f64, s.mem_limit_kb as f64, 20),
+        "MEMORY  [{}]  {:>8} held  +{} reserved  of {}   limit {:.0}%{}",
+        bar(m.mem_used_kb as f64, over_mem as f64, s.reserve_mem_kb as f64, m.mem_total_kb as f64, s.mem_limit_kb as f64, 20),
         gb(m.mem_used_kb),
         gb(s.reserve_mem_kb),
         gb(m.mem_total_kb),
-        s.limits.mem_max_pct
+        s.limits.mem_max_pct,
+        if over_mem >= 1024 { format!("   {} over estimates", gb(over_mem)) } else { String::new() }
     );
-    let _ = writeln!(o, "         # in use now   + promised to running jobs   | limit");
+    let _ = writeln!(o, "         # in use now   ! above the estimates   + promised to running jobs   | limit");
     let _ = writeln!(o);
     let _ =
         writeln!(o, "RUNNING ({})                          pool          time   CPU now / needs      MEMORY now / needs", s.running.len());
@@ -446,7 +454,7 @@ pub fn render_status(s: &Snapshot) -> String {
     }
     if let Some(first) = s.warnings.first() {
         let _ = writeln!(o);
-        let _ = writeln!(o, "WARNINGS ({})  {first}   (all of them: taskguard top, view 6)", s.warnings.len());
+        let _ = writeln!(o, "WARNINGS ({})  {first}   (all of them: taskguard top, view 5)", s.warnings.len());
     }
     o
 }
@@ -475,8 +483,9 @@ mod tests {
 
     #[test]
     fn bars() {
-        assert_eq!(bar(5.0, 2.0, 10.0, 8.5, 10), "#####++.|.");
-        assert_eq!(bar(0.0, 0.0, 10.0, 10.0, 10), ".........|".replace('|', "."));
+        assert_eq!(bar(5.0, 0.0, 2.0, 10.0, 8.5, 10), "#####++.|.");
+        assert_eq!(bar(0.0, 0.0, 0.0, 10.0, 10.0, 10), ".........|".replace('|', "."));
+        assert_eq!(bar(6.0, 2.0, 1.0, 10.0, 8.5, 10), "####!!+.|.", "2 of the 6 in use are above the estimates");
     }
 
     #[test]

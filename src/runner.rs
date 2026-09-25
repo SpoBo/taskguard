@@ -57,6 +57,24 @@ pub fn parse_jobs(s: &str, ncpu: usize) -> Result<u32> {
 
 const POLL: Duration = Duration::from_millis(100);
 
+/// Needs set by hand hold for this run only. The run is still measured, so
+/// the next run learns from what it really used.
+fn apply_nudge(me: &mut Entry, n: &queue::Nudge, database: Option<&Db>) {
+    if n.need_cpu.is_none() && n.need_mem_kb.is_none() {
+        return;
+    }
+    let (cpu, mem) = (n.need_cpu.unwrap_or(me.need_cpu), n.need_mem_kb.unwrap_or(me.need_mem_kb));
+    me.by_hand =
+        Some(format!("set by hand to {cpu:.1} cores, {} (was {:.1} cores, {})", report::gb(mem), me.need_cpu, report::gb(me.need_mem_kb)));
+    me.need_cpu = cpu;
+    me.need_mem_kb = mem;
+    // The job's needs are now known: no estimate, no learn stagger.
+    me.known = true;
+    if let Some(d) = database {
+        let _ = d.set_need(me.run_id, cpu, mem);
+    }
+}
+
 fn cleanup_files(q: &Queue, e: &Entry) {
     let _ = std::fs::remove_file(q.wait_path(e));
     let _ = std::fs::remove_file(q.run_path(e.pid));
@@ -272,12 +290,13 @@ pub fn run(mut o: Opts) -> Result<i32> {
         raised_by_min: raised,
         now: o.now,
         est_dur_s: learned.dur_s,
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
 
     ensure_recorder(&dir);
     let sig = Signals::register();
-    let limits = Limits {
+    let limits_of = |cfg: &Config| Limits {
         cpu_max_pct: cfg.cpu_max,
         mem_max_pct: cfg.mem_max,
         learn_stagger: cfg.learn_stagger,
@@ -285,6 +304,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
     };
+    let mut limits = limits_of(&cfg);
+    // A limit changed in the dashboard's Config view reaches jobs that
+    // already wait: they read the user config again when it changes.
+    let conf_path = config::user_config_path();
+    let conf_mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut seen_mtime = conf_mtime(&conf_path);
 
     // ---- wait for room
     let t0 = db::now();
@@ -308,6 +333,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         let mut announced = false;
         let mut last_line = t0;
         let mut span: Option<(String, String, f64)> = None;
+        let mut started_by_hand = false;
         loop {
             if let Some(s) = sig.any() {
                 cleanup_files(&q, &me);
@@ -317,6 +343,13 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 return Ok(128 + s);
             }
             let now = db::now();
+            let mtime = conf_mtime(&conf_path);
+            if mtime != seen_mtime {
+                seen_mtime = mtime;
+                if let Ok(c) = Config::load(&cwd, &checkout) {
+                    limits = limits_of(&c);
+                }
+            }
             let decision;
             let running;
             {
@@ -333,8 +366,17 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 if let Some(cur) = waiting.iter().find(|w| w.pid == me_pid) {
                     me.bypassed_since = cur.bypassed_since;
                 }
+                if let Some(n) = q.take_nudge(me_pid) {
+                    apply_nudge(&mut me, &n, database.as_ref());
+                    started_by_hand |= n.start;
+                }
+                let mut waiting = waiting;
+                if let Some(w) = waiting.iter_mut().find(|w| w.pid == me_pid) {
+                    w.need_cpu = me.need_cpu;
+                    w.need_mem_kb = me.need_mem_kb;
+                }
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &q.unknown_starts());
-                let forced = matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
+                let forced = started_by_hand || matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
                 if matches!(decision, Decision::Admit { .. }) || forced {
                     // Every older job that is still waiting has now been passed.
                     for w in waiting.iter().filter(|w| w.ticket < me.ticket && w.bypassed_since.is_none()) {
@@ -380,6 +422,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
             match &decision {
                 Decision::Admit { reason } => {
                     admit_reason = reason.clone();
+                    break;
+                }
+                _ if started_by_hand => {
+                    admit_reason = "started by hand from the dashboard".into();
                     break;
                 }
                 _ if forced => {
@@ -490,6 +536,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
         if now - last_sample >= cfg.sample_every {
             let span = now - last_sample;
             last_sample = now;
+            if let Some(n) = q.take_nudge(me_pid) {
+                apply_nudge(&mut me, &n, database.as_ref());
+            }
             if let Some(r) = tracker.sample(child_pid, now) {
                 me.live_cpu = r.used;
                 me.live_mem_kb = r.mem_kb;

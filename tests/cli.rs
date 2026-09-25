@@ -284,3 +284,69 @@ fn a_nested_call_runs_inside_the_outer_slot() {
     let runs: i64 = e.db().query_row("SELECT count(*) FROM runs", [], |r| r.get(0)).unwrap();
     assert_eq!(runs, 1, "the nested call takes no slot and records no run");
 }
+
+/// Wait until a waiting entry exists for `pid`, so a nudge reaches a job that waits.
+fn wait_until_queued(e: &Env, pid: u32) {
+    let t = Instant::now();
+    while !std::fs::read_dir(e.dir.join("wait")).unwrap().flatten().any(|f| f.file_name().to_string_lossy().ends_with(&format!(".{pid}"))) {
+        assert!(t.elapsed() < Duration::from_secs(10), "job {pid} never queued");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_waiting_job_started_by_hand_runs_at_once() {
+    let e = Env::new("");
+    let holder = e.spawn(&["-j1", "--id", "h", "--", "sh", "-c", "touch held; sleep 4"]);
+    wait_for(&e.file("held"));
+    let waiter = e.spawn(&["-j1", "--id", "h", "--", "touch", "started"]);
+    wait_until_queued(&e, waiter.id());
+    // What the dashboard's "g" writes.
+    std::fs::write(e.dir.join("nudge").join(waiter.id().to_string()), r#"{"start":true}"#).unwrap();
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("started by hand"), "{}", stderr(&out));
+    assert!(e.file("started").exists());
+    let t = Instant::now();
+    holder.wait_with_output().unwrap();
+    assert!(t.elapsed() > Duration::from_millis(500), "the job started while the holder still ran");
+}
+
+#[test]
+fn needs_set_by_hand_let_a_job_fit() {
+    let e = Env::new("");
+    let holder = e.spawn(&["--", "sh", "-c", "touch held; sleep 4"]);
+    wait_for(&e.file("held"));
+    // 100 TB never fits next to a running job.
+    let waiter = e.spawn(&["--min-mem", "100000000M", "--", "touch", "started"]);
+    wait_until_queued(&e, waiter.id());
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!e.file("started").exists());
+    // What the dashboard's "e" writes for "1 64M".
+    std::fs::write(e.dir.join("nudge").join(waiter.id().to_string()), r#"{"need_cpu":0.1,"need_mem_kb":65536}"#).unwrap();
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.file("started").exists());
+    let need: i64 = e.db().query_row("SELECT need_mem_kb FROM runs WHERE cmd = 'touch started'", [], |r| r.get(0)).unwrap();
+    assert_eq!(need, 65536, "the run records the needs it really waited for");
+    holder.wait_with_output().unwrap();
+}
+
+#[test]
+fn a_waiting_job_follows_a_limit_changed_in_the_config() {
+    // At 1% of RAM no job fits while another one runs.
+    let e = Env::new("mem_max = 1\nlearn_stagger = 0\n");
+    let holder = e.spawn(&["--", "sh", "-c", "touch held; sleep 5"]);
+    wait_for(&e.file("held"));
+    let waiter = e.spawn(&["--", "touch", "started"]);
+    wait_until_queued(&e, waiter.id());
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(!e.file("started").exists(), "the job waits for memory");
+    std::fs::write(&e.conf, "status_every = 1\nlearn_stagger = 0\nmem_max = 99\n").unwrap();
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.file("started").exists());
+    let t = Instant::now();
+    holder.wait_with_output().unwrap();
+    assert!(t.elapsed() > Duration::from_millis(500), "the job started while the holder still ran");
+}

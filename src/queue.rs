@@ -60,6 +60,22 @@ pub struct Entry {
     pub est_dur_s: Option<f64>,
     /// For a job with no history: where its estimated need comes from.
     pub estimate_from: Option<String>,
+    /// The taskguard version that owns the entry. Older versions leave it
+    /// out, and they do not read nudges either.
+    pub version: Option<String>,
+    /// Set when someone changed the needs by hand, in words.
+    pub by_hand: Option<String>,
+}
+
+/// A request from the dashboard to one job: start now, or use other needs.
+/// The job's own process reads it (`nudge/<pid>`) and acts on it, because
+/// only that process may move its entry or decide that it starts.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Nudge {
+    pub start: bool,
+    pub need_cpu: Option<f64>,
+    pub need_mem_kb: Option<u64>,
 }
 
 pub struct Queue {
@@ -72,7 +88,7 @@ pub struct Guard {
 
 impl Queue {
     pub fn open(dir: &Path) -> Result<Queue> {
-        for d in ["wait", "run", "viewers"] {
+        for d in ["wait", "run", "viewers", "nudge"] {
             fs::create_dir_all(dir.join(d)).with_context(|| format!("creating {}", dir.join(d).display()))?;
         }
         Ok(Queue { dir: dir.to_path_buf() })
@@ -97,6 +113,29 @@ impl Queue {
 
     pub fn run_path(&self, pid: i32) -> PathBuf {
         self.dir.join("run").join(pid.to_string())
+    }
+
+    fn nudge_path(&self, pid: i32) -> PathBuf {
+        self.dir.join("nudge").join(pid.to_string())
+    }
+
+    /// Add to the nudge for a job; an earlier one that was not read yet stays.
+    pub fn nudge(&self, pid: i32, change: impl FnOnce(&mut Nudge)) -> Result<()> {
+        let path = self.nudge_path(pid);
+        let mut n: Nudge = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        change(&mut n);
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        fs::write(&tmp, serde_json::to_string(&n)?)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Read and remove the nudge for a job, if there is one.
+    pub fn take_nudge(&self, pid: i32) -> Option<Nudge> {
+        let path = self.nudge_path(pid);
+        let text = fs::read_to_string(&path).ok()?;
+        let _ = fs::remove_file(&path);
+        serde_json::from_str(&text).ok()
     }
 
     /// Write through a temp file and rename, so a reader never sees half a file.
@@ -160,9 +199,10 @@ impl Queue {
                 }
             }
         }
-        if let Ok(rd) = fs::read_dir(self.dir.join("viewers")) {
+        for sub in ["viewers", "nudge"] {
+            let Ok(rd) = fs::read_dir(self.dir.join(sub)) else { continue };
             for f in rd.filter_map(|e| e.ok()) {
-                let pid: i32 = f.file_name().to_string_lossy().parse().unwrap_or(0);
+                let pid: i32 = f.file_name().to_string_lossy().split('.').next().and_then(|p| p.parse().ok()).unwrap_or(0);
                 if !alive(pid) {
                     let _ = fs::remove_file(f.path());
                 }
@@ -296,6 +336,12 @@ pub enum Decision {
 /// one is about to eat. The same holds for CPU.
 pub fn reserve(running: &[Entry]) -> (f64, u64) {
     running.iter().fold((0.0, 0), |(c, m), e| ((c + (e.need_cpu - e.live_cpu).max(0.0)), m + e.need_mem_kb.saturating_sub(e.live_mem_kb)))
+}
+
+/// How far running jobs are above their needs right now: the part of the
+/// load the estimates did not see coming.
+pub fn over(running: &[Entry]) -> (f64, u64) {
+    running.iter().fold((0.0, 0), |(c, m), e| ((c + (e.live_cpu - e.need_cpu).max(0.0)), m + e.live_mem_kb.saturating_sub(e.need_mem_kb)))
 }
 
 /// May `me` start now? A pure function of the machine reading and the queue,

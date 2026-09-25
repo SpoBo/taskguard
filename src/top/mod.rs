@@ -4,7 +4,7 @@ mod chart;
 mod views;
 
 use crate::commands;
-use crate::config::{self, Config};
+use crate::config::{self, Config, SETTINGS};
 use crate::dash::{self, Bucket, Marker, NsRow, RunRow, TrendRow, Warning};
 use crate::db::{self, Db};
 use crate::key;
@@ -28,17 +28,19 @@ pub enum View {
     Trends,
     Warnings,
     Namespaces,
+    Config,
     Help,
 }
 
+/// The tabs, in order. The Job view is no tab: Enter on a row opens it.
 pub const VIEWS: [(View, &str); 8] = [
     (View::Overview, "Overview"),
     (View::Queue, "Queue"),
     (View::Runs, "Runs"),
-    (View::Job, "Job"),
     (View::Trends, "Trends"),
     (View::Warnings, "Warnings"),
     (View::Namespaces, "Namespaces"),
+    (View::Config, "Config"),
     (View::Help, "Help"),
 ];
 
@@ -54,6 +56,9 @@ pub enum Input {
     None,
     Filter(String),
     ConfirmKill(i32, String),
+    ConfirmStart(i32, String),
+    /// Needs for a job, typed as "CORES MEMORY", for example "2 4G".
+    EditNeeds(i32, String, String),
 }
 
 /// Everything a frame draws, loaded once per refresh.
@@ -87,6 +92,15 @@ pub struct JobData {
     pub adjustments: Vec<dash::Adjustment>,
     pub min_cpu: Option<f64>,
     pub min_mem_kb: Option<u64>,
+    /// The run of this job that is going on now, if any.
+    pub live: Option<LiveRun>,
+}
+
+pub struct LiveRun {
+    pub entry: crate::queue::Entry,
+    pub waiting: bool,
+    /// Samples so far: time, cores used, cores wanted, memory, page-ins per second.
+    pub samples: Vec<(f64, f64, f64, u64, f64)>,
 }
 
 pub struct App {
@@ -94,6 +108,8 @@ pub struct App {
     pub cfg: Config,
     pub view: View,
     pub prev_view: View,
+    /// The view and row to return to when the Job view closes.
+    pub back: (View, usize),
     pub range: usize,
     pub ns_filter: Option<String>,
     pub text_filter: String,
@@ -112,6 +128,17 @@ pub struct App {
     /// Rows of the current list view on screen, for mouse clicks:
     /// (first y, rows shown, index of the first row shown).
     pub list_rows: (u16, usize, usize),
+    /// Where the tabs and the footer keys sit on screen, for mouse clicks:
+    /// (row, first column, last column, what a click does).
+    pub hits: Vec<(u16, u16, u16, Click)>,
+    pub cwd: PathBuf,
+    pub checkout: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Click {
+    Tab(View),
+    Key(KeyCode),
 }
 
 impl App {
@@ -121,6 +148,7 @@ impl App {
             cfg,
             view: View::Overview,
             prev_view: View::Overview,
+            back: (View::Overview, 0),
             range: 2,
             ns_filter: None,
             text_filter: String::new(),
@@ -137,6 +165,9 @@ impl App {
             data: Data::default(),
             message: None,
             list_rows: (0, 0, 0),
+            hits: Vec::new(),
+            cwd: PathBuf::new(),
+            checkout: PathBuf::new(),
         }
     }
 
@@ -181,7 +212,25 @@ impl App {
                         Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<i64>>(1)?.map(|v| v as u64)))
                     })
                     .unwrap_or((None, None));
+                let snap = commands::snapshot(&self.dir, &self.cfg, Some(&db)).ok();
+                let live = snap.and_then(|s| {
+                    let running = s.running.into_iter().find(|e| &e.key == k).map(|e| (e, false));
+                    running.or_else(|| s.waiting.into_iter().find(|w| &w.entry.key == k).map(|w| (w.entry, true)))
+                });
+                let live = match live {
+                    Some((entry, waiting)) => {
+                        let mut st = db.conn.prepare(
+                            "SELECT ts, cores_used, cores_wanted, mem_kb, pageins_per_s FROM job_samples WHERE run_id = ?1 ORDER BY ts",
+                        )?;
+                        let samples = st
+                            .query_map([entry.run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64, r.get(4)?)))?
+                            .collect::<std::result::Result<_, _>>()?;
+                        Some(LiveRun { entry, waiting, samples })
+                    }
+                    None => None,
+                };
                 Some(JobData {
+                    live,
                     key: k.clone(),
                     learned: db.learned(k, self.cfg.hist_keep, self.cfg.boost_runs)?,
                     runs,
@@ -230,6 +279,7 @@ impl App {
             View::Warnings => self.data.warnings.len(),
             View::Namespaces => self.data.namespaces.len(),
             View::Job => self.data.job.as_ref().map(|j| j.runs.len()).unwrap_or(0),
+            View::Config => SETTINGS.len(),
             _ => 0,
         }
     }
@@ -242,6 +292,28 @@ impl App {
             self.sort = 0;
             self.reverse = false;
         }
+    }
+
+    /// Open the Job view for a key, and remember where to return to.
+    fn open_job(&mut self, key: String) {
+        if self.view != View::Job {
+            self.back = (self.view, self.sel);
+        }
+        self.job_key = Some(key);
+        self.view = View::Job;
+        self.sel = 0;
+    }
+
+    fn close_job(&mut self) {
+        let (view, sel) = self.back;
+        self.view = view;
+        self.sel = sel;
+    }
+
+    fn step_tab(&mut self, forward: bool) {
+        let i = VIEWS.iter().position(|(v, _)| *v == self.view).unwrap_or(0);
+        let j = if forward { (i + 1) % VIEWS.len() } else { (i + VIEWS.len() - 1) % VIEWS.len() };
+        self.set_view(VIEWS[j].0);
     }
 
     fn selected_key(&self) -> Option<String> {
@@ -258,11 +330,70 @@ impl App {
         }
     }
 
-    /// Queue view rows: waiting jobs first (they are what needs explaining),
-    /// then running ones. The bool is true for a waiting job.
+    /// Queue view rows: running jobs first, then waiting ones in queue
+    /// order. The bool is true for a waiting job.
     pub fn queue_row(&self, i: usize) -> Option<(&crate::queue::Entry, bool)> {
         let s = self.data.snap.as_ref()?;
-        if i < s.waiting.len() { Some((&s.waiting[i].entry, true)) } else { s.running.get(i - s.waiting.len()).map(|e| (e, false)) }
+        if i < s.running.len() { Some((&s.running[i], false)) } else { s.waiting.get(i - s.running.len()).map(|w| (&w.entry, true)) }
+    }
+
+    /// The waiting job on the selected Queue row, with its decision.
+    pub fn queue_waiting(&self) -> Option<&crate::report::Waiting> {
+        let s = self.data.snap.as_ref()?;
+        self.sel.checked_sub(s.running.len()).and_then(|i| s.waiting.get(i))
+    }
+
+    /// A job from an older taskguard does not read nudges.
+    fn nudgeable(&mut self, e: &crate::queue::Entry) -> bool {
+        if e.version.is_none() {
+            self.message = Some(format!("{} runs an older taskguard (before 0.1.3); it cannot be started or changed from here", e.key));
+            return false;
+        }
+        true
+    }
+
+    fn apply_input(&mut self, input: Input) {
+        let q = Queue { dir: self.dir.clone() };
+        match input {
+            Input::ConfirmKill(pid, key) => {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                self.message = Some(format!("sent SIGTERM to {key} (pid {pid})"));
+            }
+            Input::ConfirmStart(pid, key) => {
+                self.message = Some(match q.nudge(pid, |n| n.start = true) {
+                    Ok(()) => format!("{key} starts within a second"),
+                    Err(e) => format!("could not start {key}: {e}"),
+                });
+            }
+            Input::EditNeeds(pid, key, text) => {
+                self.message = Some(match parse_needs(&text) {
+                    Ok((cpu, mem)) => match q.nudge(pid, |n| {
+                        n.need_cpu = cpu.or(n.need_cpu);
+                        n.need_mem_kb = mem.or(n.need_mem_kb);
+                    }) {
+                        Ok(()) => format!("{key}: needs changed for this run; the next run learns from what it really uses"),
+                        Err(e) => format!("could not change {key}: {e}"),
+                    },
+                    Err(e) => e,
+                });
+            }
+            Input::None | Input::Filter(_) => {}
+        }
+    }
+
+    /// Change the selected setting by one step, and save it in the user config.
+    fn step_setting(&mut self, up: bool) {
+        let Some(set) = SETTINGS.get(self.sel) else { return };
+        let path = config::user_config_path();
+        self.message = Some(match config::step_user_setting(&path, &self.cfg, set, up) {
+            Ok(text) => {
+                if let Ok(c) = Config::load(&self.cwd, &self.checkout) {
+                    self.cfg = c;
+                }
+                format!("{text}, saved in {}", path.display())
+            }
+            Err(e) => format!("could not save: {e}"),
+        });
     }
 
     /// Returns false to quit.
@@ -287,12 +418,26 @@ impl App {
                 }
                 return true;
             }
-            Input::ConfirmKill(pid, key) => {
+            Input::ConfirmKill(..) | Input::ConfirmStart(..) => {
+                let input = std::mem::replace(&mut self.input, Input::None);
                 if let KeyCode::Char('y') = k.code {
-                    unsafe { libc::kill(*pid, libc::SIGTERM) };
-                    self.message = Some(format!("sent SIGTERM to {key} (pid {pid})"));
+                    self.apply_input(input);
                 }
-                self.input = Input::None;
+                return true;
+            }
+            Input::EditNeeds(_, _, text) => {
+                match k.code {
+                    KeyCode::Enter => {
+                        let input = std::mem::replace(&mut self.input, Input::None);
+                        self.apply_input(input);
+                    }
+                    KeyCode::Esc => self.input = Input::None,
+                    KeyCode::Backspace => {
+                        text.pop();
+                    }
+                    KeyCode::Char(c) => text.push(c),
+                    _ => {}
+                }
                 return true;
             }
             Input::None => {}
@@ -301,25 +446,44 @@ impl App {
             return false;
         }
         self.message = None;
+        // Cmd+arrows (when the terminal reports Cmd), Option+arrows and
+        // Shift+arrows move between tabs. Option+arrows arrive as Alt+b and
+        // Alt+f in terminals that send them as words.
+        let mods = k.modifiers;
+        let tab_mod = mods.intersects(KeyModifiers::SUPER | KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::META);
+        match k.code {
+            KeyCode::Left | KeyCode::Right if tab_mod => {
+                self.step_tab(k.code == KeyCode::Right);
+                return true;
+            }
+            KeyCode::Char('b' | 'f') if mods.contains(KeyModifiers::ALT) => {
+                self.step_tab(k.code == KeyCode::Char('f'));
+                return true;
+            }
+            _ => {}
+        }
+        if self.view == View::Job && matches!(k.code, KeyCode::Esc | KeyCode::Backspace) {
+            self.close_job();
+            return true;
+        }
+        if self.view == View::Config {
+            match k.code {
+                KeyCode::Left | KeyCode::Char('-') => return self.then(|a| a.step_setting(false)),
+                KeyCode::Right | KeyCode::Char('+' | '=') | KeyCode::Enter => return self.then(|a| a.step_setting(true)),
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char(c @ '1'..='8') => {
                 let i = (c as u8 - b'1') as usize;
-                if VIEWS[i].0 == View::Job && self.job_key.is_none() {
-                    self.message = Some("pick a job first: select a row in Runs, Trends or Warnings and press Enter".into());
-                } else {
-                    self.set_view(VIEWS[i].0);
-                }
+                self.set_view(VIEWS[i].0);
             }
-            KeyCode::Tab | KeyCode::BackTab => {
-                let i = VIEWS.iter().position(|(v, _)| *v == self.view).unwrap_or(0);
-                let step = if k.code == KeyCode::Tab { 1 } else { VIEWS.len() - 1 };
-                let mut j = (i + step) % VIEWS.len();
-                if VIEWS[j].0 == View::Job && self.job_key.is_none() {
-                    j = (j + step) % VIEWS.len();
-                }
-                self.set_view(VIEWS[j].0);
-            }
+            KeyCode::Tab | KeyCode::BackTab => self.step_tab(k.code == KeyCode::Tab),
+            KeyCode::Char('j') => match self.job_key.clone() {
+                Some(k) => self.open_job(k),
+                None => self.message = Some("no job opened yet: select a row and press Enter".into()),
+            },
             KeyCode::Char('t') => self.range = (self.range + 1) % RANGES.len(),
             KeyCode::Char('T') => self.range = (self.range + RANGES.len() - 1) % RANGES.len(),
             KeyCode::Char('n') => {
@@ -367,8 +531,7 @@ impl App {
             KeyCode::End => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(k) = self.selected_key() {
-                    self.job_key = Some(k);
-                    self.set_view(View::Job);
+                    self.open_job(k);
                 }
             }
             KeyCode::Char('k') => {
@@ -378,16 +541,51 @@ impl App {
                     self.message = Some("k works on a row in the Queue view".into());
                 }
             }
+            KeyCode::Char('g') => match (self.view, self.queue_row(self.sel).map(|(e, w)| (e.clone(), w))) {
+                (View::Queue, Some((e, true))) => {
+                    if self.nudgeable(&e) {
+                        self.input = Input::ConfirmStart(e.pid, e.key.clone());
+                    }
+                }
+                (View::Queue, Some((e, false))) => self.message = Some(format!("{} already runs", e.key)),
+                _ => self.message = Some("g works on a waiting job in the Queue view".into()),
+            },
+            KeyCode::Char('e') => match (self.view, self.queue_row(self.sel).map(|(e, _)| e.clone())) {
+                (View::Queue, Some(e)) => {
+                    if self.nudgeable(&e) {
+                        let now = format!("{:.1} {}", e.need_cpu, crate::report::gb(e.need_mem_kb).replace(' ', ""));
+                        self.input = Input::EditNeeds(e.pid, e.key.clone(), now);
+                    }
+                }
+                _ => self.message = Some("e works on a job in the Queue view".into()),
+            },
             _ => {}
         }
         true
     }
 
-    pub fn mouse(&mut self, kind: MouseEventKind, _col: u16, row: u16) {
+    fn then(&mut self, f: impl FnOnce(&mut App)) -> bool {
+        f(self);
+        true
+    }
+
+    pub fn mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) {
         match kind {
-            MouseEventKind::ScrollUp => self.range = self.range.saturating_sub(1),
-            MouseEventKind::ScrollDown => self.range = (self.range + 1).min(RANGES.len() - 1),
+            // The wheel scrolls a list, and zooms the time range on the Overview.
+            MouseEventKind::ScrollUp if self.view == View::Overview => self.range = self.range.saturating_sub(1),
+            MouseEventKind::ScrollDown if self.view == View::Overview => self.range = (self.range + 1).min(RANGES.len() - 1),
+            MouseEventKind::ScrollUp => self.sel = self.sel.saturating_sub(1),
+            MouseEventKind::ScrollDown => self.sel = (self.sel + 1).min(self.list_len().saturating_sub(1)),
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((_, _, _, click)) = self.hits.iter().find(|(y, x0, x1, _)| *y == row && col >= *x0 && col <= *x1).copied() {
+                    match click {
+                        Click::Tab(v) => self.set_view(v),
+                        Click::Key(code) => {
+                            self.key(KeyEvent::new(code, KeyModifiers::NONE));
+                        }
+                    }
+                    return;
+                }
                 let (y0, n, first) = self.list_rows;
                 if row >= y0 && ((row - y0) as usize) < n {
                     self.sel = first + (row - y0) as usize;
@@ -396,6 +594,25 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// "2 4G" sets both needs; "2" only the cores; "4G" or "- 4G" only the memory.
+fn parse_needs(text: &str) -> std::result::Result<(Option<f64>, Option<u64>), String> {
+    let bad = || format!("could not read {text:?}: type cores and memory, for example \"2 4G\"");
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let cores = |p: &str| if p == "-" { Ok(None) } else { p.parse::<f64>().map(Some).map_err(|_| bad()) };
+    let mem = |p: &str| if p == "-" { Ok(None) } else { config::parse_size_kb(p).map(Some).map_err(|_| bad()) };
+    match parts.as_slice() {
+        [one] if one.ends_with(|c: char| c.is_ascii_alphabetic()) => Ok((None, mem(one)?)),
+        [one] => Ok((cores(one)?, None)),
+        [c, m] => Ok((cores(c)?, mem(m)?)),
+        _ => Err(bad()),
+    }
+    .and_then(|(c, m)| match (c, m) {
+        (None, None) => Err(bad()),
+        (Some(c), _) if c <= 0.0 => Err("cores must be above 0".into()),
+        other => Ok(other),
+    })
 }
 
 fn sort_runs(v: &mut [RunRow], col: usize, rev: bool) {
@@ -456,12 +673,14 @@ pub fn run(args: &[String]) -> Result<i32> {
     runner::ensure_recorder(&q.dir);
 
     let mut app = App::new(dir, cfg);
+    app.checkout = key::checkout_root(&cwd);
+    app.cwd = cwd;
     let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     if args.iter().any(|a| a == "--queue") {
         app.view = View::Queue;
     }
     if let Some(v) = arg("--view") {
-        match VIEWS.iter().find(|(_, n)| n.eq_ignore_ascii_case(&v)) {
+        match VIEWS.iter().chain([(View::Job, "Job")].iter()).find(|(_, n)| n.eq_ignore_ascii_case(&v)) {
             Some((view, _)) => app.view = *view,
             None => {
                 anyhow::bail!("unknown view {v:?}; one of: {}", VIEWS.iter().map(|(_, n)| n.to_lowercase()).collect::<Vec<_>>().join(", "))
@@ -497,6 +716,13 @@ pub fn run(args: &[String]) -> Result<i32> {
     }
     let mut term = ratatui::init();
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // Terminals that support it then report Cmd (Super) on arrow keys.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+        && crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok();
     let result = (|| -> Result<()> {
         let mut last = Instant::now() - Duration::from_secs(10);
         loop {
@@ -524,8 +750,27 @@ pub fn run(args: &[String]) -> Result<i32> {
             }
         }
     })();
+    if enhanced {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
+    }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     drop(viewer);
     result.map(|_| 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_are_typed_as_cores_and_memory() {
+        assert_eq!(parse_needs("2 4G"), Ok((Some(2.0), Some(4 << 20))));
+        assert_eq!(parse_needs("1.5"), Ok((Some(1.5), None)));
+        assert_eq!(parse_needs("512M"), Ok((None, Some(512 << 10))));
+        assert_eq!(parse_needs("- 1G"), Ok((None, Some(1 << 20))));
+        assert!(parse_needs("").is_err());
+        assert!(parse_needs("0 1G").is_err());
+        assert!(parse_needs("two 1G").is_err());
+    }
 }

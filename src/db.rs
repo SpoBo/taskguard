@@ -234,6 +234,11 @@ impl Db {
         Ok(Learned { runs: recent.len(), mem_kb: mem, cpu, dur_s: dur, mem_boosted: boosted })
     }
 
+    pub fn set_need(&self, run_id: i64, cpu: f64, mem_kb: u64) -> Result<()> {
+        self.conn.execute("UPDATE runs SET need_cpu = ?2, need_mem_kb = ?3 WHERE id = ?1", params![run_id, cpu, mem_kb as i64])?;
+        Ok(())
+    }
+
     pub fn insert_run(&self, r: &NewRun) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO runs (ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, now,

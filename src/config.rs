@@ -157,6 +157,146 @@ impl Default for Config {
     }
 }
 
+/// A setting that the dashboard's Config view can change.
+pub struct Setting {
+    pub key: &'static str,
+    pub what: &'static str,
+    pub kind: SettingKind,
+}
+
+pub enum SettingKind {
+    /// A number: step, lowest, highest, unit.
+    Number(f64, f64, f64, &'static str),
+    Bool,
+    /// A size in megabytes: step, lowest, highest.
+    Size(u64, u64, u64),
+}
+
+pub const SETTINGS: [Setting; 9] = [
+    Setting {
+        key: "cpu_max",
+        what: "CPU limit: jobs start while busy + promised + need stay under this share of all cores",
+        kind: SettingKind::Number(5.0, 10.0, 100.0, "%"),
+    },
+    Setting {
+        key: "mem_max",
+        what: "memory limit: jobs start while memory stays under this share of RAM",
+        kind: SettingKind::Number(5.0, 10.0, 95.0, "%"),
+    },
+    Setting {
+        key: "pressure_max",
+        what: "Linux: no new job while memory pressure (PSI) is above this",
+        kind: SettingKind::Number(5.0, 5.0, 90.0, "%"),
+    },
+    Setting { key: "hints", what: "agent hints on the status lines of jobs", kind: SettingKind::Bool },
+    Setting {
+        key: "max_bypass",
+        what: "a job that newer jobs passed for this long gets a reservation",
+        kind: SettingKind::Number(30.0, 30.0, 1800.0, "s"),
+    },
+    Setting {
+        key: "learn_stagger",
+        what: "new jobs start in batches this far apart, so readings can catch up",
+        kind: SettingKind::Number(1.0, 0.0, 60.0, "s"),
+    },
+    Setting {
+        key: "cpu_min_duration",
+        what: "jobs that usually end sooner than this skip the CPU check",
+        kind: SettingKind::Number(1.0, 0.0, 60.0, "s"),
+    },
+    Setting {
+        key: "new_job_mem",
+        what: "memory a first run reserves when no similar job is known",
+        kind: SettingKind::Size(256, 256, 16384),
+    },
+    Setting { key: "status_every", what: "a waiting job prints a status line this often", kind: SettingKind::Number(5.0, 5.0, 300.0, "s") },
+];
+
+impl Config {
+    /// The value of a setting, as the Config view shows it.
+    pub fn setting_text(&self, key: &str) -> String {
+        match key {
+            "cpu_max" => format!("{:.0}%", self.cpu_max),
+            "mem_max" => format!("{:.0}%", self.mem_max),
+            "pressure_max" => format!("{:.0}%", self.pressure_max),
+            "hints" => (if self.hints { "on" } else { "off" }).into(),
+            "max_bypass" => format!("{}s", self.max_bypass),
+            "learn_stagger" => format!("{:.0}s", self.learn_stagger),
+            "cpu_min_duration" => format!("{:.0}s", self.cpu_min_duration),
+            "new_job_mem" => format!("{}M", self.new_job_mem_kb / 1024),
+            "status_every" => format!("{}s", self.status_every),
+            _ => "?".into(),
+        }
+    }
+
+    fn setting_number(&self, key: &str) -> f64 {
+        match key {
+            "cpu_max" => self.cpu_max,
+            "mem_max" => self.mem_max,
+            "pressure_max" => self.pressure_max,
+            "max_bypass" => self.max_bypass as f64,
+            "learn_stagger" => self.learn_stagger,
+            "cpu_min_duration" => self.cpu_min_duration,
+            "status_every" => self.status_every as f64,
+            _ => 0.0,
+        }
+    }
+}
+
+/// Move a setting one step up or down from its current value, and write it at
+/// the top level of the user config. Comments and other settings stay as they
+/// are. Returns what changed, in words.
+pub fn step_user_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> Result<String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("reading {}", path.display()))?;
+    let value: toml_edit::Item = match set.kind {
+        SettingKind::Bool => toml_edit::value(!cfg.hints),
+        SettingKind::Number(step, lo, hi, _) => {
+            let cur = cfg.setting_number(set.key);
+            let next = ((cur / step).round() * step + if up { step } else { -step }).clamp(lo, hi);
+            // Whole numbers are written as integers: some settings are integers.
+            if next.fract() == 0.0 { toml_edit::value(next as i64) } else { toml_edit::value(next) }
+        }
+        SettingKind::Size(step, lo, hi) => {
+            let cur = cfg.new_job_mem_kb / 1024;
+            let next = if up { cur + step } else { cur.saturating_sub(step) }.clamp(lo, hi);
+            toml_edit::value(format!("{next}M"))
+        }
+    };
+    // Replace only the value, so the comments around it stay.
+    match (doc.get_mut(set.key).and_then(|i| i.as_value_mut()), value.into_value()) {
+        (Some(cur), Ok(mut new)) => {
+            *new.decor_mut() = cur.decor().clone();
+            *cur = new;
+        }
+        (_, Ok(new)) => {
+            doc.insert(set.key, toml_edit::Item::Value(new));
+        }
+        (_, Err(_)) => bail!("cannot write {}", set.key),
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    let new = Config { hints: !cfg.hints, ..Default::default() };
+    let shown = match set.kind {
+        SettingKind::Bool => new.setting_text("hints"),
+        _ => match doc.get(set.key).and_then(|v| v.as_value()) {
+            Some(toml_edit::Value::Integer(i)) => i.value().to_string(),
+            Some(toml_edit::Value::Float(f)) => f.value().to_string(),
+            Some(toml_edit::Value::String(t)) => t.value().clone(),
+            _ => String::new(),
+        },
+    };
+    let unit = match set.kind {
+        SettingKind::Number(_, _, _, u) => u,
+        _ => "",
+    };
+    Ok(format!("{} = {shown}{unit}", set.key))
+}
+
 pub fn home() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
 }
@@ -480,5 +620,24 @@ mod tests {
         assert_eq!(cl.min_cpu, Some(4.0));
         assert_eq!(cl.min_mem_kb, Some(6 * 1024 * 1024));
         assert!(c.origin["hints"].ends_with(".taskguard.toml"));
+    }
+
+    #[test]
+    fn a_setting_changed_in_the_dashboard_keeps_the_rest_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "# my limits\ncpu_max = 80 # leave room for the editor\n\n[dir.\"/w\"]\nmem_max = 70\n").unwrap();
+        let cfg = Config { cpu_max: 80.0, ..Default::default() };
+        let set = SETTINGS.iter().find(|s| s.key == "cpu_max").unwrap();
+        assert_eq!(step_user_setting(&path, &cfg, set, false).unwrap(), "cpu_max = 75%");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my limits") && text.contains("# leave room for the editor"), "{text}");
+        assert!(text.contains("cpu_max = 75") && text.contains("mem_max = 70"), "{text}");
+        let hints = SETTINGS.iter().find(|s| s.key == "hints").unwrap();
+        assert_eq!(step_user_setting(&path, &cfg, hints, true).unwrap(), "hints = off");
+        let size = SETTINGS.iter().find(|s| s.key == "new_job_mem").unwrap();
+        assert_eq!(step_user_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
+        let c = read_layer(&path).unwrap().unwrap();
+        assert_eq!((c.cpu_max, c.hints, c.new_job_mem.as_deref()), (Some(75.0), Some(false), Some("1792M")));
     }
 }

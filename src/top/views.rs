@@ -1,9 +1,11 @@
 //! Drawing the dashboard's views.
 
 use super::chart::{self, AXIS_W, PALETTE, Stacked, WaitStrip, spark};
-use super::{App, Charts, Input, NS_SORTS, RANGES, RUN_SORTS, VIEWS, View};
+use super::{App, Charts, Click, Input, NS_SORTS, RANGES, RUN_SORTS, VIEWS, View};
+use crate::config::{SETTINGS, SettingKind};
 use crate::dash::{self, Marker};
 use crate::report::{self, chrono_like, datetime, dur, gb};
+use crossterm::event::KeyCode;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -17,6 +19,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let [head, tabs, main, foot] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)]).areas(f.area());
     draw_header(f, app, head);
+    app.hits.clear();
     draw_tabs(f, app, tabs);
     app.list_rows = (0, 0, 0);
     match app.view {
@@ -27,6 +30,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Trends => trends(f, app, main),
         View::Warnings => warnings(f, app, main),
         View::Namespaces => namespaces(f, app, main),
+        View::Config => config_view(f, app, main),
         View::Help => help(f, main),
     }
     draw_footer(f, app, foot);
@@ -58,66 +62,103 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     if !d.warnings.is_empty() {
         spans.push(Span::styled(
-            format!("⚠ {} warnings (6)", d.warnings.len()),
+            format!("⚠ {} warnings ({})", d.warnings.len(), VIEWS.iter().position(|(v, _)| *v == View::Warnings).unwrap_or(0) + 1),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
     let mut spans = Vec::new();
+    let mut x = area.x;
+    // The Job view has no tab; the tab it was opened from stays marked.
+    let current = if app.view == View::Job { app.back.0 } else { app.view };
     for (i, (v, name)) in VIEWS.iter().enumerate() {
-        let style = if *v == app.view {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
-        } else if *v == View::Job && app.job_key.is_none() {
-            DIM
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(format!(" {} {} ", i + 1, name), style));
+        let style = if *v == current { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default() };
+        let label = format!(" {} {} ", i + 1, name);
+        let w = label.chars().count() as u16;
+        app.hits.push((area.y, x, x + w - 1, Click::Tab(*v)));
+        x += w + 1;
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
+    }
+    if app.view == View::Job {
+        spans.push(Span::styled(" › job ", Style::default().fg(Color::Black).bg(Color::Cyan)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let text = match &app.input {
-        Input::Filter(t) => format!("filter keys: {t}▏   Enter apply, Esc cancel"),
-        Input::ConfirmKill(pid, key) => format!("send SIGTERM to {key} (pid {pid})? y / n"),
-        Input::None => match &app.message {
-            Some(m) => m.clone(),
-            None => {
-                let common = "q quit  1-8/Tab views  t range  n namespace  / filter  Esc clear  space pause";
-                let extra = match app.view {
-                    View::Overview => "  ←/→ time cursor  c/m/b charts  o other layer",
-                    View::Queue => "  ↑/↓ select  Enter job  k stop job",
-                    View::Runs => {
-                        return f.render_widget(
-                            Paragraph::new(format!(
-                                "{common}  ↑/↓ select  Enter job  s sort ({})  r reverse",
-                                RUN_SORTS[app.sort % RUN_SORTS.len()]
-                            ))
-                            .style(DIM),
-                            area,
-                        );
-                    }
-                    View::Namespaces => {
-                        return f.render_widget(
-                            Paragraph::new(format!("{common}  s sort ({})  r reverse  Enter top job", NS_SORTS[app.sort % NS_SORTS.len()]))
-                                .style(DIM),
-                            area,
-                        );
-                    }
-                    View::Trends | View::Warnings => "  ↑/↓ select  Enter job",
-                    View::Job => "  Esc back",
-                    View::Help => "",
-                };
-                format!("{common}{extra}")
-            }
-        },
+        Input::Filter(t) => Some(format!("filter keys: {t}▏   Enter apply, Esc cancel")),
+        Input::ConfirmKill(pid, key) => Some(format!("send SIGTERM to {key} (pid {pid})? y / n")),
+        Input::ConfirmStart(_, key) => Some(format!("start {key} now, whatever the limits say? y / n")),
+        Input::EditNeeds(_, key, t) => Some(format!("needs of {key} for this run, as CORES MEMORY: {t}▏   Enter apply, Esc cancel")),
+        Input::None => app.message.clone(),
     };
-    f.render_widget(Paragraph::new(text).style(DIM), area);
+    if let Some(text) = text {
+        f.render_widget(Paragraph::new(text).style(DIM), area);
+        return;
+    }
+    // Each item is a key and what it does; a click on it presses the key.
+    let mut items: Vec<(String, &str, Option<KeyCode>)> =
+        vec![("q".into(), "quit", Some(KeyCode::Char('q'))), ("⇧←/→".into(), "tabs", None)];
+    let view_items: Vec<(String, &str, Option<KeyCode>)> = match app.view {
+        View::Overview => vec![
+            ("t".into(), "range", Some(KeyCode::Char('t'))),
+            ("n".into(), "namespace", Some(KeyCode::Char('n'))),
+            ("←/→".into(), "time cursor", None),
+            ("c/m/b".into(), "charts", None),
+            ("o".into(), "other layer", Some(KeyCode::Char('o'))),
+        ],
+        View::Queue => vec![
+            ("↑/↓".into(), "select", None),
+            ("Enter".into(), "details", Some(KeyCode::Enter)),
+            ("g".into(), "start now", Some(KeyCode::Char('g'))),
+            ("e".into(), "edit needs", Some(KeyCode::Char('e'))),
+            ("k".into(), "stop", Some(KeyCode::Char('k'))),
+        ],
+        View::Runs => vec![
+            ("↑/↓".into(), "select", None),
+            ("Enter".into(), "details", Some(KeyCode::Enter)),
+            ("s".into(), RUN_SORTS[app.sort % RUN_SORTS.len()], Some(KeyCode::Char('s'))),
+            ("r".into(), "reverse", Some(KeyCode::Char('r'))),
+            ("/".into(), "filter", Some(KeyCode::Char('/'))),
+        ],
+        View::Namespaces => vec![
+            ("s".into(), NS_SORTS[app.sort % NS_SORTS.len()], Some(KeyCode::Char('s'))),
+            ("r".into(), "reverse", Some(KeyCode::Char('r'))),
+            ("Enter".into(), "top job", Some(KeyCode::Enter)),
+            ("t".into(), "range", Some(KeyCode::Char('t'))),
+        ],
+        View::Trends | View::Warnings => vec![("↑/↓".into(), "select", None), ("Enter".into(), "details", Some(KeyCode::Enter))],
+        View::Job => vec![("Esc".into(), "back", Some(KeyCode::Esc))],
+        View::Config => vec![
+            ("↑/↓".into(), "select", None),
+            ("←/-".into(), "lower", Some(KeyCode::Left)),
+            ("→/+".into(), "raise", Some(KeyCode::Right)),
+        ],
+        View::Help => vec![],
+    };
+    items.extend(view_items);
+    if app.view != View::Job && app.job_key.is_some() {
+        items.push(("j".into(), "last job", Some(KeyCode::Char('j'))));
+    }
+    items.push(("space".into(), if app.paused { "resume" } else { "pause" }, Some(KeyCode::Char(' '))));
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (key, what, code) in items {
+        let label = format!("{key} {what}");
+        let w = label.chars().count() as u16;
+        if let Some(code) = code {
+            app.hits.push((area.y, x, x + w - 1, Click::Key(code)));
+        }
+        x += w + 2;
+        spans.push(Span::styled(key, Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {what}  "), DIM));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // -------------------------------------------------------------- overview ----
@@ -282,6 +323,64 @@ fn remember_rows(app: &mut App, area: Rect, header: u16, state: &TableState, len
     app.list_rows = (area.y + header, visible.min(len.saturating_sub(first)), first);
 }
 
+/// Draw a table. When it has more rows than fit, the last line says how many
+/// rows are hidden above and below.
+fn render_list(f: &mut Frame, app: &mut App, table: Table, area: Rect, header: u16, len: usize) {
+    let fits = (area.height.saturating_sub(header) as usize) >= len;
+    let (list, hint) = if fits || area.height <= header + 2 {
+        (area, None)
+    } else {
+        let [list, hint] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        (list, Some(hint))
+    };
+    let mut st = table_state(app);
+    f.render_stateful_widget(table, list, &mut st);
+    remember_rows(app, list, header, &st, len);
+    if let Some(hint) = hint {
+        let shown = app.list_rows.1;
+        let above = st.offset();
+        let below = len.saturating_sub(above + shown);
+        let mut parts = Vec::new();
+        if above > 0 {
+            parts.push(format!("↑ {above} more above"));
+        }
+        if below > 0 {
+            parts.push(format!("↓ {below} more below"));
+        }
+        let text = format!("  {}   (↑/↓ or the mouse wheel to scroll)", parts.join("   "));
+        f.render_widget(Paragraph::new(text).style(Style::default().fg(Color::Cyan)), hint);
+    }
+}
+
+/// A bar in colour: in use within the estimates, in use above them (red),
+/// promised to running jobs (yellow), free, and the limit.
+fn color_bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: usize) -> Vec<Span<'static>> {
+    if total <= 0.0 {
+        return vec![Span::raw("·".repeat(width))];
+    }
+    let cell = |v: f64| ((v / total) * width as f64).round().clamp(0.0, width as f64) as usize;
+    let u = cell(used);
+    let o = u - cell(used - over.min(used)).min(u);
+    let r = cell(used + reserved).max(u);
+    let l = (((limit / total) * width as f64).floor().max(0.0) as usize).min(width.saturating_sub(1));
+    let mut spans: Vec<Span> = Vec::new();
+    for i in 0..width {
+        let (ch, color) = if i == l && l + 1 < width {
+            ("│", Color::Yellow)
+        } else if i < u - o {
+            ("█", Color::Gray)
+        } else if i < u {
+            ("█", Color::Red)
+        } else if i < r {
+            ("▒", Color::Yellow)
+        } else {
+            ("·", Color::DarkGray)
+        };
+        spans.push(Span::styled(ch, Style::default().fg(color)));
+    }
+    spans
+}
+
 // ----------------------------------------------------------------- queue ----
 
 fn queue(f: &mut Frame, app: &mut App, area: Rect) {
@@ -290,31 +389,70 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     let m = &s.machine;
+    let (over_cpu, over_mem) = crate::queue::over(&s.running);
+    let over_text = |v: String, over: bool| if over { format!("  {v} over estimates") } else { String::new() };
+    let mut cpu = vec![Span::raw("CPU     [")];
+    cpu.extend(color_bar(m.cpu_busy, over_cpu, s.reserve_cpu, m.ncpu as f64, s.cpu_limit, 24));
+    cpu.push(Span::raw(format!(
+        "]  {:>5.1} busy  +{:.1} promised  of {:.1} cores  limit {:.0}%",
+        m.cpu_busy, s.reserve_cpu, m.ncpu as f64, s.limits.cpu_max_pct
+    )));
+    cpu.push(Span::styled(over_text(format!("{over_cpu:.1} cores"), over_cpu >= 0.05), Style::default().fg(Color::Red)));
+    let mut mem = vec![Span::raw("MEMORY  [")];
+    mem.extend(color_bar(m.mem_used_kb as f64, over_mem as f64, s.reserve_mem_kb as f64, m.mem_total_kb as f64, s.mem_limit_kb as f64, 24));
+    mem.push(Span::raw(format!(
+        "]  {} held  +{} promised  of {}  limit {:.0}%",
+        gb(m.mem_used_kb),
+        gb(s.reserve_mem_kb),
+        gb(m.mem_total_kb),
+        s.limits.mem_max_pct
+    )));
+    mem.push(Span::styled(over_text(gb(over_mem), over_mem >= 1024), Style::default().fg(Color::Red)));
     let bars = vec![
-        Line::raw(format!(
-            "CPU     [{}]  {:>5.1} busy  +{:.1} promised to running jobs  of {:.1} cores  limit {:.0}%",
-            report::bar(m.cpu_busy, s.reserve_cpu, m.ncpu as f64, s.cpu_limit, 24),
-            m.cpu_busy,
-            s.reserve_cpu,
-            m.ncpu as f64,
-            s.limits.cpu_max_pct
-        )),
-        Line::raw(format!(
-            "MEMORY  [{}]  {} held  +{} promised  of {}  limit {:.0}%",
-            report::bar(m.mem_used_kb as f64, s.reserve_mem_kb as f64, m.mem_total_kb as f64, s.mem_limit_kb as f64, 24),
-            gb(m.mem_used_kb),
-            gb(s.reserve_mem_kb),
-            gb(m.mem_total_kb),
-            s.limits.mem_max_pct
-        )),
-        Line::styled("         # in use now   + promised to running jobs   | limit", DIM),
+        Line::from(cpu),
+        Line::from(mem),
+        Line::from(vec![
+            Span::raw("         "),
+            Span::styled("█", Style::default().fg(Color::Gray)),
+            Span::styled(" in use   ", DIM),
+            Span::styled("█", Style::default().fg(Color::Red)),
+            Span::styled(" jobs above their estimate   ", DIM),
+            Span::styled("▒", Style::default().fg(Color::Yellow)),
+            Span::styled(" promised to running jobs   ", DIM),
+            Span::styled("│", Style::default().fg(Color::Yellow)),
+            Span::styled(" limit", DIM),
+        ]),
     ];
     let n_rows = s.waiting.len() + s.running.len();
     let [top, list, why] =
         Layout::vertical([Constraint::Length(4), Constraint::Length((n_rows as u16 + 2).clamp(3, 14)), Constraint::Min(6)]).areas(area);
     f.render_widget(Paragraph::new(bars), top);
 
+    let est = |e: &crate::queue::Entry| {
+        if e.by_hand.is_some() {
+            " set"
+        } else if e.known || e.raised_by_min {
+            ""
+        } else {
+            " est"
+        }
+    };
     let mut rows: Vec<Row> = Vec::new();
+    for e in &s.running {
+        let over = e.live_cpu > e.need_cpu + 0.05 || e.live_mem_kb > e.need_mem_kb;
+        rows.push(Row::new(vec![
+            Cell::from(if e.now { "NOW" } else { "RUN" }).style(Style::default().fg(Color::Green)),
+            Cell::from(trunc(&e.key, 44)),
+            Cell::from(e.ns.clone()),
+            Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
+            Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))).style(if over {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            }),
+            Cell::from(format!("needs {:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
+        ]));
+    }
     for w in &s.waiting {
         let e = &w.entry;
         let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into());
@@ -323,19 +461,9 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             Cell::from(trunc(&e.key, 44)),
             Cell::from(e.ns.clone()),
             Cell::from(dur(s.now - e.queued_at)),
-            Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), if e.known || e.raised_by_min { "" } else { " est" })),
+            Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
             Cell::from(blocked)
                 .style(Style::default().fg(chart::blocker_color(report::main_blocker(&w.decision).map(|b| b.name()).unwrap_or("")))),
-        ]));
-    }
-    for e in &s.running {
-        rows.push(Row::new(vec![
-            Cell::from(if e.now { "NOW" } else { "RUN" }).style(Style::default().fg(Color::Green)),
-            Cell::from(trunc(&e.key, 44)),
-            Cell::from(e.ns.clone()),
-            Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
-            Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))),
-            Cell::from(format!("needs {:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), if e.known || e.raised_by_min { "" } else { " est" })),
         ]));
     }
     let table = Table::new(
@@ -351,15 +479,13 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(Row::new(vec!["", "job", "namespace", "time", "needs / now", "blocked by"]).style(BOLD))
     .row_highlight_style(Style::default().bg(Color::DarkGray))
-    .block(Block::new().borders(Borders::TOP).title(format!(" {} waiting, {} running ", s.waiting.len(), s.running.len())));
-    let mut st = table_state(app);
-    f.render_stateful_widget(table, list, &mut st);
-    remember_rows(app, list, 2, &st, n_rows);
+    .block(Block::new().borders(Borders::TOP).title(format!(" {} running, {} waiting ", s.running.len(), s.waiting.len())));
+    render_list(f, app, table, list, 2, n_rows);
 
     // The Why panel.
     let Some(s) = app.data.snap.as_ref() else { return };
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(w) = s.waiting.get(app.sel) {
+    if let Some(w) = app.queue_waiting() {
         let e = &w.entry;
         lines.push(Line::styled(format!("Why is {} waiting?", e.key), BOLD));
         for (ok, text) in report::rule_checks(s, w) {
@@ -384,7 +510,9 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             dur(s.now - e.queued_at),
             if e.bypassed_since.is_some() { "Newer jobs have passed it; after 2 minutes it gets a reservation." } else { "" }
         )));
-        if !e.known && !e.raised_by_min {
+        if let Some(h) = &e.by_hand {
+            lines.push(Line::styled(format!("Needs {h}, for this run only."), Style::default().fg(Color::Cyan)));
+        } else if !e.known && !e.raised_by_min {
             lines.push(Line::styled(
                 format!(
                     "First run: nothing is learned yet, so it reserves an estimate ({}). The run teaches its real needs.",
@@ -393,6 +521,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
                 DIM,
             ));
         }
+        lines.push(Line::styled("g start it now   e change its needs for this run   Enter details", DIM));
     } else if let Some((e, _)) = app.queue_row(app.sel) {
         lines.push(Line::styled(format!("{} is running", e.key), BOLD));
         lines.push(Line::raw(format!(
@@ -401,7 +530,9 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             gb(e.live_mem_kb),
             e.need_cpu,
             gb(e.need_mem_kb),
-            if e.known {
+            if e.by_hand.is_some() {
+                "set by hand"
+            } else if e.known {
                 "learned"
             } else if e.raised_by_min {
                 "minimum"
@@ -410,12 +541,17 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             },
             dur(s.now - e.started_at.unwrap_or(s.now))
         )));
+        if e.live_cpu > e.need_cpu + 0.05 || e.live_mem_kb > e.need_mem_kb {
+            lines
+                .push(Line::styled("it uses more than its estimate; the next run learns the higher need", Style::default().fg(Color::Red)));
+        }
         if let Some(d) = e.est_dur_s {
             lines.push(Line::raw(format!("usually takes {}, so about {} left", dur(d), dur(d - (s.now - e.started_at.unwrap_or(s.now))))));
         }
         if e.now {
             lines.push(Line::raw("it skipped the queue (--now); it is measured like any other job"));
         }
+        lines.push(Line::styled("Enter details: CPU and memory over time   e lower what it still reserves", DIM));
     } else {
         lines.push(Line::styled("The queue is empty. Every job started as soon as it arrived.", DIM));
     }
@@ -476,9 +612,7 @@ fn runs(f: &mut Frame, app: &mut App, area: Rect) {
         Row::new(vec!["ended", "namespace", "kind", "job", "waited", "took", "cores u/w", "peak", "exit", "blocker", "flags"]).style(BOLD),
     )
     .row_highlight_style(Style::default().bg(Color::DarkGray));
-    let mut st = table_state(app);
-    f.render_stateful_widget(table, list, &mut st);
-    remember_rows(app, list, 1, &st, n);
+    render_list(f, app, table, list, 1, n);
 
     let d = &app.data;
     let mut lines = Vec::new();
@@ -531,6 +665,10 @@ fn job(f: &mut Frame, app: &mut App, area: Rect) {
     lines.push(Line::raw(format!("needs memory: {mem_src}")));
     lines.push(Line::raw(format!("usually takes {}", l.dur_s.map(dur).unwrap_or("?".into()))));
     lines.push(Line::raw(""));
+    if let Some(live) = &j.live {
+        live_run(&mut lines, live, app.data.now, area.width.saturating_sub(24) as usize);
+        lines.push(Line::raw(""));
+    }
     let chrono: Vec<&dash::RunRow> = j.runs.iter().rev().collect();
     let series = |f: &dyn Fn(&dash::RunRow) -> Option<f64>| -> Vec<f64> { chrono.iter().filter_map(|r| f(r)).collect() };
     let w = 40;
@@ -583,9 +721,112 @@ fn job(f: &mut Frame, app: &mut App, area: Rect) {
     .header(Row::new(vec!["ended", "waited", "took", "cores u/w", "peak", "exit", "blocker", ""]).style(BOLD))
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .block(Block::new().borders(Borders::TOP).title(" last runs "));
-    let mut st = table_state(app);
-    f.render_stateful_widget(t, list, &mut st);
-    remember_rows(app, list, 2, &st, n);
+    render_list(f, app, t, list, 2, n);
+}
+
+/// The run that is going on now: its load over time, next to its needs, and
+/// the signs of starvation that the end of the run will judge.
+fn live_run(lines: &mut Vec<Line<'static>>, live: &super::LiveRun, now: f64, w: usize) {
+    let e = &live.entry;
+    let red = Style::default().fg(Color::Red);
+    if live.waiting {
+        lines.push(Line::styled(format!("WAITING for {}  {}", dur(now - e.queued_at), e.blocker.clone().unwrap_or_default()), BOLD));
+        return;
+    }
+    let started = e.started_at.unwrap_or(now);
+    lines.push(Line::styled(format!("RUNNING for {}  (this run, oldest → now)", dur(now - started)), BOLD));
+    let s = &live.samples;
+    let w = w.clamp(10, 80);
+    let used: Vec<f64> = s.iter().map(|x| x.1).collect();
+    let wanted: Vec<f64> = s.iter().map(|x| x.2).collect();
+    let mem: Vec<f64> = s.iter().map(|x| x.3 as f64).collect();
+    let peak_mem = s.iter().map(|x| x.3).max().unwrap_or(0);
+    let peak_cpu = used.iter().copied().fold(0.0, f64::max);
+    let over = |v: bool| if v { red } else { Style::default() };
+    lines.push(Line::from(vec![
+        Span::raw(format!("cores used    {}  ", spark(&used, w))),
+        Span::styled(format!("now {:.1}, peak {peak_cpu:.1}, needs {:.1}", e.live_cpu, e.need_cpu), over(e.live_cpu > e.need_cpu + 0.05)),
+    ]));
+    lines.push(Line::raw(format!("cores wanted  {}", spark(&wanted, w))));
+    lines.push(Line::from(vec![
+        Span::raw(format!("memory        {}  ", spark(&mem, w))),
+        Span::styled(
+            format!("now {}, peak {}, needs {}", gb(e.live_mem_kb), gb(peak_mem), gb(e.need_mem_kb)),
+            over(peak_mem > e.need_mem_kb),
+        ),
+    ]));
+    // The last 30 seconds, with the thresholds the end of the run uses.
+    let recent: Vec<_> = s.iter().filter(|x| x.0 >= now - 30.0).collect();
+    if recent.is_empty() {
+        lines.push(Line::styled("no samples yet", DIM));
+        return;
+    }
+    let n = recent.len() as f64;
+    let (u, wa, pg) = recent.iter().fold((0.0, 0.0, 0.0), |a, x| (a.0 + x.1 / n, a.1 + x.2 / n, a.2 + x.4 / n));
+    let wait_ratio = if u > 0.05 { (wa - u).max(0.0) / u } else { 0.0 };
+    let cpu_starved = wait_ratio > crate::insight::CPU_WAIT_RATIO;
+    lines.push(Line::from(vec![
+        Span::styled(if cpu_starved { " ✗ " } else { " ✓ " }, if cpu_starved { red } else { Style::default().fg(Color::Green) }),
+        Span::raw(format!(
+            "CPU: its threads wait for a core {:.0}% as long as they run (starved above {:.0}%); wants {wa:.1} cores, gets {u:.1}",
+            wait_ratio * 100.0,
+            crate::insight::CPU_WAIT_RATIO * 100.0
+        )),
+    ]));
+    let mem_starved = pg > crate::insight::PAGEINS_PER_S;
+    lines.push(Line::from(vec![
+        Span::styled(if mem_starved { " ✗ " } else { " ✓ " }, if mem_starved { red } else { Style::default().fg(Color::Green) }),
+        Span::raw(format!(
+            "memory: {pg:.0} page-ins per second (short of memory above {:.0}, while the machine is under memory pressure)",
+            crate::insight::PAGEINS_PER_S
+        )),
+    ]));
+    if let Some(h) = &e.by_hand {
+        lines.push(Line::styled(format!("needs {h}, for this run only"), Style::default().fg(Color::Cyan)));
+    }
+}
+
+// ---------------------------------------------------------------- config ----
+
+fn config_view(f: &mut Frame, app: &mut App, area: Rect) {
+    let user = crate::config::user_config_path().display().to_string();
+    let rows: Vec<Row> = SETTINGS
+        .iter()
+        .map(|set| {
+            let origin = app.cfg.origin.get(set.key).cloned().unwrap_or_else(|| "built-in".into());
+            let elsewhere = origin != "built-in" && origin != user;
+            let kind = match set.kind {
+                SettingKind::Bool => "on / off",
+                SettingKind::Number(..) => "number",
+                SettingKind::Size(..) => "size",
+            };
+            Row::new(vec![
+                Cell::from(set.key),
+                Cell::from(app.cfg.setting_text(set.key)).style(BOLD),
+                Cell::from(if elsewhere { format!("{origin} (wins over your change)") } else { origin }).style(if elsewhere {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    DIM
+                }),
+                Cell::from(format!("{} ({kind})", set.what)),
+            ])
+        })
+        .collect();
+    let [top, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).areas(area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!("Changes are saved in {user}. They apply to every job on this machine,")),
+            Line::raw("waiting jobs included, unless a repo's .taskguard.toml or a [dir] section sets the same thing."),
+            Line::styled("The limits are the headroom: jobs start only while the machine stays under them.", DIM),
+        ]),
+        top,
+    );
+    let n = rows.len();
+    let table = Table::new(rows, [Constraint::Length(17), Constraint::Length(8), Constraint::Length(34), Constraint::Min(20)])
+        .header(Row::new(vec!["setting", "value", "set by", "what it does"]).style(BOLD))
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .block(Block::new().borders(Borders::TOP));
+    render_list(f, app, table, list, 2, n);
 }
 
 // ---------------------------------------------------------------- trends ----
@@ -640,9 +881,7 @@ fn trends(f: &mut Frame, app: &mut App, area: Rect) {
     .header(Row::new(vec!["job", "namespace", "runs", "memory", "cores", "duration", "memory over all runs"]).style(BOLD))
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .block(Block::new().title(" median of the last 10 runs against the 10 before them; yellow > 25%, red > 50% "));
-    let mut st = table_state(app);
-    f.render_stateful_widget(table, list, &mut st);
-    remember_rows(app, list, 2, &st, n);
+    render_list(f, app, table, list, 2, n);
     let text = match app.data.trends.get(app.sel) {
         Some(t) => dash::trend_text(t),
         None => "no trends yet: a job needs 13 runs before its last 10 can be compared".into(),
@@ -718,9 +957,7 @@ fn namespaces(f: &mut Frame, app: &mut App, area: Rect) {
     .header(Row::new(vec!["namespace", "CPU-hours", "GB-hours", "runs", "waited", "failed", "starved", "top jobs by CPU"]).style(BOLD))
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .block(Block::new().title(format!(" last {} ", RANGES[app.range].0)));
-    let mut st = table_state(app);
-    f.render_stateful_widget(table, area, &mut st);
-    remember_rows(app, area, 2, &st, n);
+    render_list(f, app, table, area, 2, n);
 }
 
 // ------------------------------------------------------------------ help ----
@@ -729,19 +966,22 @@ fn help(f: &mut Frame, area: Rect) {
     let text = "\
 VIEWS
   1 Overview    machine load over time, with taskguard's jobs stacked per namespace
-  2 Queue       what runs and what waits, and a Why panel for the selected waiting job
+  2 Queue       what runs and what waits, and a Why panel for the selected job
   3 Runs        past runs; the panel below shows why the selected run waited
-  4 Job         one command: its learned needs, their history, and what taskguard changed
-  5 Trends      commands whose memory, CPU or duration grows
-  6 Warnings    possibly starved runs, suggested minimums, trend alerts, --now runs over a limit
-  7 Namespaces  load and waits per namespace
+  4 Trends      commands whose memory, CPU or duration grows
+  5 Warnings    possibly starved runs, suggested minimums, trend alerts, --now runs over a limit
+  6 Namespaces  load and waits per namespace
+  7 Config      limits and other settings, changed with ←/→ and saved in your config
   8 Help        this page
+  Enter on a row opens the job: its learned needs, its history, and the run going on now.
+  Esc or Backspace goes back; j opens the last job again.
 
 KEYS
-  q quit   1-8 / Tab views   t / T time range   n next namespace   / filter jobs   Esc clear or back
-  ←/→ time cursor (Overview)   c / m / b CPU, memory or both charts   o hide or show the \"other\" layer
-  ↑/↓ select   Enter open the job   s sort   r reverse   k stop a job (Queue)   space pause
-  mouse: click a row to select it; scroll to change the time range
+  q quit   1-8 / Tab / Shift, Option or Cmd + ←/→ views   t / T time range   n next namespace
+  / filter jobs   Esc clear or back   ←/→ time cursor (Overview)   c / m / b charts   o the \"other\" layer
+  ↑/↓ select   Enter details   s sort   r reverse   space pause
+  Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
+  mouse: click a tab, a key in the bottom line, or a row; the wheel scrolls lists and zooms the Overview
 
 CHART LAYERS (Overview)
   ██ coloured   load of jobs taskguard started, one colour per namespace
@@ -889,10 +1129,138 @@ mod tests {
         assert_eq!((app.data.from / 3.0).fract(), 0.0, "edges sit on whole multiples of the width");
     }
 
+    /// One running and one waiting job, both owned by this test process.
+    fn with_queue(app: &mut App, running_over: bool) {
+        let q = crate::queue::Queue::open(&app.dir).unwrap();
+        let pid = std::process::id() as i32;
+        let base = crate::queue::Entry { pid, ns: "dalp".into(), known: true, version: Some("0.1.3".into()), ..Default::default() };
+        let run = crate::queue::Entry {
+            key: "packages/big:build".into(),
+            started_at: Some(now() - 30.0),
+            need_cpu: 2.0,
+            need_mem_kb: 1 << 20,
+            live_cpu: if running_over { 5.0 } else { 1.0 },
+            live_mem_kb: if running_over { 3 << 20 } else { 1 << 19 },
+            ..base.clone()
+        };
+        let wait = crate::queue::Entry {
+            ticket: 2,
+            key: "packages/small:tsc".into(),
+            queued_at: now() - 5.0,
+            need_cpu: 1.0,
+            need_mem_kb: 1 << 19,
+            ..base
+        };
+        q.write(&q.run_path(pid), &run).unwrap();
+        q.write(&q.wait_path(&wait), &wait).unwrap();
+        app.load().unwrap();
+    }
+
+    #[test]
+    fn queue_lists_running_jobs_first_and_marks_overage() {
+        let (_t, mut app) = fixture();
+        with_queue(&mut app, true);
+        app.view = View::Queue;
+        let s = screen(&mut app, 150, 30);
+        let (run, wait) = (s.find("packages/big:build").unwrap(), s.find("packages/small:tsc").unwrap());
+        assert!(run < wait, "the running job is listed first:\n{s}");
+        assert!(s.contains("over estimates"), "{s}");
+        assert!(s.contains("uses more than its estimate"), "the first row is selected: the running job\n{s}");
+        app.sel = 1;
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("Why is packages/small:tsc waiting?"), "{s}");
+    }
+
+    #[test]
+    fn enter_opens_a_job_and_esc_returns_to_the_same_row() {
+        let (_t, mut app) = fixture();
+        with_queue(&mut app, false);
+        app.view = View::Queue;
+        app.sel = 1;
+        let press = |app: &mut App, code| {
+            app.key(crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+        };
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((app.view, app.job_key.as_deref()), (View::Job, Some("packages/small:tsc")));
+        app.load().unwrap();
+        let s = screen(&mut app, 150, 40);
+        assert!(s.contains("WAITING for"), "a job that waits now shows it:\n{s}");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!((app.view, app.sel), (View::Queue, 1));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.view, View::Job, "j opens the last job again");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Queue);
+    }
+
+    #[test]
+    fn a_running_job_shows_its_load_over_time() {
+        let (_t, mut app) = fixture();
+        let db = crate::db::Db::open_dir(&app.dir).unwrap();
+        let pid = std::process::id() as i32;
+        let id = db.insert_run(&NewRun { ns: "dalp", key: "packages/live:vitest", ..Default::default() }).unwrap();
+        for i in 0..20 {
+            // Wants 6 cores, gets 2: its threads wait twice as long as they run.
+            db.job_sample(id, now() - 40.0 + i as f64 * 2.0, 2.0, 2.0, 6.0, (1 + i) << 18, 0.0).unwrap();
+        }
+        let q = crate::queue::Queue::open(&app.dir).unwrap();
+        let e = crate::queue::Entry {
+            pid,
+            run_id: id,
+            key: "packages/live:vitest".into(),
+            started_at: Some(now() - 40.0),
+            need_cpu: 6.0,
+            need_mem_kb: 8 << 20,
+            live_cpu: 2.0,
+            live_mem_kb: 5 << 20,
+            ..Default::default()
+        };
+        q.write(&q.run_path(pid), &e).unwrap();
+        app.job_key = Some("packages/live:vitest".into());
+        app.view = View::Job;
+        app.load().unwrap();
+        let s = screen(&mut app, 160, 40);
+        assert!(s.contains("RUNNING for"), "{s}");
+        assert!(s.contains("cores used") && s.contains("memory") && s.contains("needs 8.0 GB"), "{s}");
+        assert!(s.contains("✗ CPU: its threads wait for a core 200%"), "{s}");
+    }
+
+    #[test]
+    fn long_lists_say_how_many_rows_are_hidden() {
+        let (_t, mut app) = fixture();
+        let db = crate::db::Db::open_dir(&app.dir).unwrap();
+        for i in 0..40 {
+            let id = db.insert_run(&NewRun { ns: "dalp", key: &format!("k{i}"), ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+            db.finish_run(id, &RunResult { ended_at: now(), measured: true, peak_mem_kb: 1, ..Default::default() }).unwrap();
+        }
+        app.view = View::Runs;
+        app.load().unwrap();
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("more below"), "{s}");
+        app.sel = 35;
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("more above"), "{s}");
+    }
+
+    #[test]
+    fn clicks_on_tabs_and_footer_keys() {
+        let (_t, mut app) = fixture();
+        let _ = screen(&mut app, 150, 30);
+        let (y, x, _, _) = *app.hits.iter().find(|h| h.3 == Click::Tab(View::Trends)).unwrap();
+        app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x + 1, y);
+        assert_eq!(app.view, View::Trends);
+        let _ = screen(&mut app, 150, 30);
+        let (y, x, _, _) = *app.hits.iter().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
+        app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
+        assert!(app.paused, "a click on 'space pause' pauses");
+    }
+
     #[test]
     fn every_view_renders_on_a_small_screen() {
         let (_t, mut app) = fixture();
-        for (v, _) in VIEWS {
+        app.job_key = Some("packages/api:vitest_run".into());
+        for v in VIEWS.iter().map(|(v, _)| *v).chain([View::Job]) {
             app.view = v;
             let _ = screen(&mut app, 60, 12);
         }
