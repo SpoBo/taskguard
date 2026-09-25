@@ -154,3 +154,11 @@ pub fn proc_name(pid: i32) -> String {
     }
     String::from_utf8_lossy(&buf[..n as usize]).into_owned()
 }
+
+/// The program's path. Some programs have a name that says little: Claude
+/// Code's process is named after its version, for example "2.1.282".
+pub fn proc_path(pid: i32) -> Option<String> {
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}

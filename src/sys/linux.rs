@@ -104,3 +104,8 @@ pub fn proc_sample(pid: i32) -> Option<ProcSample> {
 pub fn proc_name(pid: i32) -> String {
     fs::read_to_string(format!("/proc/{pid}/comm")).map(|s| s.trim().to_string()).unwrap_or_else(|_| format!("pid {pid}"))
 }
+
+/// The program's path, for grouping processes that share a name.
+pub fn proc_path(pid: i32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.display().to_string())
+}

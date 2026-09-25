@@ -111,6 +111,33 @@ pub fn ns_series(db: &Db, from: f64, to: f64, n: usize, sample_every: f64) -> Re
     Ok(out)
 }
 
+/// Per group of programs outside taskguard (agents, browsers, ...): cores and
+/// memory per bucket. Each reading stands for the recorder interval before it.
+pub fn group_series(db: &Db, from: f64, to: f64, n: usize, every: f64) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
+    let w = (to - from) / n as f64;
+    let mut out: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+    type Row = (f64, String, f64, f64, f64);
+    let rows: Vec<Row> = if use_raw(from) {
+        let mut s = db.conn.prepare_cached("SELECT ts, grp, cores, mem_kb FROM group_samples WHERE ts >= ?1 AND ts < ?2 + 60")?;
+        s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as f64, every)))?
+            .collect::<std::result::Result<_, _>>()?
+    } else {
+        let mut s = db.conn.prepare_cached(
+            "SELECT (minute + 1) * 60, grp, cores_avg, mem_avg_kb FROM group_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2",
+        )?;
+        s.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?, r.get(3)?, 60.0)))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    for (t, g, c, m, span) in rows {
+        let v = out.entry(g).or_insert_with(|| vec![(0.0, 0.0); n]);
+        spread(t, span, from, w, n, |i, o| {
+            v[i].0 += c * o / w;
+            v[i].1 += m * o / w;
+        });
+    }
+    Ok(out)
+}
+
 /// How many jobs waited in each bucket, and the most common main blocker.
 pub fn waiting_series(db: &Db, from: f64, to: f64, n: usize) -> Result<Vec<(usize, String)>> {
     let w = (to - from) / n as f64;

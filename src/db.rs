@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS machine_1m (
   mem_avg_kb REAL, mem_max_kb REAL,
   waiting_max INTEGER
 );
+CREATE TABLE IF NOT EXISTS group_samples (
+  ts REAL NOT NULL,
+  grp TEXT NOT NULL,
+  cores REAL NOT NULL,
+  mem_kb INTEGER NOT NULL,
+  procs INTEGER NOT NULL,
+  top TEXT
+);
+CREATE INDEX IF NOT EXISTS group_samples_ts ON group_samples(ts);
+CREATE TABLE IF NOT EXISTS group_1m (
+  minute INTEGER NOT NULL,
+  grp TEXT NOT NULL,
+  cores_avg REAL, mem_avg_kb REAL,
+  PRIMARY KEY (minute, grp)
+);
 CREATE TABLE IF NOT EXISTS ns_1m (
   minute INTEGER NOT NULL,
   ns TEXT NOT NULL,
@@ -124,6 +139,17 @@ CREATE TABLE IF NOT EXISTS ns_1m (
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// One group of programs outside taskguard at one moment.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupReading {
+    pub group: String,
+    pub cores: f64,
+    pub mem_kb: u64,
+    pub procs: usize,
+    /// Its biggest programs, in words: "claude ×20 5.3 GB, bun ×8 1.0 GB".
+    pub top: String,
 }
 
 /// What history says about one key.
@@ -407,6 +433,42 @@ impl Db {
     }
 
     /// The biggest processes outside taskguard at the latest reading.
+    /// One reading of the groups of programs outside taskguard: per group,
+    /// cores, memory, the number of processes, and its biggest programs.
+    pub fn group_samples(&self, ts: f64, rows: &[GroupReading]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt =
+                tx.prepare_cached("INSERT INTO group_samples (ts, grp, cores, mem_kb, procs, top) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+            for g in rows {
+                stmt.execute(params![ts, g.group, g.cores, g.mem_kb as i64, g.procs as i64, g.top])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest reading per group, biggest memory first.
+    pub fn latest_groups(&self) -> Result<Vec<GroupReading>> {
+        let ts: Option<f64> = self.conn.query_row("SELECT max(ts) FROM group_samples", [], |r| r.get(0)).optional()?.flatten();
+        let Some(ts) = ts else { return Ok(Vec::new()) };
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT grp, cores, mem_kb, procs, coalesce(top, '') FROM group_samples WHERE ts = ?1 ORDER BY mem_kb DESC")?;
+        let rows = stmt
+            .query_map([ts], |r| {
+                Ok(GroupReading {
+                    group: r.get(0)?,
+                    cores: r.get(1)?,
+                    mem_kb: r.get::<_, i64>(2)? as u64,
+                    procs: r.get::<_, i64>(3)? as usize,
+                    top: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn latest_top_procs(&self) -> Result<Vec<(String, u64, f64)>> {
         let ts: Option<f64> = self.conn.query_row("SELECT max(ts) FROM top_procs", [], |r| r.get(0)).optional()?.flatten();
         let Some(ts) = ts else { return Ok(Vec::new()) };
@@ -438,6 +500,12 @@ impl Db {
              GROUP BY m, r.ns",
             params![last, upto_min, sample_every],
         )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO group_1m (minute, grp, cores_avg, mem_avg_kb)
+             SELECT CAST(ts / 60 AS INTEGER) AS m, grp, avg(cores), avg(mem_kb)
+             FROM group_samples WHERE ts >= ?1 * 60 AND ts < ?2 * 60 GROUP BY m, grp",
+            params![last, upto_min],
+        )?;
         Ok(())
     }
 
@@ -447,6 +515,8 @@ impl Db {
         self.conn.execute("DELETE FROM machine_samples WHERE ts < ?1", [raw_cut])?;
         self.conn.execute("DELETE FROM job_samples WHERE ts < ?1", [raw_cut])?;
         self.conn.execute("DELETE FROM top_procs WHERE ts < ?1", [raw_cut])?;
+        self.conn.execute("DELETE FROM group_samples WHERE ts < ?1", [raw_cut])?;
+        self.conn.execute("DELETE FROM group_1m WHERE minute < ?1", [roll_cut])?;
         self.conn.execute("DELETE FROM wait_spans WHERE to_ts < ?1", [raw_cut])?;
         self.conn.execute("DELETE FROM machine_1m WHERE minute < ?1", [roll_cut])?;
         self.conn.execute("DELETE FROM ns_1m WHERE minute < ?1", [roll_cut])?;
@@ -503,7 +573,9 @@ mod tests {
             "wait_spans.run_id",
             "wait_spans.to_ts",
         ];
-        let mut want: Vec<String> = v0_1_0.iter().map(|s| s.to_string()).collect();
+        // Tables added later: only versions that know them write to them.
+        let added = ["group_samples.cores", "group_samples.grp", "group_samples.mem_kb", "group_samples.procs", "group_samples.ts"];
+        let mut want: Vec<String> = v0_1_0.iter().chain(added.iter()).map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(required, want);
     }

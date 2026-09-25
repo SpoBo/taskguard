@@ -200,6 +200,13 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
             d.ns.iter()
                 .map(|(ns, v)| (ns.clone(), ns_color(app, ns), v.iter().map(|x| if is_cpu { x.0 } else { x.1 }).collect()))
                 .collect();
+        // Groups in a fixed order, biggest first by what they hold now.
+        let mut groups: Vec<(String, Color, Vec<f64>)> = d
+            .groups
+            .iter()
+            .map(|(g, v)| (g.clone(), chart::group_color(g), v.iter().map(|x| if is_cpu { x.0 } else { x.1 }).collect()))
+            .collect();
+        groups.sort_by_key(|(g, _, _)| d.groups_now.iter().position(|x| &x.group == g).unwrap_or(usize::MAX));
         let fmt_cpu = |v: f64| format!("{v:.0}c");
         let fmt_mem = |v: f64| if v <= 0.0 { "0G".into() } else { gb(v as u64).replace(" GB", "G").replace(" MB", "M") };
         let (max, limit, fmt, title): (f64, f64, &dyn Fn(f64) -> String, &str) = if is_cpu {
@@ -208,7 +215,17 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
             (d.mem_total_kb, d.mem_total_kb * app.cfg.mem_max / 100.0, &fmt_mem, "Memory")
         };
         f.render_widget(
-            Stacked { total: &total, layers: &layers, max, limit, show_other: app.show_other, cursor: app.cursor, fmt, title },
+            Stacked {
+                total: &total,
+                layers: &layers,
+                groups: &groups,
+                max,
+                limit,
+                show_other: app.show_other,
+                cursor: app.cursor,
+                fmt,
+                title,
+            },
             rows[1 + i],
         );
     }
@@ -267,16 +284,44 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
         None => d.machine.iter().rev().find(|b| b.has_data).cloned().unwrap_or_default(),
     };
     if app.show_other {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled("not started by taskguard:", DIM));
+        let mut theirs = (0.0, 0.0);
+        let mut groups: Vec<(&String, &Vec<(f64, f64)>)> = d.groups.iter().collect();
+        groups.sort_by_key(|(g, _)| d.groups_now.iter().position(|x| &x.group == *g).unwrap_or(usize::MAX));
+        for (g, v) in groups {
+            let ((mut c, mut m), (pc, pm)) = pick(v);
+            // Without a cursor, "now" is the newest reading: the newest
+            // column is still filling up.
+            if at.is_none() {
+                let latest = d.groups_now.iter().find(|x| &x.group == g);
+                (c, m) = latest.map(|x| (x.cores, x.mem_kb as f64)).unwrap_or((0.0, 0.0));
+            }
+            if pc.max(c) < 0.05 && pm.max(m) < 50.0 * 1024.0 {
+                continue;
+            }
+            theirs.0 += c;
+            theirs.1 += m;
+            lines.push(Line::from(vec![
+                Span::styled("▒▒ ", Style::default().fg(chart::group_color(g))),
+                Span::styled(format!("{g:<14}"), BOLD),
+                Span::raw(format!(" {c:>4.1}c {:>8}", gb(m as u64))),
+            ]));
+            // Now: the biggest programs in the group, which could be closed.
+            match (at, d.groups_now.iter().find(|x| &x.group == g)) {
+                (None, Some(x)) if !x.top.is_empty() => lines.push(Line::styled(format!("   {}", trunc(&x.top, 34)), DIM)),
+                _ => lines.push(Line::styled(format!("                peak {pc:>4.1}c {:>8}", gb(pm as u64)), DIM)),
+            }
+        }
         lines.push(Line::from(vec![
             Span::styled("░░ ", DIM),
             Span::raw(format!(
                 "{:<14} {:>4.1}c {:>8}",
                 "other",
-                (machine_at.cpu - ours.0).max(0.0),
-                gb((machine_at.mem_kb - ours.1).max(0.0) as u64)
+                (machine_at.cpu - ours.0 - theirs.0).max(0.0),
+                gb((machine_at.mem_kb - ours.1 - theirs.1).max(0.0) as u64)
             )),
         ]));
-        lines.push(Line::styled("   (not started by taskguard)", DIM));
     }
     lines.push(Line::from(vec![
         Span::styled("╌╌ ", Style::default().fg(Color::Yellow)),
@@ -500,9 +545,20 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         }
         if let Some(b) = report::main_blocker(&w.decision)
             && b.name() == "memory"
-            && let Some((name, mem, _)) = s.top_other.first()
         {
-            lines.push(Line::raw(format!("  the biggest user outside taskguard is {name} ({})", gb(*mem))));
+            let groups: Vec<String> = app
+                .data
+                .groups_now
+                .iter()
+                .filter(|g| g.mem_kb >= 256 * 1024)
+                .take(3)
+                .map(|g| format!("{} {} ({})", g.group, gb(g.mem_kb), g.top))
+                .collect();
+            if !groups.is_empty() {
+                lines.push(Line::raw(format!("  outside taskguard now: {}", groups.join("; "))));
+            } else if let Some((name, mem, _)) = s.top_other.first() {
+                lines.push(Line::raw(format!("  the biggest user outside taskguard is {name} ({})", gb(*mem))));
+            }
         }
         let since = e.blocker_since.map(|t| format!(" for {}", dur(s.now - t))).unwrap_or_default();
         lines.push(Line::raw(format!(
@@ -985,7 +1041,9 @@ KEYS
 
 CHART LAYERS (Overview)
   ██ coloured   load of jobs taskguard started, one colour per namespace
-  ░░ grey       the rest of the machine's load: things taskguard did not start
+  ▒▒ muted      load taskguard did not start, per group: agents (with what they started), browsers,
+                editors, dev services, containers, chat & apps; the legend names the biggest programs
+  ░░ grey       the rest of the machine's load
   ╌╌ yellow     the limit (cpu_max, mem_max)
   waiting row   how many jobs waited, coloured by the main reason:
                 red CPU, magenta memory, yellow slots, blue reservation, cyan learning
@@ -1073,6 +1131,37 @@ mod tests {
         assert!(s.contains("█") && s.contains("░"), "both our layer and the other layer are drawn:\n{s}");
         assert!(s.contains('!'), "the starved run is marked:\n{s}");
         assert!(s.contains("⚠"), "the warning badge shows on every view");
+    }
+
+    #[test]
+    fn programs_outside_taskguard_are_shown_by_group() {
+        let (_t, mut app) = fixture();
+        let db = crate::db::Db::open_dir(&app.dir).unwrap();
+        for i in 0..30 {
+            let t = now() - 60.0 + i as f64 * 2.0;
+            let g = |group: &str, cores, mem_kb, top: &str| crate::db::GroupReading {
+                group: group.into(),
+                cores,
+                mem_kb,
+                procs: 1,
+                top: top.into(),
+            };
+            db.group_samples(
+                t,
+                &[g("agents", 1.5, 6 << 20, "claude ×20 5.0 GB, bun ×8 1.0 GB"), g("browsers", 0.2, 1 << 20, "Google Chrome ×12 1.0 GB")],
+            )
+            .unwrap();
+        }
+        app.load().unwrap();
+        let s = screen(&mut app, 160, 40);
+        assert!(s.contains("not started by taskguard"), "{s}");
+        let (agents, browsers) = (s.find("agents").unwrap(), s.find("browsers").unwrap());
+        assert!(agents < browsers, "the biggest group comes first:\n{s}");
+        assert!(s.contains("6.0 GB") && s.contains("claude ×20"), "{s}");
+        assert!(s.contains('▒'), "the groups are drawn in the chart:\n{s}");
+        app.show_other = false;
+        let s = screen(&mut app, 160, 40);
+        assert!(!s.contains("not started by taskguard"), "o hides everything taskguard did not start");
     }
 
     #[test]

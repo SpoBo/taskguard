@@ -7,6 +7,7 @@ mod commands;
 mod config;
 mod dash;
 mod db;
+mod groups;
 mod insight;
 mod key;
 mod machine;

@@ -72,6 +72,9 @@ pub struct Data {
     pub ncpu: usize,
     pub mem_total_kb: f64,
     pub ns: BTreeMap<String, Vec<(f64, f64)>>,
+    /// Groups of programs outside taskguard, per column, and their newest reading.
+    pub groups: BTreeMap<String, Vec<(f64, f64)>>,
+    pub groups_now: Vec<db::GroupReading>,
     pub waiting: Vec<(usize, String)>,
     pub markers: Vec<(f64, Marker)>,
     pub runs: Vec<RunRow>,
@@ -256,6 +259,8 @@ impl App {
             ncpu,
             mem_total_kb: mem_total,
             ns,
+            groups: dash::group_series(&db, from, to, n, crate::recorder::EVERY)?,
+            groups_now: db.latest_groups().unwrap_or_default(),
             waiting: dash::waiting_series(&db, from, to, n)?,
             markers: dash::markers(&db, from, to)?,
             runs,

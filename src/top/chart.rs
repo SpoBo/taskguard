@@ -15,6 +15,8 @@ pub struct Stacked<'a> {
     pub total: &'a [Option<f64>],
     /// Per namespace, the value per column, bottom first.
     pub layers: &'a [(String, Color, Vec<f64>)],
+    /// Per group of programs outside taskguard, stacked above the namespaces.
+    pub groups: &'a [(String, Color, Vec<f64>)],
     pub max: f64,
     pub limit: f64,
     pub show_other: bool,
@@ -25,6 +27,20 @@ pub struct Stacked<'a> {
 }
 
 pub const AXIS_W: u16 = 8;
+
+/// A fixed, muted colour per group of programs outside taskguard, apart from
+/// the bright namespace colours.
+pub fn group_color(name: &str) -> Color {
+    match name {
+        "agents" => Color::Indexed(141),
+        "browsers" => Color::Indexed(75),
+        "editors" => Color::Indexed(179),
+        "dev services" => Color::Indexed(108),
+        "containers" => Color::Indexed(247),
+        "chat & apps" => Color::Indexed(174),
+        _ => Color::Indexed(244),
+    }
+}
 
 impl Widget for Stacked<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -56,8 +72,18 @@ impl Widget for Stacked<'_> {
                     stack.push((acc, Style::default().fg(*color), "█"));
                 }
             }
-            if self.show_other && total > acc {
-                stack.push((total, Style::default().fg(Color::DarkGray), "░"));
+            if self.show_other {
+                for (_, color, vals) in self.groups {
+                    let v = vals.get(c).copied().unwrap_or(0.0);
+                    // A group can never be more than the machine total holds.
+                    if v > 0.0 && acc < total {
+                        acc = (acc + v).min(total);
+                        stack.push((acc, Style::default().fg(*color), "▒"));
+                    }
+                }
+                if total > acc {
+                    stack.push((total, Style::default().fg(Color::DarkGray), "░"));
+                }
             }
             for r in 0..rows {
                 // Value range this cell covers, bottom row first.
@@ -144,8 +170,18 @@ mod tests {
         let fmt = |v: f64| format!("{v:.0}");
         let area = Rect::new(0, 0, AXIS_W + 4, 9);
         let mut buf = Buffer::empty(area);
-        Stacked { total: &total, layers: &layers, max: 12.0, limit: 10.0, show_other: true, cursor: None, fmt: &fmt, title: "CPU" }
-            .render(area, &mut buf);
+        Stacked {
+            total: &total,
+            layers: &layers,
+            groups: &[],
+            max: 12.0,
+            limit: 10.0,
+            show_other: true,
+            cursor: None,
+            fmt: &fmt,
+            title: "CPU",
+        }
+        .render(area, &mut buf);
         let col: Vec<String> = (1..9).map(|y| buf[(AXIS_W, y)].symbol().to_string()).collect();
         // 8 rows of 1.5 cores each: limit near 10, other up to 8, dalp up to 4.
         assert_eq!(col, vec![" ", "╌", " ", "░", "░", "█", "█", "█"].into_iter().map(String::from).collect::<Vec<_>>());

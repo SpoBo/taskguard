@@ -248,25 +248,38 @@ run, and the minimum to pin when a job starves again and again.
 
 | View | What it shows |
 | --- | --- |
-| 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace; the grey rest is load taskguard did not start. A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
-| 2 Queue | What runs and what waits. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. |
+| 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace. The load it did not start is split into groups: agents (with everything they started), browsers, editors, dev services such as databases, containers, and chat and other apps. The legend names the biggest programs in each group, so you can see what to close to make room. A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
+| 2 Queue | Running jobs, then waiting ones. The bars show in red the load that running jobs have above their estimates. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. `g` starts a waiting job now, and `e` sets a job's needs for this run only (for example `2 4G`), so it can fit into room you know it will not outgrow. |
 | 3 Runs | Past runs, sortable and filterable, with the reasons each one waited. |
-| 4 Job | One command: its learned needs and where each comes from, sparklines over its runs, and what taskguard changed on its own. |
-| 5 Trends | Commands whose memory, CPU or duration grows: the last 10 runs against the 10 before. |
-| 6 Warnings | Starved runs with the evidence, suggested minimums, trend alerts, and `--now` runs that went over a limit. |
-| 7 Namespaces | CPU-hours, GB-hours, runs, waits and starved runs per namespace. |
+| 4 Trends | Commands whose memory, CPU or duration grows: the last 10 runs against the 10 before. |
+| 5 Warnings | Starved runs with the evidence, suggested minimums, trend alerts, and `--now` runs that went over a limit. |
+| 6 Namespaces | CPU-hours, GB-hours, runs, waits and starved runs per namespace. |
+| 7 Config | The limits and other settings. `←`/`→` change one and save it in your user config, comments kept. Jobs that already wait follow the change. |
 
-Keys: `1`-`8` views, `t` time range (5m to 7d), `n` namespace, `/` filter,
-`←`/`→` time cursor, `c`/`m`/`b` charts, `o` hide the other layer, `s`/`r`
-sort, `Enter` open a job, `k` stop a job, `q` quit. The mouse selects rows and
-scrolls the time range.
+`Enter` on a row opens that job: its learned needs and where each comes
+from, sparklines over its runs, and what taskguard changed on its own. For a
+run that is going on now, it also shows CPU and memory over the run and live
+signs of starvation. `Esc` or `Backspace` goes back to the same row, and `j`
+opens the last job again.
+
+Keys: `1`-`8`, `Tab`, or Shift, Option or Cmd with `←`/`→` change views. `t`
+time range (5m to 7d), `n` namespace, `/` filter, `←`/`→` time cursor,
+`c`/`m`/`b` charts, `o` hide the load taskguard did not start, `s`/`r` sort,
+`q` quit. Long lists say how many rows are hidden above and below. The mouse
+works on the tabs, the keys in the bottom line, and the rows; the wheel
+scrolls lists and zooms the Overview.
+
+A job started by hand or with other needs is still measured, so its next run
+learns from what it really used. Jobs from taskguard before 0.1.3 cannot be
+started or changed from the dashboard.
 
 `taskguard top --print [--view NAME] [--range 1h]` prints one frame as plain
 text, for scripts and agents.
 
 The history comes from a small recorder process. The first job starts it, it
-samples the machine every 2 seconds, and it exits by itself 30 minutes after
-the last job. Nothing is installed as a service.
+samples the machine and the groups of other programs every 2 seconds, and it
+exits by itself 30 minutes after the last job. Nothing is installed as a
+service.
 
 ## Try it with the demo
 
