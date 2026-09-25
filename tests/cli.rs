@@ -112,6 +112,9 @@ fn a_negative_timeout_gives_up_with_124() {
     let out = e.run(&["--st", "-1", "-j1", "--id", "t", "--", "true"]);
     assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
     assert!(stderr(&out).contains("timeout"));
+    // A caller with its own meaning for "busy" sets the code, as DALP's throttle does with 75.
+    let out = e.run(&["--st", "-1", "--st-exit", "75", "-j1", "--id", "t", "--", "true"]);
+    assert_eq!(out.status.code(), Some(75), "{}", stderr(&out));
     holder.wait_with_output().unwrap();
 }
 

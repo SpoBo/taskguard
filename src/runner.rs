@@ -26,6 +26,8 @@ pub struct Opts {
     pub id: Option<String>,
     pub ns: Option<String>,
     pub timeout: Option<f64>,
+    /// Exit code when a negative --st gives up; 124 (as `timeout`) by default.
+    pub timeout_exit: Option<i32>,
     pub key: Option<String>,
     pub min_cpu: Option<f64>,
     pub min_mem_kb: Option<u64>,
@@ -393,8 +395,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 if let Some(d) = &database {
                     let _ = d.abandon_run(run_id);
                 }
-                say(&format!("timeout {} - gave up after {} in the queue, exit 124", me.key, report::dur(now - t0)));
-                return Ok(124);
+                let code = o.timeout_exit.unwrap_or(124);
+                say(&format!("timeout {} - gave up after {} in the queue, exit {code}", me.key, report::dur(now - t0)));
+                return Ok(code);
             }
             // The queued line is only worth printing when the job really waits.
             if !announced {
@@ -712,6 +715,9 @@ fn run_bg(o: &Opts) -> Result<i32> {
     }
     if let Some(v) = o.timeout {
         args.extend(["--st".into(), v.to_string()]);
+    }
+    if let Some(v) = o.timeout_exit {
+        args.extend(["--st-exit".into(), v.to_string()]);
     }
     if let Some(v) = &o.key {
         args.extend(["--key".into(), v.clone()]);

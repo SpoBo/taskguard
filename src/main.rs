@@ -41,6 +41,7 @@ options (sem style; the default is to run in the foreground):
   --id NAME               pool name (sem's semaphore id)
   --ns NAME               namespace for the dashboard (default: the repo name)
   --st SECS               SECS > 0: run anyway after SECS; SECS < 0: give up (exit 124)
+  --st-exit N             the exit code when --st gives up, instead of 124
   --key KEY               history key (default: project path + command)
   --min-cpu N             never start with fewer than N free cores
   --min-mem SIZE          never start with less than SIZE free (6G, 512M)
@@ -91,6 +92,10 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--st" | "--semaphore-timeout" | "--semaphoretimeout" => {
                 let v = take_value(args, &mut i, name)?;
                 o.timeout = Some(v.parse().map_err(|_| anyhow::anyhow!("{name} needs a number of seconds"))?);
+            }
+            "--st-exit" => {
+                let v = take_value(args, &mut i, name)?;
+                o.timeout_exit = Some(v.parse().map_err(|_| anyhow::anyhow!("--st-exit needs an exit code"))?);
             }
             "--key" => o.key = Some(take_value(args, &mut i, name)?),
             "--min-cpu" => {

@@ -160,6 +160,7 @@ taskguard --wait [--id NAME]
 | `--id NAME` | Pool name (sem's semaphore id). |
 | `--ns NAME` | Namespace for the dashboard. The default is the repo name, the same for every worktree. |
 | `--st SECS` | `SECS > 0`: run anyway after SECS. `SECS < 0`: give up after -SECS, exit 124. |
+| `--st-exit N` | The exit code when `--st` gives up, instead of 124. |
 | `--key KEY` | History key. The default is the project path plus the command. |
 | `--min-cpu N` | Never start with fewer than N free cores. |
 | `--min-mem SIZE` | Never start with less than SIZE free (`6G`, `512M`). |
