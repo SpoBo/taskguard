@@ -177,7 +177,10 @@ fn a_minimum_makes_a_job_wait_for_room() {
     wait_for(&e.file("held"));
     let out = e.run(&["--st", "-2", "--min-cpu", "100000", "--", "true"]);
     assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
-    assert!(stderr(&out).contains("blocked by CPU"), "{}", stderr(&out));
+    // CPU blocks; on a machine that is also short of memory, memory is named
+    // first and CPU follows under "also".
+    let err = stderr(&out);
+    assert!(err.contains("blocked by CPU") || err.contains("also: cpu"), "{err}");
     holder.wait_with_output().unwrap();
 }
 
@@ -219,8 +222,10 @@ fn a_run_is_learned_and_explained() {
 fn a_cpu_starved_run_is_flagged_and_advised() {
     let e = Env::new("");
     let n = std::thread::available_parallelism().unwrap().get() * 3;
-    // Three busy loops per core for 11 s: every thread waits on a core most of the time.
-    let script = format!("for i in $(seq {n}); do ( end=$(($(date +%s)+11)); while [ $(date +%s) -lt $end ]; do :; done ) & done; wait");
+    // Three busy loops per core for 11 s: every thread waits on a core most of
+    // the time. The loops start no processes, so all their time is CPU or
+    // waiting for a core.
+    let script = format!("pids=''; for i in $(seq {n}); do ( while :; do :; done ) & pids=\"$pids $!\"; done; sleep 11; kill $pids");
     let mut c = e.cmd(&["--key", "hog", "--", "sh", "-c", &script]);
     c.env("npm_lifecycle_event", "test").env("npm_package_json", e.cwd.join("package.json"));
     let out = c.output().unwrap();
