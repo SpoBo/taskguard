@@ -1,0 +1,72 @@
+name: release
+
+# A `v*` tag builds taskguard for macOS and Linux and publishes the binaries on
+# a GitHub release. Run it by hand (workflow_dispatch) for a dry run: the same
+# builds, kept as workflow artifacts, with no release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Static musl binaries: they run on any Linux, Nix included, with no
+          # system libraries to match.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Check the binary runs
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: target/${{ matrix.target }}/release/taskguard version
+      - name: Package
+        run: |
+          name="taskguard-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/taskguard" LICENSE README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taskguard-${{ matrix.target }}
+          path: taskguard-${{ matrix.target }}.tar.gz*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "taskguard ${{ github.ref_name }}" \
+            --notes "Prebuilt binaries for macOS (Apple silicon, Intel) and Linux (x86_64, ARM, static musl). Each archive holds the \`taskguard\` binary; a \`.sha256\` file sits next to it."
