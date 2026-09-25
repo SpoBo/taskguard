@@ -374,6 +374,25 @@ Everything lives in `~/.cache/taskguard` (or `TASKGUARD_DIR`):
 A job that is killed leaves a file behind. The next process that looks sees
 that its owner is gone and removes it, so a Ctrl-C never wedges the queue.
 
+## Mixed versions
+
+Different versions of taskguard can run on one machine at the same time. For
+example, each worktree of a repo can pin its own version. They all share one
+queue and one history in the state directory, so each version must read what
+the others write:
+
+- The queue entries and the `machine` file are JSON. Fields are only added,
+  never removed, renamed or retyped, and a missing field gets a default.
+- The database only gains tables and columns. A new column is nullable or has
+  a default, so older versions can still insert rows.
+- A job gets the same history key in every version.
+- `TASKGUARD_HELD` keeps its meaning, so a nested call never takes a second
+  slot, whatever version the outer call was.
+
+Tests hold each of these rules. A change that cannot follow them must use a
+new state directory. Versions that use different directories do not see each
+other's jobs. They still see the load of those jobs in the machine readings.
+
 ## Uninstall
 
 ```sh

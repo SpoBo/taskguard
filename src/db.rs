@@ -13,6 +13,16 @@ pub struct Db {
     pub conn: Connection,
 }
 
+/// Every taskguard version on the machine shares this database, so old and new
+/// versions write to it side by side. The rules:
+/// - Add tables and columns; never drop, rename or retype one.
+/// - A new column is nullable or has a default, so the INSERTs of older
+///   versions, which name only the columns they know, keep working.
+/// - A new column on an existing table is also added in `Db::open`, as
+///   `span_s` is, because `CREATE TABLE IF NOT EXISTS` skips existing tables.
+/// - Queries name their columns: no `SELECT *`.
+///
+/// `tests::schema_stays_compatible` checks the NOT NULL columns.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY,
@@ -442,6 +452,67 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_stays_compatible() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let mut stmt = db
+            .conn
+            .prepare("SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type = 'table' AND p.\"notnull\" AND p.dflt_value IS NULL AND NOT p.pk ORDER BY 1, 2")
+            .unwrap();
+        let required: Vec<String> = stmt
+            .query_map([], |r| Ok(format!("{}.{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        // Exactly the NOT NULL columns of v0.1.0. A new one here breaks the
+        // INSERTs of every older version still running on the machine.
+        let v0_1_0 = [
+            "adjustments.kind",
+            "adjustments.key",
+            "adjustments.reason",
+            "adjustments.ts",
+            "job_samples.cores_used",
+            "job_samples.cores_wanted",
+            "job_samples.mem_kb",
+            "job_samples.pageins_per_s",
+            "job_samples.run_id",
+            "job_samples.ts",
+            "machine_samples.cpu_busy",
+            "machine_samples.mem_total_kb",
+            "machine_samples.mem_used_kb",
+            "machine_samples.ncpu",
+            "machine_samples.running",
+            "machine_samples.ts",
+            "machine_samples.waiting",
+            "runs.key",
+            "runs.ns",
+            "runs.queued_at",
+            "top_procs.cores",
+            "top_procs.mem_kb",
+            "top_procs.name",
+            "top_procs.pid",
+            "top_procs.ts",
+            "wait_spans.blocker",
+            "wait_spans.from_ts",
+            "wait_spans.run_id",
+            "wait_spans.to_ts",
+        ];
+        let mut want: Vec<String> = v0_1_0.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(required, want);
+    }
+
+    #[test]
+    fn opens_a_database_from_before_span_s() {
+        let path = std::env::temp_dir().join(format!("tg-old-{}.db", std::process::id()));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE job_samples (ts REAL NOT NULL, run_id INTEGER NOT NULL, cores_used REAL NOT NULL, cores_wanted REAL NOT NULL, mem_kb INTEGER NOT NULL, pageins_per_s REAL NOT NULL)").unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        assert!(db.conn.prepare("SELECT span_s FROM job_samples").is_ok());
+        std::fs::remove_file(&path).ok();
+    }
 
     fn run(db: &Db, key: &str, mem: u64, wanted: f64, secs: f64, starved: Option<&str>) {
         let id = db.insert_run(&NewRun { ns: "n", key, ..Default::default() }).unwrap();

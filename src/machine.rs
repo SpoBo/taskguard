@@ -7,13 +7,17 @@ use crate::sys;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// The shared `machine` cache file. Every taskguard version on the machine
+/// reads it, so the rules on `queue::Entry` hold here too: never remove or
+/// rename a field, never change its type, and new fields are optional. A
+/// version that cannot read the file takes its own reading instead.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct MachineSample {
     pub ts: f64,
     /// Busy cores, smoothed over about three seconds. The scheduler uses this.
     pub cpu_busy: f64,
     /// Busy cores over the last interval alone. The history records this.
-    #[serde(default)]
     pub cpu_inst: f64,
     pub ncpu: usize,
     pub mem_used_kb: u64,
@@ -21,7 +25,6 @@ pub struct MachineSample {
     pub mem_pressure: Option<f64>,
     /// Readings of the last `PEAK_WINDOW` seconds, oldest first: the time,
     /// the memory in use, and how much of it taskguard's own jobs held.
-    #[serde(default)]
     pub recent_mem: Vec<(f64, u64, u64)>,
     pub(crate) ticks_busy: u64,
     pub(crate) ticks_total: u64,

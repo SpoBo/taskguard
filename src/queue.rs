@@ -12,7 +12,20 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+/// One waiting or running job, as a JSON file in `wait/` or `run/`.
+///
+/// Every taskguard version on the machine reads these files, and DALP pins a
+/// version per worktree, so old and new versions run side by side. The rules:
+/// - Never remove or rename a field, and never change its JSON type. v0.1.0 to
+///   v0.1.2 need every field below except `estimate_from`; an entry they cannot
+///   read is a job they do not see, and they start work on top of it.
+/// - A new field is optional: `#[serde(default)]` covers it, so this version
+///   still reads the entries of older ones.
+/// - A change that cannot follow these rules needs a new state directory.
+///
+/// `tests::entry_format_is_stable` holds the v0.1.2 shape.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Entry {
     pub ticket: u64,
     pub pid: i32,
@@ -46,7 +59,6 @@ pub struct Entry {
     /// Learned median duration, for estimated start times.
     pub est_dur_s: Option<f64>,
     /// For a job with no history: where its estimated need comes from.
-    #[serde(default)]
     pub estimate_from: Option<String>,
 }
 
@@ -131,6 +143,20 @@ impl Queue {
                 if !alive(e.pid) {
                     let _ = fs::remove_file(&p);
                     gone.push(e.run_id);
+                }
+            }
+            // An entry this version cannot read (a newer version broke the
+            // format rules on `Entry`) still names its owner in the file name:
+            // `wait/<ticket>.<pid>` and `run/<pid>`. Drop it once that is gone.
+            let Ok(rd) = fs::read_dir(self.dir.join(sub)) else { continue };
+            for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
+                let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+                let owner = name.rsplit('.').next().and_then(|pid| pid.parse::<i32>().ok());
+                if name.contains(".tmp") || fs::read_to_string(&p).is_ok_and(|t| serde_json::from_str::<Entry>(&t).is_ok()) {
+                    continue;
+                }
+                if owner.is_some_and(|pid| !alive(pid)) {
+                    let _ = fs::remove_file(&p);
                 }
             }
         }
@@ -386,6 +412,61 @@ mod tests {
     const GB: u64 = 1024 * 1024;
     const LIM: Limits =
         Limits { cpu_max_pct: 100.0, mem_max_pct: 85.0, learn_stagger: 2.0, max_bypass: 120.0, cpu_min_duration: 5.0, pressure_max: 20.0 };
+
+    /// A running entry exactly as v0.1.2 writes it.
+    const ENTRY_V0_1_2: &str = r#"{"ticket":7,"pid":4242,"run_id":31,"key":"packages/api:tsc","ns":"shop","label":"typecheck","pool":null,"pool_key":null,"pool_slots":null,"checkout":"/w/shop","queued_at":1000.5,"started_at":1002.0,"need_cpu":3.0,"need_mem_kb":1468006,"known":true,"raised_by_min":false,"now":false,"live_cpu":1.2,"live_mem_kb":900000,"bypassed_since":null,"blocker":null,"blocker_since":null,"est_dur_s":20.0,"estimate_from":null}"#;
+
+    #[test]
+    fn entry_format_is_stable() {
+        // This version reads what v0.1.2 wrote.
+        let old: Entry = serde_json::from_str(ENTRY_V0_1_2).unwrap();
+        assert_eq!((old.pid, old.need_mem_kb, old.started_at), (4242, 1468006, Some(1002.0)));
+
+        // v0.1.2 reads what this version writes: every field it needs is still
+        // there, with the same JSON type. Fields may only be added.
+        let old: serde_json::Map<String, serde_json::Value> = serde_json::from_str(ENTRY_V0_1_2).unwrap();
+        let new = serde_json::to_value(Entry { started_at: Some(1.0), ..Default::default() }).unwrap();
+        let kind = |v: &serde_json::Value| match v {
+            serde_json::Value::Number(n) if n.is_f64() => "float",
+            serde_json::Value::Number(_) => "integer",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::String(_) => "string",
+            _ => "null or other",
+        };
+        for (field, value) in &old {
+            let Some(now) = new.get(field) else { panic!("field {field} is gone; older versions need it") };
+            if !value.is_null() && !now.is_null() {
+                // Whole-number floats print as 1.0, so compare floats loosely.
+                let (a, b) = (kind(value), kind(now));
+                assert!(a == b || (a != "bool" && a != "string" && b != "bool" && b != "string"), "field {field} changed type: {a} -> {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn entries_from_other_versions_are_read() {
+        // A newer version added a field; an older one left some out.
+        let newer = ENTRY_V0_1_2.replace(r#""ticket":7"#, r#""ticket":7,"priority":3"#);
+        assert_eq!(serde_json::from_str::<Entry>(&newer).unwrap().ticket, 7);
+        let older: Entry = serde_json::from_str(r#"{"ticket":3,"pid":10,"run_id":1,"key":"k"}"#).unwrap();
+        assert_eq!((older.ticket, older.need_cpu), (3, 0.0));
+    }
+
+    #[test]
+    fn unreadable_entries_of_dead_owners_are_dropped() {
+        let dir = std::env::temp_dir().join(format!("tg-reap-{}", std::process::id()));
+        let q = Queue::open(&dir).unwrap();
+        let dead = i32::MAX - 1;
+        let live = std::process::id() as i32;
+        fs::write(dir.join("wait").join(format!("9.{dead}")), "{not json").unwrap();
+        fs::write(dir.join("run").join(dead.to_string()), r#"{"pid":"not a number"}"#).unwrap();
+        fs::write(dir.join("run").join(live.to_string()), "{not json").unwrap();
+        q.reap();
+        assert!(!dir.join("wait").join(format!("9.{dead}")).exists());
+        assert!(!dir.join("run").join(dead.to_string()).exists());
+        assert!(dir.join("run").join(live.to_string()).exists(), "a live owner keeps its entry");
+        fs::remove_dir_all(&dir).ok();
+    }
 
     fn job(ticket: u64, key: &str, cpu: f64, mem_gb: u64) -> Entry {
         Entry { ticket, key: key.into(), need_cpu: cpu, need_mem_kb: mem_gb * GB, known: true, queued_at: 1000.0, ..Default::default() }

@@ -128,6 +128,9 @@ mod tests {
         let k = run_key(Path::new("/nonexistent/pkg"), &args);
         assert!(k.chars().count() <= 64 + 9);
         assert!(k.contains('~'));
+        // Pinned: every version must give a job the same key, or they stop
+        // sharing what they learned about it.
+        assert_eq!(k, "root:vitest_--flag0_--flag1_--flag2_--flag3_--flag4_--flag5_--fl~ae87be9a");
         assert_ne!(k, run_key(Path::new("/nonexistent/pkg"), &args[..39]));
     }
 }
