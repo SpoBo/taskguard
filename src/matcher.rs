@@ -120,6 +120,78 @@ fn strip_once(mut v: Vec<String>) -> Vec<String> {
     v
 }
 
+/// Every command a shell job runs: the parts of `sh -c "a && b; c | d"`, or
+/// the lines of a script file run as `sh file.sh` (up to 64 KB of it). Empty
+/// for anything that is not a shell. What a job is depends on all of them: a
+/// script that fetches, installs and then runs the whole CI is a CI run.
+pub fn shell_commands(argv: &[String]) -> Vec<Vec<String>> {
+    let eff = strip_env_and_wrappers(argv);
+    let shell = eff.first().map(|s| s.rsplit('/').next().unwrap_or(s)).unwrap_or("");
+    if !matches!(shell, "sh" | "bash" | "zsh" | "dash") {
+        return Vec::new();
+    }
+    let text = match eff.get(1).map(String::as_str) {
+        Some("-c") => eff.get(2).cloned().unwrap_or_default(),
+        Some(file) if !file.starts_with('-') => {
+            let mut buf = String::new();
+            if let Ok(f) = std::fs::File::open(file) {
+                use std::io::Read;
+                let _ = f.take(64 * 1024).read_to_string(&mut buf);
+            }
+            buf
+        }
+        _ => String::new(),
+    };
+    split_commands(&text).iter().map(|c| split_shell(c)).filter(|v| !v.is_empty()).collect()
+}
+
+/// Leading `VAR=value` words and `env`, as a shell job is often started.
+fn strip_env_and_wrappers(argv: &[String]) -> Vec<String> {
+    let mut v: &[String] = argv;
+    while let Some(first) = v.first() {
+        if first == "env" || (first.contains('=') && !first.starts_with('-')) {
+            v = &v[1..];
+        } else {
+            break;
+        }
+    }
+    v.to_vec()
+}
+
+/// Cut a shell text into its commands at `&&`, `||`, `;`, `|`, `&` and new
+/// lines, outside quotes. Comment lines are dropped.
+fn split_commands(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '\\') => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            (None, ';' | '&' | '|' | '\n') => {
+                out.push(std::mem::take(&mut cur));
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty() && !c.starts_with('#')).collect()
+}
+
 /// A small shell word splitter for `sh -c "..."`: quotes and backslashes only.
 /// Anything after a shell operator is dropped, because only the first command
 /// decides what the job is.
@@ -271,5 +343,31 @@ mod tests {
         assert!(!matches("vite $", &v("bunx vite build")));
         assert!(matches("**/run-integration.ts", &v("bun testkit/helpers/tools/run-integration.ts --task x")));
         assert!(matches("bun --watch", &v("bun --watch src/main.ts")));
+    }
+
+    #[test]
+    fn a_shell_job_is_read_command_by_command() {
+        let cmds = shell_commands(
+            &v("sh -c")
+                .into_iter()
+                .chain(["git fetch -q origin main && git merge 'a b' && bun install; bun run ci:local | tee log".to_string()])
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            cmds,
+            vec![
+                v("git fetch -q origin main"),
+                vec!["git".into(), "merge".into(), "a b".into()],
+                v("bun install"),
+                v("bun run ci:local"),
+                v("tee log")
+            ]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("red-unit.sh");
+        std::fs::write(&file, "#!/bin/sh\n# unit tests\ncd packages/api\nbunx vitest run\n").unwrap();
+        let cmds = shell_commands(&["bash".to_string(), file.display().to_string()]);
+        assert_eq!(cmds, vec![v("cd packages/api"), v("bunx vitest run")]);
+        assert!(shell_commands(&v("bun run ci:local")).is_empty());
     }
 }

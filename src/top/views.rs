@@ -492,7 +492,8 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let mut rows: Vec<Row> = Vec::new();
     for e in &s.running {
-        let over = e.live_cpu > e.need_cpu + 0.05 || e.live_mem_kb > e.need_mem_kb;
+        let over =
+            e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05 || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
         rows.push(Row::new(vec![
             Cell::from(if e.now { "NOW" } else { "RUN" }).style(Style::default().fg(Color::Green)),
             Cell::from(trunc(&e.key, 44)),
@@ -605,9 +606,11 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             },
             dur(s.now - e.started_at.unwrap_or(s.now))
         )));
-        if e.live_cpu > e.need_cpu + 0.05 || e.live_mem_kb > e.need_mem_kb {
-            lines
-                .push(Line::styled("it uses more than its estimate; the next run learns the higher need", Style::default().fg(Color::Red)));
+        if e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05 || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb) {
+            lines.push(Line::styled(
+                "it uses more than its estimate; its needs now follow its peak, and the next run learns them",
+                Style::default().fg(Color::Red),
+            ));
         }
         if let Some(d) = e.est_dur_s {
             lines.push(Line::raw(format!("usually takes {}, so about {} left", dur(d), dur(d - (s.now - e.started_at.unwrap_or(s.now))))));

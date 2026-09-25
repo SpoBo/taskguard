@@ -38,6 +38,12 @@ pub fn blocker_text(b: &Blocker) -> String {
         Blocker::LearnStagger { wait_s } => {
             format!("new jobs start in small batches while their needs are learned (next batch in {:.1}s)", wait_s)
         }
+        Blocker::Settling { key, wait_s } => {
+            format!(
+                "{key} is a first run that still grows; new first runs wait until it shows what it takes (at most {:.0}s more)",
+                wait_s.ceil()
+            )
+        }
         Blocker::Pressure { level, .. } => {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
@@ -96,6 +102,7 @@ pub fn unblock_text(b: &Blocker, running: &[Entry], now: f64) -> String {
             None => "starts when a slot frees up".into(),
         },
         Blocker::LearnStagger { wait_s } => format!("starts in about {:.0}s", wait_s.ceil()),
+        Blocker::Settling { key, wait_s } => format!("starts when {key} stops growing (at most {:.0}s)", wait_s.ceil()),
         Blocker::Pressure { .. } => "starts when the memory pressure eases".into(),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;

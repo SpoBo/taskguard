@@ -62,7 +62,11 @@ pub const POOLS: &[(&str, &[&str])] = &[
 ];
 
 /// Labels for the dashboard and history. They never change scheduling.
+/// Kinds of jobs, for the dashboard and for the guess of a first run. A shell
+/// script that runs several gets the heaviest one (`HEAVIEST_FIRST`).
 pub const LABELS: &[(&str, &[&str])] = &[
+    // A whole CI run or a check across the repo: many tasks, often the whole machine.
+    ("ci", &["ci", "ci:*", "check:static", "check:packages", "test:integration", "test:coverage"]),
     ("typecheck", &["tsc", "tsgo", "vue-tsc", "**/typescript/bin/tsc"]),
     (
         "lint",
@@ -105,3 +109,6 @@ pub const LABELS: &[(&str, &[&str])] = &[
     ),
     ("check", &["**/check-*.ts", "**/audit*.ts", "**/lint-*.ts"]),
 ];
+
+/// Kinds from heavy to light, to pick one for a script that runs several.
+pub const HEAVIEST_FIRST: &[&str] = &["ci", "test", "build", "typecheck", "codegen", "lint", "check"];

@@ -468,8 +468,17 @@ impl Config {
             c.pool = Some((pool.name.clone(), pool.max_slots, pool.per_checkout));
             c.why.push(format!("pool {}: matches one of {:?}", pool.name, pool.patterns));
         }
-        if let Some((name, _)) = self.labels.iter().find(|(_, pats)| pats.iter().any(|p| matcher::matches(p, argv))) {
-            c.label = Some(name.clone());
+        let label_of =
+            |argv: &[String]| self.labels.iter().find(|(_, pats)| pats.iter().any(|p| matcher::matches(p, argv))).map(|(n, _)| n.clone());
+        c.label = label_of(argv);
+        // A shell job is what the heaviest command in it is.
+        if c.label.is_none() {
+            let rank = |l: &str| builtin::HEAVIEST_FIRST.iter().position(|h| *h == l).unwrap_or(usize::MAX);
+            let inside = matcher::shell_commands(argv).iter().filter_map(|cmd| label_of(cmd)).min_by_key(|l| rank(l));
+            if let Some(l) = inside {
+                c.why.push(format!("kind {l}: the heaviest command in the shell script"));
+                c.label = Some(l);
+            }
         }
         for (rule, layer) in &self.jobs {
             let hit = match (&rule.pattern, &rule.key) {
@@ -639,5 +648,22 @@ mod tests {
         assert_eq!(step_user_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
         let c = read_layer(&path).unwrap().unwrap();
         assert_eq!((c.cpu_max, c.hints, c.new_job_mem.as_deref()), (Some(75.0), Some(false), Some("1792M")));
+    }
+
+    #[test]
+    fn a_shell_script_gets_the_kind_of_its_heaviest_command() {
+        let c = Config::default();
+        let kind = |line: &str| c.classify(&argv(line), "k").unwrap().label;
+        assert_eq!(kind("bun run ci:local").as_deref(), Some("ci"));
+        assert_eq!(
+            kind(
+                "sh -c 'git fetch -q origin main && git merge --no-edit origin/main && bun install --frozen-lockfile && bun run ci:local'"
+            )
+            .as_deref(),
+            Some("ci")
+        );
+        assert_eq!(kind("bash -c 'cd packages/api && bunx tsc --noEmit && bunx vitest run'").as_deref(), Some("test"));
+        assert_eq!(kind("bunx vitest run").as_deref(), Some("test"));
+        assert_eq!(kind("sh -c 'git fetch'"), None);
     }
 }

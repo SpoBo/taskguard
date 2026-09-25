@@ -152,6 +152,14 @@ pub struct GroupReading {
     pub top: String,
 }
 
+/// A guess for a job with no history, and where it comes from in words.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Estimate {
+    pub mem_kb: Option<u64>,
+    pub cpu: Option<f64>,
+    pub from: String,
+}
+
 /// What history says about one key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Learned {
@@ -365,23 +373,50 @@ impl Db {
     /// its highest peak, so one key with many runs does not dominate. Memory
     /// is the 75th percentile, so most similar jobs fit in the guess; CPU the
     /// median. Returns (memory, cpu, similar keys).
-    pub fn estimate(&self, label: Option<&str>, tool: &str) -> Result<(Option<u64>, Option<f64>, usize)> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT max(peak_mem_kb), avg(cores_wanted) FROM runs
-             WHERE peak_mem_kb > 0 AND ended_at > ?3 AND (label = ?1 OR (?1 IS NULL AND cmd LIKE ?2))
-             GROUP BY key",
-        )?;
+    /// A guess for a job with no history, from jobs like it in the last 30
+    /// days: first those of the same kind in the same pool, then the same
+    /// kind, then the same pool, then the same program. Memory is the 90th
+    /// percentile of their peaks and CPU the 75th of the cores they wanted:
+    /// a guess that is too low lets a first run crowd the machine.
+    pub fn estimate(&self, label: Option<&str>, tool: &str, pool: Option<&str>) -> Result<Option<Estimate>> {
         let since = now() - 30.0 * 86400.0;
-        let rows: Vec<(i64, Option<f64>)> = stmt
-            .query_map(params![label, format!("{tool}%"), since], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        if rows.is_empty() {
-            return Ok((None, None, 0));
+        // kind, pool, program, and the words for where the guess comes from
+        type Tier<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, String);
+        let mut tiers: Vec<Tier> = Vec::new();
+        if let (Some(l), Some(p)) = (label, pool) {
+            tiers.push((Some(l), Some(p), None, format!("{l} {p} jobs")));
         }
-        let mut mems: Vec<u64> = rows.iter().map(|r| r.0 as u64).collect();
-        mems.sort_unstable();
-        let p75 = mems[(mems.len() * 3 / 4).min(mems.len() - 1)];
-        Ok((Some(p75), median_of(rows.iter().filter_map(|r| r.1).collect()), rows.len()))
+        if let Some(l) = label {
+            tiers.push((Some(l), None, None, format!("{l} jobs")));
+        }
+        if let Some(p) = pool {
+            tiers.push((None, Some(p), None, format!("jobs in {p}")));
+        }
+        tiers.push((None, None, Some(tool), format!("{tool} jobs")));
+        for (l, p, t, what) in tiers {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT max(peak_mem_kb), avg(cores_wanted) FROM runs
+                 WHERE peak_mem_kb > 0 AND ended_at > ?1
+                   AND (?2 IS NULL OR label = ?2) AND (?3 IS NULL OR pool = ?3) AND (?4 IS NULL OR cmd LIKE ?4 || '%')
+                 GROUP BY key",
+            )?;
+            let rows: Vec<(i64, Option<f64>)> =
+                stmt.query_map(params![since, l, p, t], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            if rows.is_empty() {
+                continue;
+            }
+            let pct = |mut v: Vec<f64>, q: f64| -> Option<f64> {
+                if v.is_empty() {
+                    return None;
+                }
+                v.sort_by(|a, b| a.total_cmp(b));
+                Some(v[((v.len() as f64 * q) as usize).min(v.len() - 1)])
+            };
+            let mem = pct(rows.iter().map(|r| r.0 as f64).collect(), 0.9).map(|m| m as u64);
+            let cpu = pct(rows.iter().filter_map(|r| r.1).collect(), 0.75);
+            return Ok(Some(Estimate { mem_kb: mem, cpu, from: format!("typical of {} {what}", rows.len()) }));
+        }
+        Ok(None)
     }
 
     /// How many of the key's most recent runs in a row were starved.
@@ -633,17 +668,29 @@ mod tests {
     fn a_new_job_is_estimated_from_similar_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_dir(tmp.path()).unwrap();
-        assert_eq!(db.estimate(Some("typecheck"), "tsc").unwrap(), (None, None, 0));
-        for (key, mem) in [("a", 300), ("b", 700), ("c", 900), ("d", 4200)] {
-            let id = db.insert_run(&NewRun { ns: "n", key, label: Some("typecheck"), cmd: "tsc -p .", ..Default::default() }).unwrap();
+        assert_eq!(db.estimate(Some("typecheck"), "tsc", None).unwrap(), None);
+        let add = |key: &str, label: &str, pool: Option<&str>, cmd: &str, mem: u64, cores: f64| {
+            let id = db.insert_run(&NewRun { ns: "n", key, label: Some(label), pool, cmd, ..Default::default() }).unwrap();
             db.mark_started(id, now() - 5.0, 0.0, None).unwrap();
-            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: mem, cores_wanted: 1.0, measured: true, ..Default::default() })
+            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: mem, cores_wanted: cores, measured: true, ..Default::default() })
                 .unwrap();
+        };
+        for (i, mem) in [300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900, 4200].iter().enumerate() {
+            add(&format!("tc{i}"), "typecheck", None, "tsc -p .", *mem, 1.0 + i as f64 / 10.0);
         }
-        let (mem, cpu, n) = db.estimate(Some("typecheck"), "tsc").unwrap();
-        assert_eq!((mem, cpu, n), (Some(4200), Some(1.0), 4), "with four keys, the 75th percentile is the highest peak");
-        assert_eq!(db.estimate(None, "tsc").unwrap().2, 4, "without a label, the command decides");
-        assert_eq!(db.estimate(Some("test"), "vitest").unwrap().2, 0);
+        add("ci-a", "ci", Some("throttle-suite"), "sh -c x", 12_000_000, 9.0);
+        add("ci-b", "ci", Some("throttle-suite"), "bun run ci:local", 10_000_000, 8.0);
+
+        let e = db.estimate(Some("typecheck"), "tsc", None).unwrap().unwrap();
+        assert_eq!(e.mem_kb, Some(4200), "the 90th percentile of ten peaks: the highest");
+        assert_eq!(e.cpu.map(|c| (c * 10.0).round() / 10.0), Some(1.7), "CPU: the 75th percentile");
+        assert_eq!(e.from, "typical of 10 typecheck jobs");
+        let e = db.estimate(Some("ci"), "sh", Some("throttle-suite")).unwrap().unwrap();
+        assert_eq!((e.mem_kb, e.from.as_str()), (Some(12_000_000), "typical of 2 ci throttle-suite jobs"));
+        let e = db.estimate(None, "sh", Some("throttle-suite")).unwrap().unwrap();
+        assert_eq!(e.from, "typical of 2 jobs in throttle-suite", "without a kind, the pool decides");
+        assert_eq!(db.estimate(None, "tsc", None).unwrap().unwrap().from, "typical of 10 tsc jobs", "then the program");
+        assert_eq!(db.estimate(Some("test"), "vitest", None).unwrap(), None);
     }
 
     #[test]

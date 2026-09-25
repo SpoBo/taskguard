@@ -65,6 +65,37 @@ pub struct Entry {
     pub version: Option<String>,
     /// Set when someone changed the needs by hand, in words.
     pub by_hand: Option<String>,
+    /// When the job's memory last rose more than 10% above its peak so far.
+    /// A first run that has stopped growing shows what it takes.
+    pub mem_grew_at: Option<f64>,
+    /// The needs the job started with. While it runs, its needs follow its
+    /// peak; these keep what it was admitted with, to show the overage.
+    pub start_need_cpu: Option<f64>,
+    pub start_need_mem_kb: Option<u64>,
+}
+
+/// A first run has settled when its memory has not grown for this long...
+pub const SETTLE_S: f64 = 20.0;
+/// ...or when it has run this long: a long job must not hold back every new
+/// one, and by then its needs follow its peak.
+pub const SETTLE_MAX_S: f64 = 120.0;
+
+impl Entry {
+    /// Still on a guess: no history, no minimum, no needs set by hand.
+    pub fn guessed(&self) -> bool {
+        !self.known && !self.raised_by_min && self.by_hand.is_none()
+    }
+
+    /// How long until this running first run counts as settled; None once it has.
+    pub fn settling_for(&self, now: f64) -> Option<f64> {
+        let started = self.started_at?;
+        if !self.guessed() {
+            return None;
+        }
+        let grew = self.mem_grew_at.unwrap_or(started);
+        let left = (SETTLE_S - (now - grew)).min(SETTLE_MAX_S - (now - started));
+        (left > 0.0).then_some(left)
+    }
 }
 
 /// A request from the dashboard to one job: start now, or use other needs.
@@ -285,6 +316,12 @@ pub enum Blocker {
     LearnStagger {
         wait_s: f64,
     },
+    /// A first run still grows: another first run waits until it has shown
+    /// what it takes.
+    Settling {
+        key: String,
+        wait_s: f64,
+    },
     /// The kernel reports memory pressure: nothing new starts.
     Pressure {
         level: f64,
@@ -315,7 +352,7 @@ impl Blocker {
             Blocker::Older { .. } => "order",
             Blocker::Reserved { .. } => "reserved",
             Blocker::Slots { .. } => "slots",
-            Blocker::LearnStagger { .. } => "learning",
+            Blocker::LearnStagger { .. } | Blocker::Settling { .. } => "learning",
             Blocker::Memory { .. } => "memory",
             Blocker::Pressure { .. } => "pressure",
             Blocker::Cpu { .. } => "cpu",
@@ -341,7 +378,10 @@ pub fn reserve(running: &[Entry]) -> (f64, u64) {
 /// How far running jobs are above their needs right now: the part of the
 /// load the estimates did not see coming.
 pub fn over(running: &[Entry]) -> (f64, u64) {
-    running.iter().fold((0.0, 0), |(c, m), e| ((c + (e.live_cpu - e.need_cpu).max(0.0)), m + e.live_mem_kb.saturating_sub(e.need_mem_kb)))
+    running.iter().fold((0.0, 0), |(c, m), e| {
+        let (cpu, mem) = (e.start_need_cpu.unwrap_or(e.need_cpu), e.start_need_mem_kb.unwrap_or(e.need_mem_kb));
+        (c + (e.live_cpu - cpu).max(0.0), m + e.live_mem_kb.saturating_sub(mem))
+    })
 }
 
 /// May `me` start now? A pure function of the machine reading and the queue,
@@ -397,6 +437,11 @@ pub fn decide(
     // what the new jobs really take. A batch is as large as the free room
     // allows: one job per free core, and as many as fit in the free memory at
     // this job's estimated need.
+    if me.guessed()
+        && let Some((r, wait_s)) = running.iter().filter_map(|r| r.settling_for(now).map(|w| (r, w))).min_by(|a, b| a.1.total_cmp(&b.1))
+    {
+        blockers.push(Blocker::Settling { key: r.key.clone(), wait_s });
+    }
     if !me.known && !me.raised_by_min {
         let recent: Vec<f64> = unknown_starts.iter().copied().filter(|t| now - t < lim.learn_stagger).collect();
         let free_cpu = cpu_limit - m.cpu_busy - res_cpu;
@@ -591,6 +636,42 @@ mod tests {
         assert_eq!(blockers(decide(&machine(0.0, 1), &LIM, &[running.clone()], &[me.clone()], &me, 1000.0, &[])), vec!["slots"]);
         me.pool_key = Some("e2e@/other-worktree".into());
         assert!(blockers(decide(&machine(0.0, 1), &LIM, &[running], &[me.clone()], &me, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_first_run_waits_until_running_first_runs_settle() {
+        // A first run started at 1000 and still grows; its memory last rose at 1030.
+        let mut growing = job(1, "packages/ci:run", 1.0, 2);
+        growing.known = false;
+        growing.started_at = Some(1000.0);
+        growing.mem_grew_at = Some(1030.0);
+        let mut me = job(2, "new", 1.0, 1);
+        me.known = false;
+        let r = std::slice::from_ref(&growing);
+        let w = std::slice::from_ref(&me);
+        let d = decide(&machine(1.0, 4), &LIM, r, w, &me, 1040.0, &[]);
+        assert_eq!(blockers(d.clone()), vec!["learning"]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Settling { wait_s, .. } if (*wait_s - 10.0).abs() < 1e-9))
+        );
+        // Steady for 20 s: it has shown what it takes.
+        assert!(blockers(decide(&machine(1.0, 4), &LIM, r, w, &me, 1051.0, &[])).is_empty());
+        // Still growing, but past two minutes: it no longer holds new jobs back.
+        let mut late = growing.clone();
+        late.mem_grew_at = Some(1119.0);
+        assert!(blockers(decide(&machine(1.0, 4), &LIM, std::slice::from_ref(&late), w, &me, 1121.0, &[])).is_empty());
+        // A job with history is never held back by the rule.
+        let known = job(3, "old", 1.0, 1);
+        assert!(blockers(decide(&machine(1.0, 4), &LIM, r, std::slice::from_ref(&known), &known, 1040.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn overage_is_measured_against_the_needs_a_job_started_with() {
+        let mut e = job(1, "k", 2.0, 4);
+        e.live_mem_kb = 6 * GB;
+        e.need_mem_kb = 7 * GB + GB / 2; // raised to follow its peak
+        e.start_need_mem_kb = Some(4 * GB);
+        assert_eq!(over(&[e]).1, 2 * GB);
     }
 
     #[test]

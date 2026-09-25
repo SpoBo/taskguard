@@ -46,12 +46,21 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   running out of memory kills processes. The CPU need is the median of the
   cores the job *wanted* in its last 10 runs, because too little CPU only
   makes a job slower.
-- **A first run reserves an estimate.** A job with no history counts as
-  needing what similar jobs needed: the 75th percentile peak of jobs with the
-  same label (typecheck, test, ...), or 1.5 GB without any (`new_job_mem`). New
-  jobs start in batches sized by the free room, and a batch starts only after
-  the one before has run for 5 seconds (`learn_stagger`), so the readings can
-  show what the new jobs really take.
+- **A first run reserves a cautious guess.** A job with no history counts as
+  needing what jobs like it needed in the last 30 days: the 90th percentile of
+  their memory peaks and the 75th of the cores they wanted. "Like it" means the
+  same kind and pool first (a `ci` run in DALP's `throttle-suite`), then the
+  same kind, then the same pool, then the same program; 1.5 GB without any
+  (`new_job_mem`). A shell job gets the kind of the heaviest command it runs:
+  `sh -c "git fetch && bun install && bun run ci:local"` is a `ci` run.
+- **First runs wait until the one before has settled.** A new first run starts
+  only when every first run that is already running has stopped growing: its
+  memory has not risen by 10% for 20 seconds, or it has run for 2 minutes.
+  Several new jobs that each grow for minutes can no longer start together.
+- **A running job's needs follow its peak.** When a job passes its needs, its
+  memory need becomes its peak plus 25% and its CPU need what it wants, so what
+  it still promises to take keeps up with what it takes. The Queue shows in red
+  how far jobs are above the needs they started with.
 - **Memory pressure stops everything new.** When the kernel reports memory
   pressure (macOS: warning or critical; Linux: PSI above 20%), nothing new
   starts until it eases, whatever the estimates say.

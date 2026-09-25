@@ -216,12 +216,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
     // compiles start into a machine that could not hold them, and froze it:
     // each grew to several GB within seconds, faster than the readings showed.
     let (est_mem, est_cpu, estimate_from) = if learned.runs == 0 {
-        let (m, c, n) = database.as_ref().and_then(|d| d.estimate(cls.label.as_deref(), &tool).ok()).unwrap_or((None, None, 0));
-        let from = match (m, &cls.label) {
-            (Some(_), Some(l)) => format!("typical of {n} {l} job(s)"),
-            (Some(_), None) => format!("typical of {n} {tool} job(s)"),
-            (None, _) => "the new_job_mem default".to_string(),
+        let est = database.as_ref().and_then(|d| d.estimate(cls.label.as_deref(), &tool, pool.as_deref()).ok().flatten());
+        let from = match &est {
+            Some(e) if e.mem_kb.is_some() => e.from.clone(),
+            _ => "the new_job_mem default".to_string(),
         };
+        let (m, c) = est.map(|e| (e.mem_kb, e.cpu)).unwrap_or((None, None));
         (Some(m.unwrap_or(cfg.new_job_mem_kb)), Some(c.unwrap_or(1.0)), Some(from))
     } else {
         (None, None, None)
@@ -388,6 +388,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
                     me.started_at = Some(now);
+                    me.start_need_cpu = Some(me.need_cpu);
+                    me.start_need_mem_kb = Some(me.need_mem_kb);
                     me.blocker = None;
                     q.write(&q.run_path(me_pid), &me)?;
                     let _ = std::fs::remove_file(q.wait_path(&me));
@@ -499,6 +501,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let mut tracker = Tracker::starting_at(started);
     let mut last_sample = started;
     let mut last_mem_kb = 0u64;
+    let mut seen_peak_kb = 0u64;
     let mut int_seen: Option<f64> = None;
     let mut forwarded = [false; 3];
     // wait4 rather than Child::try_wait: it also returns the kernel's own
@@ -542,6 +545,18 @@ pub fn run(mut o: Opts) -> Result<i32> {
             if let Some(r) = tracker.sample(child_pid, now) {
                 me.live_cpu = r.used;
                 me.live_mem_kb = r.mem_kb;
+                if r.mem_kb > seen_peak_kb + seen_peak_kb / 10 {
+                    me.mem_grew_at = Some(now);
+                }
+                seen_peak_kb = seen_peak_kb.max(r.mem_kb);
+                // Past its needs, a job's needs follow its peak, with room to
+                // grow: what it promises to take must keep up with what it takes.
+                if r.mem_kb > me.need_mem_kb {
+                    me.need_mem_kb = r.mem_kb + r.mem_kb / 4;
+                }
+                if r.wanted > me.need_cpu {
+                    me.need_cpu = r.wanted.min(sys::ncpu() as f64);
+                }
                 last_mem_kb = r.mem_kb;
                 let _ = q.write(&q.run_path(me_pid), &me);
                 if let Some(d) = &database {
