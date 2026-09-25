@@ -322,6 +322,14 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
                 gb((machine_at.mem_kb - ours.1 - theirs.1).max(0.0) as u64)
             )),
         ]));
+        let beyond = ours.1 + theirs.1 - machine_at.mem_kb;
+        if beyond > 512.0 * 1024.0 {
+            lines.push(Line::from(vec![
+                Span::styled("━━ ", Style::default().fg(Color::White)),
+                Span::raw(format!("in use: {}; programs hold", gb(machine_at.mem_kb as u64))),
+            ]));
+            lines.push(Line::styled(format!("   {} more, compressed or in swap", gb(beyond as u64)), DIM));
+        }
     }
     lines.push(Line::from(vec![
         Span::styled("╌╌ ", Style::default().fg(Color::Yellow)),
@@ -1044,6 +1052,8 @@ CHART LAYERS (Overview)
   ▒▒ muted      load taskguard did not start, per group: agents (with what they started), browsers,
                 editors, dev services, containers, chat & apps; the legend names the biggest programs
   ░░ grey       the rest of the machine's load
+  ━━ white      memory in use, where the layers pass it: a program's memory also counts what
+                the system compressed or moved to swap, so programs can add up to more
   ╌╌ yellow     the limit (cpu_max, mem_max)
   waiting row   how many jobs waited, coloured by the main reason:
                 red CPU, magenta memory, yellow slots, blue reservation, cyan learning
@@ -1162,6 +1172,27 @@ mod tests {
         app.show_other = false;
         let s = screen(&mut app, 160, 40);
         assert!(!s.contains("not started by taskguard"), "o hides everything taskguard did not start");
+    }
+
+    #[test]
+    fn groups_are_drawn_in_full_above_the_machine_total() {
+        // The machine holds 16 GB (fixture); the job 4 GB and the agents 20 GB,
+        // with memory compressed or in swap.
+        let (_t, mut app) = fixture();
+        let db = crate::db::Db::open_dir(&app.dir).unwrap();
+        for i in 0..300 {
+            let t = now() - 600.0 + i as f64 * 2.0;
+            let agents =
+                crate::db::GroupReading { group: "agents".into(), cores: 1.0, mem_kb: 20 << 20, procs: 9, top: "claude ×9".into() };
+            db.group_samples(t, &[agents]).unwrap();
+        }
+        app.charts = Charts::Mem;
+        app.load().unwrap();
+        let s = screen(&mut app, 160, 40);
+        assert!(s.contains('━'), "a line marks the memory in use:\n{s}");
+        assert!(s.contains("compressed or in swap"), "{s}");
+        let agent_rows = s.lines().filter(|l| l.contains('▒')).count();
+        assert!(agent_rows >= 10, "the agents keep their full height:\n{s}");
     }
 
     #[test]

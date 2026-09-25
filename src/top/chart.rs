@@ -73,11 +73,13 @@ impl Widget for Stacked<'_> {
                 }
             }
             if self.show_other {
+                // Drawn in full, even above the machine total: a process's
+                // memory also counts what the system compressed or swapped
+                // out, so the programs can add up to more than is in use.
                 for (_, color, vals) in self.groups {
                     let v = vals.get(c).copied().unwrap_or(0.0);
-                    // A group can never be more than the machine total holds.
-                    if v > 0.0 && acc < total {
-                        acc = (acc + v).min(total);
+                    if v > 0.0 {
+                        acc += v;
                         stack.push((acc, Style::default().fg(*color), "▒"));
                     }
                 }
@@ -85,12 +87,16 @@ impl Widget for Stacked<'_> {
                     stack.push((total, Style::default().fg(Color::DarkGray), "░"));
                 }
             }
+            // Where the layers pass the machine total, a line marks it.
+            let total_row = (acc > total * 1.02).then(|| rows as f64 - total / per_row);
             for r in 0..rows {
                 // Value range this cell covers, bottom row first.
                 let from_bottom = rows - 1 - r;
                 let mid = (from_bottom as f64 + 0.5) * per_row;
                 let y = plot.y + r as u16;
-                if let Some((_, style, sym)) = stack.iter().find(|(top, _, _)| mid <= *top) {
+                if total_row.is_some_and(|t| (r as f64 - t).abs() < 0.5) {
+                    buf.set_string(x, y, "━", Style::default().fg(Color::White));
+                } else if let Some((_, style, sym)) = stack.iter().find(|(top, _, _)| mid <= *top) {
                     buf.set_string(x, y, *sym, *style);
                 } else if (r as f64 - limit_row).abs() < 0.5 {
                     buf.set_string(x, y, "╌", Style::default().fg(Color::Yellow));
