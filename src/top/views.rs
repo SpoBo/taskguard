@@ -207,6 +207,14 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|(g, v)| (g.clone(), chart::group_color(g), v.iter().map(|x| if is_cpu { x.0 } else { x.1 }).collect()))
             .collect();
         groups.sort_by_key(|(g, _, _)| d.groups_now.iter().position(|x| &x.group == g).unwrap_or(usize::MAX));
+        // Memory only: programs can hold more than is in use (compressed or
+        // in swap). Then a line marks what is in use, in every column.
+        let mark_total = !is_cpu
+            && app.show_other
+            && total.iter().enumerate().any(|(c, t)| {
+                let sum: f64 = layers.iter().chain(groups.iter()).map(|(_, _, v)| v.get(c).copied().unwrap_or(0.0)).sum();
+                t.is_some_and(|t| sum > t * 1.02)
+            });
         let fmt_cpu = |v: f64| format!("{v:.0}c");
         let fmt_mem = |v: f64| if v <= 0.0 { "0G".into() } else { gb(v as u64).replace(" GB", "G").replace(" MB", "M") };
         let (max, limit, fmt, title): (f64, f64, &dyn Fn(f64) -> String, &str) = if is_cpu {
@@ -219,6 +227,7 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
                 total: &total,
                 layers: &layers,
                 groups: &groups,
+                mark_total,
                 max,
                 limit,
                 show_other: app.show_other,
@@ -326,9 +335,10 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
         if beyond > 512.0 * 1024.0 {
             lines.push(Line::from(vec![
                 Span::styled("━━ ", Style::default().fg(Color::White)),
-                Span::raw(format!("in use: {}; programs hold", gb(machine_at.mem_kb as u64))),
+                Span::raw(format!("memory in use: {}", gb(machine_at.mem_kb as u64))),
             ]));
-            lines.push(Line::styled(format!("   {} more, compressed or in swap", gb(beyond as u64)), DIM));
+            lines.push(Line::styled(format!("   programs hold {} more,", gb(beyond as u64)), DIM));
+            lines.push(Line::styled("   compressed or in swap".to_string(), DIM));
         }
     }
     lines.push(Line::from(vec![
@@ -1193,7 +1203,7 @@ mod tests {
         app.load().unwrap();
         let s = screen(&mut app, 160, 40);
         assert!(s.contains('━'), "a line marks the memory in use:\n{s}");
-        assert!(s.contains("compressed or in swap"), "{s}");
+        assert!(s.contains("programs hold ") && s.contains("compressed or in swap"), "{s}");
         let agent_rows = s.lines().filter(|l| l.contains('▒')).count();
         assert!(agent_rows >= 10, "the agents keep their full height:\n{s}");
     }

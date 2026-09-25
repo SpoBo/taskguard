@@ -17,6 +17,8 @@ pub struct Stacked<'a> {
     pub layers: &'a [(String, Color, Vec<f64>)],
     /// Per group of programs outside taskguard, stacked above the namespaces.
     pub groups: &'a [(String, Color, Vec<f64>)],
+    /// Draw a line at the machine total: the layers pass it somewhere.
+    pub mark_total: bool,
     pub max: f64,
     pub limit: f64,
     pub show_other: bool,
@@ -87,16 +89,19 @@ impl Widget for Stacked<'_> {
                     stack.push((total, Style::default().fg(Color::DarkGray), "░"));
                 }
             }
-            // Where the layers pass the machine total, a line marks it.
-            let total_row = (acc > total * 1.02).then(|| rows as f64 - total / per_row);
+            // When the layers pass the machine total anywhere in the chart, a
+            // line marks the total in every column, over the layer's colour.
+            let total_row = self.mark_total.then(|| rows as f64 - total / per_row);
             for r in 0..rows {
                 // Value range this cell covers, bottom row first.
                 let from_bottom = rows - 1 - r;
                 let mid = (from_bottom as f64 + 0.5) * per_row;
                 let y = plot.y + r as u16;
+                let layer = stack.iter().find(|(top, _, _)| mid <= *top);
                 if total_row.is_some_and(|t| (r as f64 - t).abs() < 0.5) {
-                    buf.set_string(x, y, "━", Style::default().fg(Color::White));
-                } else if let Some((_, style, sym)) = stack.iter().find(|(top, _, _)| mid <= *top) {
+                    let bg = layer.and_then(|(_, style, _)| style.fg).unwrap_or(Color::Reset);
+                    buf.set_string(x, y, "━", Style::default().fg(Color::White).bg(bg));
+                } else if let Some((_, style, sym)) = layer {
                     buf.set_string(x, y, *sym, *style);
                 } else if (r as f64 - limit_row).abs() < 0.5 {
                     buf.set_string(x, y, "╌", Style::default().fg(Color::Yellow));
@@ -180,6 +185,7 @@ mod tests {
             total: &total,
             layers: &layers,
             groups: &[],
+            mark_total: false,
             max: 12.0,
             limit: 10.0,
             show_other: true,
