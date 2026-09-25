@@ -160,7 +160,7 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
                 .map(|(ns, v)| (ns.clone(), ns_color(app, ns), v.iter().map(|x| if is_cpu { x.0 } else { x.1 }).collect()))
                 .collect();
         let fmt_cpu = |v: f64| format!("{v:.0}c");
-        let fmt_mem = |v: f64| gb(v as u64).replace(" GB", "G").replace(" MB", "M");
+        let fmt_mem = |v: f64| if v <= 0.0 { "0G".into() } else { gb(v as u64).replace(" GB", "G").replace(" MB", "M") };
         let (max, limit, fmt, title): (f64, f64, &dyn Fn(f64) -> String, &str) = if is_cpu {
             (d.ncpu as f64, d.ncpu as f64 * app.cfg.cpu_max / 100.0, &fmt_cpu, "CPU (cores)")
         } else {

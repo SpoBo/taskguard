@@ -7,24 +7,13 @@ machine has room for the CPU and memory that the same command used on its past
 runs. Every call on the machine shares one queue, from any terminal, worktree,
 task runner or agent.
 
-```
-$ taskguard status
-taskguard   10:51:50                       machine: 10 cores, 32.0 GB
+![taskguard top: machine CPU and memory over time, with the jobs taskguard started stacked per repo](docs/screenshots/overview.png)
 
-CPU     [################|##.]    9.3 busy  +0.2 reserved  of 10.0 cores   limit 80%
-MEMORY  [############....|...]   19.4 GB held  +0 MB reserved  of 32.0 GB   limit 85%
-         # in use now   + promised to running jobs   | limit
-
-RUNNING (1)                          pool          time   CPU now / needs      MEMORY now / needs
-  packages/ui:vitest                   -                5s    5.4 / 5.6          714 MB / 715 MB
-
-WAITING (3)                          pool        waited   needs                 blocked by
-  packages/api:tsc                     -                5s   3.7 cores, 2.5 GB     CPU: would use 13.2 of 8.0 cores, 5.2 cores short
-  web:build                            -                5s   4.4 cores, 1.2 GB     CPU: would use 13.9 of 8.0 cores, 5.9 cores short
-  packages/ui:tsc                      -                5s   2.8 cores, 911 MB     CPU: would use 12.3 of 8.0 cores, 4.3 cores short
-
-NEXT  packages/api:tsc starts when packages/ui:vitest finishes (about 4s left).
-```
+The dashboard above shows a demo: two repos, `shop` and `billing`, share one
+laptop. Coloured areas are the jobs that taskguard started, one colour per
+repo. The grey area is everything else on the machine. The strip at the bottom
+shows how many jobs waited, and why. To see it yourself, run
+[the demo](#try-it-with-the-demo).
 
 macOS and Linux. One binary, written in Rust.
 
@@ -117,6 +106,19 @@ compiler.
 
 ## Install
 
+Prebuilt binaries for macOS (Apple silicon, Intel) and Linux (x86_64, ARM,
+static) are on the [releases page](https://github.com/SpoBo/taskguard/releases):
+
+```sh
+# pick the target for your machine: aarch64-apple-darwin, x86_64-apple-darwin,
+# x86_64-unknown-linux-musl or aarch64-unknown-linux-musl
+target=aarch64-apple-darwin
+curl -fsSL "https://github.com/SpoBo/taskguard/releases/latest/download/taskguard-$target.tar.gz" | tar -xz
+install -m 755 "taskguard-$target/taskguard" ~/.local/bin/taskguard
+```
+
+Or build it from source:
+
 ```sh
 git clone https://github.com/SpoBo/taskguard.git
 cd taskguard
@@ -199,7 +201,7 @@ it for one call.
 ### Starved runs
 
 taskguard also measures whether a job was held back while it ran: its threads
-waited for a core more than half as long as they ran, it paged memory in, or it
+waited for a core more than half as long as they ran, it paged memory in while the machine was under memory pressure, or it
 took 1.5 times its usual time while the machine was full. A starved run
 teaches a higher need for the next run, and with hints on it prints advice
 that can be pasted:
@@ -219,21 +221,30 @@ vitest, jest, playwright and turbo, and the node heap flag.
 
 `taskguard top` is a terminal dashboard in the style of btop.
 
-```
-taskguard top  10:52:20  machine 10 cores, 32.0 GB  recorder on  range 15m  ns all  ⚠ 1 warnings (6)
- 1 Overview   2 Queue   3 Runs   4 Job   5 Trends   6 Warnings   7 Namespaces   8 Help
-                                      !                                           │now, and peak in the last 15m
-CPU (cores)                                                                       │
-    10c                                                                           │██ dalp            1.1c   449 MB
-                             ░  ░     ░░                                ░      ░ ░│                peak  4.7c   1.6 GB
-                            ░░░░░╌╌╌╌╌░░╌╌╌╌░╌╌╌╌╌╌╌╌╌╌╌╌╌░╌░░╌╌╌╌╌░╌╌╌╌░╌     ░╌░│██ web             1.2c   325 MB
-                            ░░░░░░    ░░  ░ ░             ░ ░░   ░ ░    ░░     ░ ░│                peak  2.4c   599 MB
-     5c                     ░░░█░░░░ ░░░░░░░░░░       ░   ░░░░░ ░░ ░   ░░░     ░░░│░░ other           7.0c  19.0 GB
-                            ░░████░░░░░████░░░░░░░░░░ ░   ░░░░░ ░░░░░░░░░░     ██░│   (not started by taskguard)
-                            ░░██████░░████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░     ███│╌╌ limit: CPU 80%, memory 85%
-     0c                     ░███████░██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░     ███│
-waiting                     ▂▄▆▅▅▆▃  ▄█▃▄▄▅▄▄▅                                 ▆▃▂│
-```
+**Queue.** What runs and what waits. The Why panel checks every rule for
+the selected job, with numbers, and says what will unblock it.
+
+![Queue view: three jobs wait on CPU, and the Why panel shows the sum that fails](docs/screenshots/queue.png)
+
+**Warnings.** Runs that were starved, what taskguard changed for the next
+run, and the minimum to pin when a job starves again and again.
+
+![Warnings view: starved runs with the evidence and a suggested --min-cpu](docs/screenshots/warnings.png)
+
+<details>
+<summary>More views: runs, job, trends, namespaces, and the <code>status</code> command</summary>
+
+![Runs view: past runs with wait time, cores used and wanted, peak memory and flags](docs/screenshots/runs.png)
+
+![Job view: the learned needs of one command and its last runs](docs/screenshots/job.png)
+
+![Trends view: a test suite whose memory grew 73%](docs/screenshots/trends.png)
+
+![Namespaces view: CPU-hours, GB-hours, runs and waits per repo](docs/screenshots/namespaces.png)
+
+![taskguard status: the same queue as plain text, for scripts and agents](docs/screenshots/status.png)
+
+</details>
 
 | View | What it shows |
 | --- | --- |
@@ -256,6 +267,22 @@ text, for scripts and agents.
 The history comes from a small recorder process. The first job starts it, it
 samples the machine every 2 seconds, and it exits by itself 30 minutes after
 the last job. Nothing is installed as a service.
+
+## Try it with the demo
+
+`scripts/demo.sh` fills a scratch state with about four minutes of made-up
+monorepo work, in two repos. The jobs are busy loops and a Python process that
+holds memory, so taskguard really measures, learns and queues them. The demo
+sets a low CPU limit (60%), so jobs have to wait.
+
+```sh
+scripts/demo.sh                                        # terminal 1
+TASKGUARD_DIR=/tmp/taskguard-demo/state taskguard top  # terminal 2
+```
+
+The demo keeps its state in `/tmp/taskguard-demo`. Your real queue and
+history are not touched, so a plain `taskguard top` does not show the demo
+jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 
 ## Commands
 

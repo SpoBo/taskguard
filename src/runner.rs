@@ -212,7 +212,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let need_mem = learned_mem.or(est_mem).unwrap_or(0).max(min_mem.unwrap_or(0));
     let raised = min_cpu.is_some_and(|m| m > learned.cpu.unwrap_or(0.0)) || min_mem.is_some_and(|m| m > learned_mem.unwrap_or(0));
 
-    let script = std::env::var("npm_lifecycle_event").ok();
+    // `bunx` and `npx` set the variable to their own name; that is no script.
+    let script = std::env::var("npm_lifecycle_event").ok().filter(|s| !matches!(s.as_str(), "bunx" | "npx" | "pnpx" | "dlx" | "exec"));
     // Both sides are resolved first: on macOS the cwd comes back as
     // /private/var/... while the variable may say /var/....
     let real_checkout = std::fs::canonicalize(&checkout).unwrap_or(checkout.clone());

@@ -174,8 +174,12 @@ pub fn starvation(f: &RunFacts) -> Option<Starvation> {
             ),
         ));
     }
-    if f.pageins_per_s > PAGEINS_PER_S {
-        found.push(("memory", format!("paged in {:.0} pages/s, so it ran short of memory", f.pageins_per_s)));
+    // Page-ins alone are no proof: macOS counts every file read from disk as a
+    // page-in, and a cold `turbo run` reads thousands of files on a machine with
+    // plenty of free memory. They only count while the kernel also reported
+    // memory pressure during the run.
+    if f.pageins_per_s > PAGEINS_PER_S && f.pressure_frac > 0.0 {
+        found.push(("memory", format!("paged in {:.0} pages/s under memory pressure, so it ran short of memory", f.pageins_per_s)));
     } else if f.pressure_frac > PRESSURE_FRAC {
         found.push(("memory", format!("the machine was under memory pressure {:.0}% of the run", f.pressure_frac * 100.0)));
     }
@@ -367,7 +371,8 @@ mod tests {
         let s = starvation(&RunFacts { runnable_s: 150.0, ..facts() }).unwrap();
         assert_eq!(s.kind, "cpu");
         assert!(s.evidence[0].contains("waited on CPU 43%"), "{:?}", s.evidence);
-        assert_eq!(starvation(&RunFacts { pageins_per_s: 500.0, ..facts() }).unwrap().kind, "memory");
+        assert_eq!(starvation(&RunFacts { pageins_per_s: 500.0, pressure_frac: 0.2, ..facts() }).unwrap().kind, "memory");
+        assert_eq!(starvation(&RunFacts { pageins_per_s: 500.0, ..facts() }), None, "file reads on a calm machine are not starvation");
         assert_eq!(starvation(&RunFacts { wall: 200.0, full_frac: 0.8, ..facts() }).unwrap().kind, "slowdown");
         assert_eq!(starvation(&RunFacts { wall: 200.0, full_frac: 0.1, ..facts() }), None, "slow but the machine had room");
     }
