@@ -28,6 +28,8 @@ impl Env {
             .env("TASKGUARD_DIR", &self.dir)
             .env("TASKGUARD_CONF", &self.conf)
             .env("TASKGUARD_RECORDER_IDLE_EXIT", "3")
+            // Memory pressure on the test machine would hold every job back.
+            .env("TASKGUARD_PRESSURE", "0")
             .env_remove("TASKGUARD_HELD")
             .env_remove("npm_lifecycle_event")
             .env_remove("npm_package_json");
@@ -336,6 +338,10 @@ fn needs_set_by_hand_let_a_job_fit() {
 fn a_waiting_job_follows_a_limit_changed_in_the_config() {
     // At 1% of RAM no job fits while another one runs.
     let e = Env::new("mem_max = 1\nlearn_stagger = 0\n");
+    // One run first: a job known to be short skips the CPU check, so only
+    // memory decides, however busy the test machine is.
+    assert!(e.run(&["--", "touch", "started"]).status.success());
+    std::fs::remove_file(e.file("started")).unwrap();
     let holder = e.spawn(&["--", "sh", "-c", "touch held; sleep 5"]);
     wait_for(&e.file("held"));
     let waiter = e.spawn(&["--", "touch", "started"]);
@@ -349,4 +355,13 @@ fn a_waiting_job_follows_a_limit_changed_in_the_config() {
     let t = Instant::now();
     holder.wait_with_output().unwrap();
     assert!(t.elapsed() > Duration::from_millis(500), "the job started while the holder still ran");
+}
+
+#[test]
+fn nothing_starts_under_memory_pressure() {
+    let e = Env::new("");
+    // Even with nothing running: the load comes from other programs.
+    let out = e.cmd(&["--st", "-2", "--", "true"]).env("TASKGUARD_PRESSURE", "100").output().unwrap();
+    assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
+    assert!(stderr(&out).contains("memory pressure"), "{}", stderr(&out));
 }

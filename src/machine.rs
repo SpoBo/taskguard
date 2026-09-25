@@ -114,7 +114,12 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
         ncpu,
         mem_used_kb: used,
         mem_total_kb: sys::mem_total_kb(),
-        mem_pressure: sys::mem_pressure_pct(),
+        // TASKGUARD_PRESSURE fixes the reading, for tests that must not
+        // depend on how busy the machine that runs them is.
+        mem_pressure: match std::env::var("TASKGUARD_PRESSURE") {
+            Ok(v) => v.parse().ok(),
+            Err(_) => sys::mem_pressure_pct(),
+        },
         recent_mem,
         ticks_busy: t.busy,
         ticks_total: t.total,

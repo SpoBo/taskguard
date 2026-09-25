@@ -125,6 +125,8 @@ fn others(
         own.insert(p.pid, k.own);
     }
     let group_of = groups::assign(&parents, &own);
+    // scripts/demo.sh: made-up groups, so screenshots show no real programs.
+    let demo = std::env::var_os("TASKGUARD_DEMO_GROUPS").is_some();
 
     let mut rows: Vec<(String, i32, u64, f64)> = Vec::new();
     let mut seen: HashMap<i32, (u64, f64)> = HashMap::new();
@@ -169,7 +171,7 @@ fn others(
             db::GroupReading { group: g.to_string(), cores: t.cores, mem_kb: t.mem_kb, procs: t.procs, top }
         })
         .collect();
-    db.group_samples(now, &group_rows)?;
+    db.group_samples(now, &if demo { demo_groups(now) } else { group_rows })?;
     if !with_top {
         return Ok(());
     }
@@ -179,4 +181,23 @@ fn others(
         r.0 = known.get(&r.1).map(|k| k.name.clone()).unwrap_or_else(|| sys::proc_name(r.1));
     }
     db.top_procs(now, &rows)
+}
+
+/// Made-up groups for the demo, gently changing over time.
+fn demo_groups(now: f64) -> Vec<db::GroupReading> {
+    let wave = |period: f64, phase: f64| 1.0 + 0.15 * ((now / period + phase) * std::f64::consts::TAU).sin();
+    let gb = |v: f64| (v * 1024.0 * 1024.0) as u64;
+    let g = |group: &str, cores: f64, mem: f64, procs: usize, top: &str| db::GroupReading {
+        group: group.into(),
+        cores,
+        mem_kb: gb(mem),
+        procs,
+        top: top.into(),
+    };
+    vec![
+        g("agents", 1.2 * wave(40.0, 0.0), 6.4 * wave(90.0, 0.0), 38, "claude ×6 3.1 GB, node ×14 1.9 GB, codex ×2 1.2 GB"),
+        g("browsers", 0.4 * wave(30.0, 0.3), 2.6, 21, "Google Chrome ×21 2.6 GB"),
+        g("editors", 0.3, 1.8 * wave(120.0, 0.5), 9, "Visual Studio Code ×9 1.8 GB"),
+        g("dev services", 0.1, 0.9, 12, "postgres ×9 0.7 GB, redis-server 0.2 GB"),
+    ]
 }

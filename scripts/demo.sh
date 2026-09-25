@@ -12,7 +12,9 @@ set -euo pipefail
 
 DEMO=${DEMO:-/tmp/taskguard-demo}
 TG=${TASKGUARD:-taskguard}
-export TASKGUARD_DIR=$DEMO/state TASKGUARD_CONF=$DEMO/config.toml TASKGUARD_RECORDER_IDLE_EXIT=900
+# TASKGUARD_DEMO_GROUPS: the recorder records made-up groups of other
+# programs (agents, browsers, ...) instead of the ones on this machine.
+export TASKGUARD_DIR=$DEMO/state TASKGUARD_CONF=$DEMO/config.toml TASKGUARD_RECORDER_IDLE_EXIT=900 TASKGUARD_DEMO_GROUPS=1
 
 rm -rf "$DEMO"
 mkdir -p "$DEMO/state"
