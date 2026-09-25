@@ -271,3 +271,16 @@ fn a_job_shorter_than_one_sample_still_shows_its_load() {
     assert!(cpu > 0.1, "the run did some work: {cpu}");
     assert!((covered - cpu).abs() < cpu * 0.3, "the samples cover the run's CPU: {covered} of {cpu}");
 }
+
+#[test]
+fn a_nested_call_runs_inside_the_outer_slot() {
+    // Every version sets and honours TASKGUARD_HELD=1, so a nested call from
+    // any version never waits for the slot its own parent holds.
+    let e = Env::new("");
+    let inner = format!("{} -j1 --id one -- sh -c 'echo $TASKGUARD_HELD > inner'", env!("CARGO_BIN_EXE_taskguard"));
+    let o = e.run(&["--st", "-10", "-j1", "--id", "one", "--", "sh", "-c", &inner]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(e.file("inner")).unwrap().trim(), "1");
+    let runs: i64 = e.db().query_row("SELECT count(*) FROM runs", [], |r| r.get(0)).unwrap();
+    assert_eq!(runs, 1, "the nested call takes no slot and records no run");
+}
