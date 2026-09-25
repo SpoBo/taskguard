@@ -1,296 +1,354 @@
-# tsc-queue
+# taskguard
 
-A machine-wide admission queue for TypeScript compiles on macOS.
+A `sem` that learns what each job needs.
 
-It stops your laptop from running out of memory when several `tsc` processes
-start at the same time. Each compile waits for a free slot, and it also waits
-until the machine has room for the amount of memory that this exact project
-needed on its past runs.
+Put `taskguard` in front of a command. The command starts only when the
+machine has room for the CPU and memory that the same command used on its past
+runs. Every call on the machine shares one queue, from any terminal, worktree,
+task runner or agent.
 
 ```
-$ tsc-queue status
-memory 61% of 32 GB held, 14% reserved for growth   limit 85%   max slots 6
+$ taskguard status
+taskguard   10:51:50                       machine: 10 cores, 32.0 GB
 
-RUNNING
-  packages_api_server                    47s   wants 18422 MB (3910 MB resident)   predicted 25600 MB
-  packages_ui                            12s   wants  1204 MB ( 980 MB resident)   predicted  1600 MB
+CPU     [################|##.]    9.3 busy  +0.2 reserved  of 10.0 cores   limit 80%
+MEMORY  [############....|...]   19.4 GB held  +0 MB reserved  of 32.0 GB   limit 85%
+         # in use now   + promised to running jobs   | limit
 
-WAITING
-  packages_worker                        31s in the queue
+RUNNING (1)                          pool          time   CPU now / needs      MEMORY now / needs
+  packages/ui:vitest                   -                5s    5.4 / 5.6          714 MB / 715 MB
 
-2 of max 6 compiling, 1 queued, 19626 MB wanted by them
-room for another: no - a typical job would land at 91%, over 85%
+WAITING (3)                          pool        waited   needs                 blocked by
+  packages/api:tsc                     -                5s   3.7 cores, 2.5 GB     CPU: would use 13.2 of 8.0 cores, 5.2 cores short
+  web:build                            -                5s   4.4 cores, 1.2 GB     CPU: would use 13.9 of 8.0 cores, 5.9 cores short
+  packages/ui:tsc                      -                5s   2.8 cores, 911 MB     CPU: would use 12.3 of 8.0 cores, 4.3 cores short
+
+NEXT  packages/api:tsc starts when packages/ui:vitest finishes (about 4s left).
 ```
+
+macOS and Linux. One binary, written in Rust.
 
 ## The problem
 
-A task runner starts one `tsc` process per task, and it only caps tasks inside
-a single run. Two terminals, two worktrees, or an editor and a CI script can
-each start a full set of compiles. Nothing on the machine holds a shared
-ceiling, so a large monorepo pushes the machine into swap and macOS starts
-killing processes.
+A task runner caps tasks inside one run only. Two terminals, two worktrees, an
+editor and a coding agent can each start a full set of compiles and test
+suites. Nothing on the machine holds a shared ceiling, so a large monorepo
+pushes the machine into swap, and the operating system starts to kill
+processes.
 
-Raising or lowering the task runner concurrency does not fix this. One large
-package can want 25 GB on its own. A limit of one task still lets that one task
-take the whole machine.
+A fixed limit does not fix this. `turbo --concurrency=2` still lets two jobs
+that each want 20 GB run side by side, and it holds back twenty small jobs that
+would fit easily. GNU `sem` has the same gap: it counts slots, and a 25 GB
+compile and a 50 MB lint each take one slot.
 
-`tsc-queue` puts one gate in front of every `tsc` process on the machine,
-whoever started it.
+`taskguard` counts what the jobs really use.
 
 ## How it decides
 
-A compile is admitted when two conditions hold.
+A job starts when both of these fit:
 
-1. Fewer than `TSC_QUEUE_MAX_SLOTS` compiles are running. This is a ceiling,
-   not a target.
-2. `memory in use` + `growth reserve` + `this job's predicted peak` stays under
-   `TSC_QUEUE_MEM_MAX` percent of RAM.
+```
+CPU busy     + CPU still promised to running jobs     + this job's CPU need     <= cpu_max  (100% of cores)
+memory held  + memory still promised to running jobs  + this job's memory need  <= mem_max  (85% of RAM)
+```
 
-The growth reserve is the part the running compiles have not taken yet:
-`sum(max(0, predicted_peak - current_footprint))`. Without it, a second job is
-admitted into space the first one is about to eat.
+- **Needs are learned.** Each run is measured, and the result is kept per
+  command. The memory need is the highest peak of the last 10 runs, because
+  running out of memory kills processes. The CPU need is the median of the
+  cores the job *wanted* in its last 10 runs, because too little CPU only
+  makes a job slower.
+- **A first run reserves an estimate.** A job with no history counts as
+  needing what similar jobs needed: the 75th percentile peak of jobs with the
+  same label (typecheck, test, ...), or 1.5 GB without any (`new_job_mem`). New
+  jobs start in batches sized by the free room, and a batch starts only after
+  the one before has run for 5 seconds (`learn_stagger`), so the readings can
+  show what the new jobs really take.
+- **Memory pressure stops everything new.** When the kernel reports memory
+  pressure (macOS: warning or critical; Linux: PSI above 20%), nothing new
+  starts until it eases, whatever the estimates say.
+- **Memory is read at its recent peak.** Admission uses the highest reading
+  of the last 10 seconds, so a job never starts in a short dip.
+- **Short jobs skip the CPU check.** A job that usually ends within 5 seconds
+  is over before the CPU reading could react to it, so holding it back only
+  makes it late. Memory is checked for every job.
+- **"Promised" is the growth still to come.** A compile that sits at 2 GB
+  but peaked at 20 GB last time still has 18 GB to take. Without this, a second
+  job is started into space the first one is about to use.
+- **The machine readings count everything.** Your browser and your editor
+  count too, not only jobs that taskguard started.
+- **Nothing running means the job starts,** whatever the CPU and memory
+  readings say, so the queue cannot deadlock on a wrong reading. Memory
+  pressure is the one exception: then the load comes from other programs, and
+  jobs wait until it eases.
+- **Any order, oldest first.** A small job may pass a big one that does not
+  fit yet. This is safe: a job only reaches taskguard when its launcher has
+  decided that it may run. Turbo starts a task only after the tasks it depends
+  on are done, and `a && b` starts `b` only after `a` ends.
+- **No starvation.** A job that newer jobs have passed for 2 minutes gets a
+  reservation. Nothing newer starts until it has started.
+- **Pools** add a slot ceiling where jobs share something: one database, one
+  set of services, one lock file. `taskguard --id e2e -j1 ...`. CPU and memory
+  are always shared by the whole machine.
 
-The prediction is the largest of the project's last ten recorded runs. Every
-run appends one line to `~/.cache/tsc-queue/history.tsv`. A project with no
-history is assumed to need `TSC_QUEUE_ASSUME_MB`.
+### What is measured
 
-A run is always admitted when nothing else is running, so the queue can never
-deadlock on a busy machine.
+| | macOS | Linux |
+| --- | --- | --- |
+| Job memory | physical footprint of the whole process tree | PSS of the whole process tree |
+| Job CPU used | user + system time | `schedstat` run time |
+| Job CPU wanted | used + time spent ready but waiting for a core (`ri_runnable_time`) | used + run-queue wait (`schedstat`) |
+| Machine CPU | host tick counters | `/proc/stat` |
+| Machine memory | the higher of active + wired + compressed, and the kernel's `memorystatus_level` | total - available |
+| Memory pressure | `memorystatus_vm_pressure_level` | `/proc/pressure/memory` |
 
-### Memory is measured as physical footprint, not resident size
+On macOS, active + wired + compressed falls exactly when the machine is in
+trouble: under pressure the kernel moves pages to the inactive list and writes
+compressed pages to swap. The kernel's own figure rises instead, so taskguard
+takes the higher of the two.
 
-macOS compresses a process's pages under memory pressure. One measured `tsc`
-reported 3.8 GB resident while it really held 22 GB. Activity Monitor shows
-both numbers and looks self-contradictory: the list column is the physical
-footprint, and the per-process info panel is the resident set.
+Physical footprint is used on macOS because resident size hides compressed
+pages. One measured `tsc` reported 3.8 GB resident while it really held 22 GB.
+All readings are syscalls. They cost microseconds, not the 120 ms per process
+of `/usr/bin/footprint`.
 
-Physical footprint charges compressed pages at their original size, so it is
-demand, not occupancy. Demand is what an admission gate must reserve, because
-resident size only looks small once the machine is already out of room.
-
-`tsc-queue` samples `/usr/bin/footprint` every two seconds. That call costs
-about 120 ms. `top -l 1 -pid` and `vmmap --summary` both cost about 1.5 s.
-
-The sample covers the whole process tree, not only the process the shim
-started. The JavaScript entry point is a node process that spawns the native
-compiler, so the memory lives in the grandchild. Measuring the direct child
-alone reported 4 MB for a compile that really held 1793 MB.
+The whole process tree is measured, because the memory often lives in a
+grandchild: a JavaScript entry point is a node process that starts the native
+compiler.
 
 ## Install
 
 ```sh
-git clone https://github.com/SpoBo/tsc-queue.git
-cd tsc-queue
-./install.sh ~/code/my-monorepo
+git clone https://github.com/SpoBo/taskguard.git
+cd taskguard
+cargo install --path .
 ```
 
-The installer copies the script to `~/.local/bin/tsc-queue`, writes
-`~/.config/tsc-queue.conf`, wraps the compiler in each checkout you named, and
-loads two launchd jobs. Run it again at any time; it never overwrites a config
-file you already have.
+This puts `taskguard` in `~/.cargo/bin`. It needs Rust 1.89 or newer.
 
-Install somewhere else with `PREFIX=/usr/local ./install.sh`.
+## Use
 
-To manage several checkouts, or a directory full of git worktrees, edit
-`~/.config/tsc-queue.conf` and run `tsc-queue install`.
+Put the prefix in the package scripts:
 
-## Update
-
-```sh
-cd tsc-queue
-git pull
-./install.sh
+```json
+{
+  "scripts": {
+    "typecheck": "taskguard tsc -p .",
+    "test": "taskguard bun --bun vitest run",
+    "build": "taskguard vite build"
+  }
+}
 ```
 
-`install.sh` copies the new script over `~/.local/bin/tsc-queue`, keeps your
-config, and reloads the two launchd jobs. Both jobs call that path, so the
-next repair sweep already runs the new code. Nothing else has to be redone.
+With turbo, prefix the package scripts, not the root `turbo run` command, and
+give turbo a high `--concurrency`. Turbo then only sets the upper limit, and
+taskguard decides what runs. A prefixed `turbo run` would hold one slot for the
+whole run.
 
-## Uninstall
+### Syntax
 
-```sh
-./uninstall.sh            # restore every compiler, keep config and history
-./uninstall.sh --purge    # also delete the config file and the history
+The shape follows GNU `sem`. There is one difference: taskguard runs in the
+foreground by default, because turbo and npm need the command's exit code.
+
+```
+taskguard [options] [--] COMMAND [ARGS...]
+taskguard --wait [--id NAME]
 ```
 
-The uninstaller stops the launchd jobs before it restores the compilers. That
-order matters: a repair job that is still loaded would re-wrap them seconds
-later.
+| Option | What it does |
+| --- | --- |
+| `-j N`, `+N`, `-N`, `N%` | Slot ceiling for this pool, as in sem. None by default. |
+| `--id NAME` | Pool name (sem's semaphore id). |
+| `--ns NAME` | Namespace for the dashboard. The default is the repo name, the same for every worktree. |
+| `--st SECS` | `SECS > 0`: run anyway after SECS. `SECS < 0`: give up after -SECS, exit 124. |
+| `--key KEY` | History key. The default is the project path plus the command. |
+| `--min-cpu N` | Never start with fewer than N free cores. |
+| `--min-mem SIZE` | Never start with less than SIZE free (`6G`, `512M`). |
+| `--now` | Skip the queue, but still measure and learn. |
+| `--bg` | Wait for room, then return and let the job run on. |
+| `--pipe` | With `--bg`: pass stdin to the command. |
+| `-q` | Print only waits longer than the status interval. |
+| `--hints`, `--no-hints` | Agent hints on or off for this call. |
+
+The `--` is optional. Options stop at the first word that is not an option.
+Use `taskguard run ...` for a command that has the same name as a subcommand.
+
+`TASKGUARD_DISABLE=1` skips taskguard for one command. A call nested inside a
+running job starts at once and takes no second slot, even when a task runner in
+between drops environment variables.
+
+Long-running commands are never queued: watch modes, dev servers, `--version`
+and `--help` run straight through. See `taskguard doctor --explain "COMMAND"`.
+
+### What a waiting job prints
+
+Status lines go to stderr, so the command's own output stays clean:
+
+```
+[taskguard] queued packages/api:tsc - learned: 3.7 cores, 2.5 GB (5 runs)
+[taskguard] waiting 15s web:build - blocked by CPU: would use 9.8 of 8.0 cores, 1.8 cores short. It starts when packages/api:tsc finishes; this is not a hang
+[taskguard] start web:build - waited 19s; fits: CPU 2.7+1.3+4.4 of 8.0 cores, memory 63% of 85%
+[taskguard] done web:build - 7s, used 4.4 cores sustained (wanted 4.8), 1.2 GB peak, exit 0 (0 still queued)
+```
+
+**Agent hints** ("this is not a hang", "starts when X finishes") are on by
+default, so an LLM agent does not kill a command that only waits. Set
+`hints = false` per repository or directory. `--hints` and `--no-hints` override
+it for one call.
+
+### Starved runs
+
+taskguard also measures whether a job was held back while it ran: its threads
+waited for a core more than half as long as they ran, it paged memory in, or it
+took 1.5 times its usual time while the machine was full. A starved run
+teaches a higher need for the next run, and with hints on it prints advice
+that can be pasted:
+
+```
+[taskguard] warning packages/api:vitest_run - possibly starved: waited on CPU 64% of its run time (wanted 6.1 cores, got 2.2)
+[taskguard] advice already done: the next run reserves 6.1 cores (was 3.0)
+[taskguard] advice to pin it: script "test" in packages/api/package.json -> "taskguard --min-cpu 7 bun --bun vitest run"
+[taskguard] advice or let vitest fit the room it gets: add --maxWorkers=2
+```
+
+The advice names the exact script and file, because package managers tell each
+script its name and package.json path. It knows the parallelism flags of
+vitest, jest, playwright and turbo, and the node heap flag.
+
+## The dashboard
+
+`taskguard top` is a terminal dashboard in the style of btop.
+
+```
+taskguard top  10:52:20  machine 10 cores, 32.0 GB  recorder on  range 15m  ns all  ⚠ 1 warnings (6)
+ 1 Overview   2 Queue   3 Runs   4 Job   5 Trends   6 Warnings   7 Namespaces   8 Help
+                                      !                                           │now, and peak in the last 15m
+CPU (cores)                                                                       │
+    10c                                                                           │██ dalp            1.1c   449 MB
+                             ░  ░     ░░                                ░      ░ ░│                peak  4.7c   1.6 GB
+                            ░░░░░╌╌╌╌╌░░╌╌╌╌░╌╌╌╌╌╌╌╌╌╌╌╌╌░╌░░╌╌╌╌╌░╌╌╌╌░╌     ░╌░│██ web             1.2c   325 MB
+                            ░░░░░░    ░░  ░ ░             ░ ░░   ░ ░    ░░     ░ ░│                peak  2.4c   599 MB
+     5c                     ░░░█░░░░ ░░░░░░░░░░       ░   ░░░░░ ░░ ░   ░░░     ░░░│░░ other           7.0c  19.0 GB
+                            ░░████░░░░░████░░░░░░░░░░ ░   ░░░░░ ░░░░░░░░░░     ██░│   (not started by taskguard)
+                            ░░██████░░████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░     ███│╌╌ limit: CPU 80%, memory 85%
+     0c                     ░███████░██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░     ███│
+waiting                     ▂▄▆▅▅▆▃  ▄█▃▄▄▅▄▄▅                                 ▆▃▂│
+```
+
+| View | What it shows |
+| --- | --- |
+| 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace; the grey rest is load taskguard did not start. A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
+| 2 Queue | What runs and what waits. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. |
+| 3 Runs | Past runs, sortable and filterable, with the reasons each one waited. |
+| 4 Job | One command: its learned needs and where each comes from, sparklines over its runs, and what taskguard changed on its own. |
+| 5 Trends | Commands whose memory, CPU or duration grows: the last 10 runs against the 10 before. |
+| 6 Warnings | Starved runs with the evidence, suggested minimums, trend alerts, and `--now` runs that went over a limit. |
+| 7 Namespaces | CPU-hours, GB-hours, runs, waits and starved runs per namespace. |
+
+Keys: `1`-`8` views, `t` time range (5m to 7d), `n` namespace, `/` filter,
+`←`/`→` time cursor, `c`/`m`/`b` charts, `o` hide the other layer, `s`/`r`
+sort, `Enter` open a job, `k` stop a job, `q` quit. The mouse selects rows and
+scrolls the time range.
+
+`taskguard top --print [--view NAME] [--range 1h]` prints one frame as plain
+text, for scripts and agents.
+
+The history comes from a small recorder process. The first job starts it, it
+samples the machine every 2 seconds, and it exits by itself 30 minutes after
+the last job. Nothing is installed as a service.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `tsc-queue status` | What is compiling, what is waiting, and whether there is room for one more |
-| `tsc-queue status --watch [secs]` | The same report, redrawn live. Default 2 seconds |
-| `tsc-queue history` | Peak memory and run count per project |
-| `tsc-queue doctor` | Configuration, and which checkouts are wrapped |
-| `tsc-queue install` | Wrap the compiler in every configured checkout |
-| `tsc-queue uninstall` | Put the original compilers back |
-| `tsc-queue repair` | Load the launchd job that re-wraps after a package install |
-| `tsc-queue watch` | Load the launchd job that reacts to a new compiler binary |
-| `tsc-queue unload` | Stop and remove both launchd jobs |
-
-Set `TSC_QUEUE_DISABLE=1` to bypass the queue for one command.
+| `taskguard [options] COMMAND` | Run a command when the machine has room for it |
+| `taskguard --wait [--id NAME]` | Wait until no job of the pool runs or waits |
+| `taskguard top` | The dashboard |
+| `taskguard status [--json]` | What runs, what waits, and why |
+| `taskguard history` | Learned needs per command |
+| `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
+| `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
+| `taskguard import-history` | Load tsc-queue's memory history |
 
 ## Configuration
 
-All settings live in `~/.config/tsc-queue.conf`. The repository ships
-[`tsc-queue.conf.example`](tsc-queue.conf.example) as a template. The installer
-copies it on the first install and never touches it again, so your live
-settings stay off the repository.
+Settings come from files, in layers. Later layers win:
+
+1. built-in defaults
+2. `~/.config/taskguard/config.toml`
+3. `[dir."<path>"]` sections in that file, for jobs inside that path
+4. `.taskguard.toml` in the repository
+5. command-line flags
+
+Files are used, not environment variables, because turbo's default strict env
+mode drops variables it does not know.
+
+[`taskguard.example.toml`](taskguard.example.toml) lists every setting. The
+most used ones:
+
+```toml
+cpu_max = 100          # percent of all cores
+mem_max = 85           # percent of RAM
+hints = true           # agent hints on status lines
+
+[pool.e2e]             # a slot ceiling for one kind of job
+max_slots = 1
+
+[[job]]                # settings for one command
+match = "vitest run --project integration"
+min_cpu = 4
+min_mem = "6G"
+```
+
+The built-in defaults cover the DALP monorepo out of the box:
+
+- single-slot pools per checkout for database migrations, contract compiles,
+  e2e runs and integration runs
+- launchers such as `bun --bun`, `bunx`, `npx`, `pnpm exec`, `devenv shell --`
+  and `node` are stripped before matching
+- watch modes and dev servers run straight through
+
+## Known limits
+
+- taskguard decides when a job starts. It never touches a job that runs. When
+  another program suddenly takes a lot of memory after taskguard's jobs have
+  started, the machine can still fill up; taskguard then starts nothing new
+  until the pressure eases. A future version may pause (SIGSTOP) its newest
+  running jobs under critical pressure and resume them when memory frees up.
+- A job with no history reserves an estimate. A first run far bigger than
+  similar jobs can still take more than its estimate before it is learned.
+
+## Moving from tsc-queue
+
+This repository used to be `SpoBo/tsc-queue`, a bash tool that replaced the
+compiler inside `node_modules` with a shim. GitHub redirects the old URL. taskguard needs no shims.
 
 ```sh
-TSC_QUEUE_ROOTS="$HOME/code/my-monorepo"   # checkouts to manage
-TSC_QUEUE_SCAN="$HOME/worktrees"           # directories full of checkouts
-TSC_QUEUE_MAX_SLOTS=6                      # ceiling on concurrent compiles
-TSC_QUEUE_MEM_MAX=85                       # percent of RAM not to exceed
-TSC_QUEUE_ASSUME_MB=1500                   # guess for a project with no history
+tsc-queue unload         # stop its launchd jobs first, or they re-wrap the compilers
+tsc-queue uninstall      # put the original compilers back
+cargo install --path .
+taskguard import-history # its memory history becomes the first guess for tsc runs
 ```
 
-**Settings must be in the file, not in your shell.** A task runner such as
-turbo runs its tasks in a strict environment mode and drops every
-`TSC_QUEUE_*` variable. Exporting them looks like it works and silently does
-nothing. The shim reads the file from disk on every call.
+Then add the prefix to the scripts. `taskguard doctor` reports shims that are
+still installed.
 
-### Which directories get patched
+## Files
 
-`TSC_QUEUE_ROOTS` names each checkout exactly. `TSC_QUEUE_SCAN` names a parent
-directory, and every immediate child holding a `package.json` or a `.git` is
-managed. Use `SCAN` for a directory full of git worktrees: a worktree created a
-second ago is covered with no extra step. Both take a space separated list, and
-you can set both.
+Everything lives in `~/.cache/taskguard` (or `TASKGUARD_DIR`):
 
-Run `tsc-queue install` after a change, then `tsc-queue doctor` to see what is
-covered.
+| Path | What it is |
+| --- | --- |
+| `wait/`, `run/` | One file per waiting or running job, named after its process |
+| `lock` | The queue lock; the kernel releases it when a process dies |
+| `machine` | The shared machine reading |
+| `taskguard.db` | Runs, samples and rollups (SQLite) |
 
-**Narrow the scope in the right order.** The tool only walks the directories it
-currently manages, so a directory you delete from the config can no longer be
-found and stays wrapped forever.
+A job that is killed leaves a file behind. The next process that looks sees
+that its owner is gone and removes it, so a Ctrl-C never wedges the queue.
+
+## Uninstall
 
 ```sh
-tsc-queue uninstall    # restores every compiler in the CURRENT scope
-# now edit the config
-tsc-queue install      # wraps the new scope
+cargo uninstall taskguard
+rm -rf ~/.cache/taskguard ~/.config/taskguard
 ```
-
-## Where it hooks in
-
-`tsc-queue` renames each checkout's real compiler to `tsc-real` and writes a
-small bash shim in its place.
-
-That is the only interception point that catches every caller: `npm run`,
-`pnpm`, `bun run`, `npx`, a task runner, an editor, and a direct call. A `PATH`
-shim does not work, because a package manager puts `node_modules/.bin` ahead of
-`PATH`.
-
-It also means the tool touches nothing outside the checkouts you name. No other
-project's compiler is modified.
-
-The wrap uses a hardlink, then an atomic rename. A plain `mv` would leave the
-compiler path empty for an instant, and anything invoking `tsc` in that window
-would die with "No such file or directory".
-
-The saved original is called `tsc-real`, with no file extension. That detail is
-load-bearing. The JavaScript entry point is loaded by node, node picks its
-loader from the file extension, and a name such as `tsc.real` makes every call
-fail with `ERR_UNKNOWN_FILE_EXTENSION`. The native Go compiler does not care,
-so the fault only shows on npm, pnpm and yarn layouts. An older `tsc.real` is
-renamed on the next `tsc-queue install`.
-
-These layouts are found by default:
-
-```
-node_modules/typescript/bin/tsc
-node_modules/.pnpm/typescript@*/node_modules/typescript/bin/tsc
-node_modules/.bun/typescript@*/node_modules/typescript/bin/tsc
-node_modules/@typescript/typescript-darwin-*/lib/tsc
-node_modules/.pnpm/@typescript+typescript-darwin-*@*/.../lib/tsc
-node_modules/.bun/@typescript+typescript-darwin-*@*/.../lib/tsc
-```
-
-Set `TSC_QUEUE_GLOBS` for an unusual layout, such as a monorepo that keeps a
-copy of TypeScript inside every package.
-
-## Staying installed
-
-A package install writes the original compiler back over the shim. Two launchd
-jobs restore it.
-
-- **The path watcher** watches each compiler's directory and fires within about
-  a second of the binary being replaced.
-- **The repair sweep** runs every 30 seconds. It is the net that also catches a
-  brand-new checkout whose paths the watcher does not know about yet.
-
-Both call `tsc-queue install --quiet`, which is idempotent. It rewrites a shim
-only when the text differs, and it writes through a temp file and a rename,
-because bash reads a script as it runs and overwriting a shim in place would
-corrupt a compile already executing it.
-
-A git hook cannot do this job. `post-merge` fires when the merge lands, which
-is before the session runs its package install, so the hook would re-wrap and
-then be overwritten seconds later.
-
-Logs go to `~/.cache/tsc-queue/repair.log`.
-
-### A patcher can save the shim as its backup
-
-Some packages replace the compiler in place after it is installed. They rename
-whatever sits at the compiler's path aside and keep that file as their backup.
-They do not check that the file is a compiler. When the shim is there, the
-shim becomes the backup, and the patcher's own restore command would put a bash
-script back as the compiler. Every call would then fail, because the path the
-shim runs no longer exists.
-
-`@effect/tsgo patch` does this: it renames `lib/tsc` to `lib/tsc.original`
-whenever no backup is there yet. The compiles themselves stay correct, because
-the patcher copies a whole new compiler in rather than editing the file. Only
-the backup is wrong.
-
-A shim is never a correct backup of anything, so `tsc-queue install` deletes
-any copy of one found beside a managed compiler, and `tsc-queue doctor` counts
-them. The test reads the file, so a true backup is never touched. The next
-patch run then writes a correct backup. The repair sweep does this every 30
-seconds, so nothing has to be run by hand.
-
-## What is never queued
-
-These finish in milliseconds and must not wait behind a 90 second build:
-
-`--version`, `--help`, `--init`, `--showConfig`, `--listFilesOnly`, and a call
-with no arguments.
-
-`--watch` is also never queued, because a watch would hold a slot for hours.
-
-Some repositories fire hundreds of `tsc --showConfig -p <dir>` probes in one
-task. Counting those as compiles makes a correct queue look broken.
-
-A nested call is also never queued. The JavaScript entry point spawns the
-native compiler, and both are wrapped, so one invocation would take two slots.
-The outer shim exports `TSC_QUEUE_HELD=1` and a shim that sees it runs straight
-through. Without that guard the queue deadlocks at the slot ceiling: every slot
-is held by an outer shim waiting on an inner one that can never be admitted.
-
-## It also fixes orphans
-
-The shim runs the real compiler as a child and traps `INT`, `TERM` and `HUP` to
-kill it. A slot whose owner died is reclaimed by a liveness check, so Ctrl-C
-never wedges the queue.
-
-A task runner on its own does not do this. Killing turbo has been observed to
-leave five `tsc` processes running unsupervised.
-
-## Limits
-
-- **macOS only.** The memory readings use `vm_stat`, `sysctl` and
-  `/usr/bin/footprint`, and the background jobs use launchd.
-- **It does not make anything faster.** It makes a machine that would have
-  thrashed finish instead.
-- **A project larger than your RAM still cannot run.** The queue admits it when
-  nothing else is running, and it then fails the same way it always did. The
-  history tells you which project that is: `tsc-queue history`.
-- **Yarn Plug'n'Play is not supported.** There is no compiler file to wrap.
-
-## License
-
-MIT. See [LICENSE](LICENSE).

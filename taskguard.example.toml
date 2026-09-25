@@ -1,0 +1,104 @@
+# taskguard settings.
+#
+# Copy this to ~/.config/taskguard/config.toml, or put the parts that belong to
+# one repository in a .taskguard.toml at the root of that repository.
+#
+# Later layers win:
+#   1. built-in defaults
+#   2. ~/.config/taskguard/config.toml          (this file)
+#   3. [dir."<path>"] sections in this file      (the longest matching path wins)
+#   4. .taskguard.toml in the repository         (walked up from the job's cwd)
+#   5. command-line flags
+#
+# Settings live in files, not in environment variables: turbo's default strict
+# env mode drops variables it does not know, so an exported variable looks
+# like it works and silently does nothing.
+#
+# Check what applies where you are:   taskguard doctor
+# Check how one command is treated:   taskguard doctor --explain "bunx vitest run"
+
+# --------------------------------------------------------------- limits ----
+# A job starts only when
+#   CPU busy     + CPU still promised to running jobs     + its CPU need     fits under cpu_max
+#   memory held  + memory still promised to running jobs  + its memory need  fits under mem_max
+# Needs are learned per command: memory is the highest peak of the last
+# hist_keep runs, CPU the median of the cores it wanted.
+cpu_max = 100         # percent of all cores
+mem_max = 85          # percent of RAM
+pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
+
+# ---------------------------------------------------------------- hints ----
+# Extra words for LLM agents on every status line ("this is not a hang",
+# "starts when X finishes"), and advice after a starved run. On by default.
+# Switch off per repository or directory, not per command. --hints and
+# --no-hints override it for one call.
+hints = true
+
+# ------------------------------------------------------------- learning ----
+hist_keep = 10        # how many past runs feed the learned needs
+learn_stagger = 5     # a batch of jobs with no history starts after the last one ran this long
+new_job_mem = "1.5G"  # memory a job with no history reserves when no similar job is known
+cpu_min_duration = 5  # jobs that usually end sooner than this skip the CPU check
+max_bypass = 120      # seconds a job may be passed by newer ones before it is reserved
+boost_runs = 5        # runs that get +25% memory after a memory-starved run
+
+# ---------------------------------------------------------------- timing ----
+sample_every = 2      # seconds between measurements of a running job
+status_every = 15     # seconds between "still waiting" lines
+
+# ------------------------------------------------------------- recorder ----
+recorder_idle_exit = 1800   # the recorder exits after this many idle seconds
+retention_raw_hours = 48    # keep 2-second samples this long
+retention_rollup_days = 90  # keep one-minute averages this long
+
+# ----------------------------------------------------------- passthrough ----
+# Commands that run straight through, unqueued and unmeasured, on top of the
+# built-in list (watch modes, dev servers, --version, --help).
+# passthrough = ["storybook", "my-dev-server"]
+
+# Top-level settings end here: in TOML, a key written after a [table] line
+# belongs to that table.
+
+# ---------------------------------------------------------------- pools ----
+# A pool only adds a slot ceiling. CPU and memory are always shared by the
+# whole machine. Built-in single-slot pools: db, contracts, e2e, integration.
+# Set per_checkout to false for one pool for the whole machine; by default each
+# worktree gets its own.
+#
+# [pool.e2e]
+# max_slots = 2
+#
+# [pool.docker]
+# max_slots = 1
+# per_checkout = false
+# match = ["docker compose up", "docker build"]
+
+# ---------------------------------------------------------- job rules ----
+# Per-command settings. `match` is a pattern: the command word, then words that
+# must appear among its arguments, in order. Launchers such as bun, bunx, npx,
+# pnpm exec and node are stripped first. `key` matches the history key instead
+# (see taskguard history), with * and ** globs.
+#
+# [[job]]
+# match = "vitest run --project integration"
+# min_cpu = 4           # never start with fewer than 4 free cores
+# min_mem = "6G"        # never start with less than 6 GB free
+#
+# [[job]]
+# key = "packages/api:*"
+# pool = "e2e"
+#
+# [[job]]
+# match = "tsc -p tsconfig.quick.json"
+# now = true            # always skip the queue, but still measure it
+
+# ---------------------------------------------------- per-directory settings ----
+# Settings for jobs whose cwd is inside a path, without touching the repository.
+#
+# [dir."/Users/me/code/dalp"]
+# hints = false
+# mem_max = 80
+#
+# [[dir."/Users/me/code/dalp".job]]
+# match = "hardhat test"
+# min_mem = "12G"
