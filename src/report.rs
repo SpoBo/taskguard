@@ -306,12 +306,19 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             },
         ));
     }
+    // Under memory pressure the decision stops before it checks CPU and
+    // memory, so for those two lines the numbers decide what is shown.
+    let pressure = failed("pressure");
+    if let Some(b) = pressure {
+        out.push((false, blocker_text(b)));
+    }
+    let checked = |name: &str, fits: bool| if pressure.is_some() { fits } else { failed(name).is_none() };
     let cpu_would = m.cpu_busy + s.reserve_cpu + e.need_cpu;
     if let Some(d) = e.est_dur_s.filter(|d| *d < s.limits.cpu_min_duration) {
         out.push((true, format!("CPU: not checked; this job usually takes {d:.1}s, too short to overload the machine")));
     } else {
         out.push((
-            failed("cpu").is_none(),
+            checked("cpu", cpu_would <= s.cpu_limit),
             format!(
                 "CPU: {:.1} busy + {:.1} promised to running jobs + {:.1} for this job = {:.1} of {:.1} cores",
                 m.cpu_busy, s.reserve_cpu, e.need_cpu, cpu_would, s.cpu_limit
@@ -320,7 +327,7 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
     }
     let mem_would = m.mem_used_kb + s.reserve_mem_kb + e.need_mem_kb;
     out.push((
-        failed("memory").is_none(),
+        checked("memory", mem_would <= s.mem_limit_kb),
         format!(
             "memory: {} held + {} promised + {} for this job = {:.0}% (limit {:.0}%)",
             gb(m.mem_used_kb),
@@ -486,6 +493,27 @@ mod tests {
         assert_eq!(bar(5.0, 0.0, 2.0, 10.0, 8.5, 10), "#####++.|.");
         assert_eq!(bar(0.0, 0.0, 0.0, 10.0, 10.0, 10), ".........|".replace('|', "."));
         assert_eq!(bar(6.0, 2.0, 1.0, 10.0, 8.5, 10), "####!!+.|.", "2 of the 6 in use are above the estimates");
+    }
+
+    #[test]
+    fn under_memory_pressure_the_rules_name_it_and_check_the_numbers() {
+        let lim = Limits {
+            cpu_max_pct: 100.0,
+            mem_max_pct: 85.0,
+            learn_stagger: 0.0,
+            max_bypass: 120.0,
+            cpu_min_duration: 5.0,
+            pressure_max: 20.0,
+        };
+        let mut m = MachineSample::fixed(10.0, 10, 23 * GB, 32 * GB);
+        m.mem_pressure = Some(50.0);
+        let job = Entry { ticket: 1, key: "root:ci".into(), need_cpu: 10.0, need_mem_kb: GB / 2, known: true, ..Default::default() };
+        let s = Snapshot::build(m, lim, vec![], vec![job], 1000.0, &[]);
+        let checks = rule_checks(&s, &s.waiting[0]);
+        let line = |start: &str| checks.iter().find(|(_, t)| t.starts_with(start)).cloned().unwrap();
+        assert!(!line("memory pressure").0, "{checks:?}");
+        assert!(!line("CPU").0, "20 of 10 cores does not fit, though the decision stopped before it checked CPU: {checks:?}");
+        assert!(line("memory:").0, "{checks:?}");
     }
 
     #[test]
