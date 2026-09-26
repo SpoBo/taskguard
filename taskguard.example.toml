@@ -44,7 +44,7 @@ boost_runs = 5        # runs that get +25% memory after a memory-starved run
 
 # ---------------------------------------------------------------- timing ----
 sample_every = 2      # seconds between measurements of a running job
-status_every = 15     # seconds between "still waiting" lines
+status_every = 120    # seconds between "still waiting" lines
 
 # ------------------------------------------------------------- recorder ----
 recorder_idle_exit = 1800   # the recorder exits after this many idle seconds

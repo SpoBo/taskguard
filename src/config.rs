@@ -113,7 +113,7 @@ impl Default for Config {
             cpu_max: 100.0,
             mem_max: 85.0,
             sample_every: 2.0,
-            status_every: 15,
+            status_every: 120,
             hist_keep: 10,
             learn_stagger: 5.0,
             cpu_min_duration: 5.0,
