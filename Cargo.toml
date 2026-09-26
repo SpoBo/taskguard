@@ -1,6 +1,6 @@
 [package]
 name = "taskguard"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.89"
 description = "A sem that learns what each job needs: start a command only when the machine has room for its CPU and memory"
@@ -9,6 +9,7 @@ repository = "https://github.com/SpoBo/taskguard"
 readme = "README.md"
 keywords = ["semaphore", "queue", "monorepo", "turbo", "scheduler"]
 categories = ["command-line-utilities", "development-tools"]
+include = ["/src", "/tests", "/README.md", "/LICENSE", "/taskguard.example.toml"]
 
 [profile.release]
 lto = true

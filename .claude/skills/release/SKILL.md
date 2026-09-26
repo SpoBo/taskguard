@@ -14,8 +14,8 @@ publishes them on a GitHub release:
 - `taskguard-x86_64-unknown-linux-musl.tar.gz`
 - `taskguard-aarch64-unknown-linux-musl.tar.gz`
 
-Each file has a `.sha256` file next to it. Nothing goes to crates.io yet. The
-owner publishes there only after DALP has shown that taskguard is stable.
+Each file has a `.sha256` file next to it. The same version also goes to
+crates.io (see the last step). Publish there only when the user asks.
 
 ## Before you start
 
@@ -61,6 +61,17 @@ id=$(gh run list -R SpoBo/taskguard --workflow release.yml --limit 1 --json data
 gh run watch "$id" -R SpoBo/taskguard --exit-status
 gh release view vNEW -R SpoBo/taskguard --json assets --jq '.assets[].name'
 ```
+
+To publish on crates.io, ask the user for a token. Pass it in the
+environment only; never write it to a file:
+
+```sh
+cargo publish --dry-run                  # checks the package first
+CARGO_REGISTRY_TOKEN=... cargo publish
+```
+
+`include` in `Cargo.toml` keeps the crate small. Add a file there when the
+build or the tests need it.
 
 A local `rust-objcopy ... libLLVM.dylib` warning on macOS comes from the
 local toolchain. It does not affect the release: CI builds the binaries.
