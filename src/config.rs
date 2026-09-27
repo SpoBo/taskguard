@@ -36,6 +36,7 @@ pub struct Layer {
     pub resume_at: Option<f64>,
     pub new_job_mem: Option<String>,
     pub max_bypass: Option<u64>,
+    pub max_backfill: Option<u64>,
     pub boost_runs: Option<usize>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
@@ -104,6 +105,7 @@ pub struct Config {
     pub resume_at: f64,
     pub new_job_mem_kb: u64,
     pub max_bypass: u64,
+    pub max_backfill: u64,
     pub boost_runs: usize,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
@@ -136,6 +138,7 @@ impl Default for Config {
             resume_at: 80.0,
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
+            max_backfill: 0,
             boost_runs: 5,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
@@ -164,6 +167,7 @@ impl Default for Config {
             "hist_keep",
             "learn_stagger",
             "max_bypass",
+            "max_backfill",
             "boost_runs",
             "recorder_idle_exit",
         ] {
@@ -433,6 +437,7 @@ impl Config {
             self.origin.insert("new_job_mem".into(), name.to_string());
         }
         set!(max_bypass);
+        set!(max_backfill);
         set!(boost_runs);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
@@ -673,8 +678,11 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::write(root.join(".taskguard.toml"), "hints = true\n[[job]]\nmatch = \"vitest run\"\nmin_cpu = 4\nmin_mem = \"6G\"\n")
-            .unwrap();
+        std::fs::write(
+            root.join(".taskguard.toml"),
+            "hints = true\nmax_backfill = 1800\n[[job]]\nmatch = \"vitest run\"\nmin_cpu = 4\nmin_mem = \"6G\"\n",
+        )
+        .unwrap();
         // SAFETY: tests in this module do not read TASKGUARD_CONF concurrently.
         unsafe { std::env::set_var("TASKGUARD_CONF", &user) };
         let c = Config::load(&pkg, &root).unwrap();
@@ -686,6 +694,7 @@ mod tests {
         assert_eq!(cl.min_cpu, Some(4.0));
         assert_eq!(cl.min_mem_kb, Some(6 * 1024 * 1024));
         assert!(c.origin["hints"].ends_with(".taskguard.toml"));
+        assert_eq!((Config::default().max_backfill, c.max_backfill), (0, 1800), "backfill is off unless a layer sets it");
     }
 
     #[test]
