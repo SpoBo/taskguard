@@ -242,7 +242,8 @@ fn run_row(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
     })
 }
 
-const RUN_COLS: &str = "id, ended_at, ns, key, label, waited_s, ended_at - started_at, cores_used, cores_wanted, peak_mem_kb, exit,
+const RUN_COLS: &str =
+    "id, ended_at, ns, key, label, waited_s, ended_at - started_at - coalesce(paused_s, 0), cores_used, cores_wanted, peak_mem_kb, exit,
                         main_blocker, starved, starved_detail, now";
 
 pub fn runs(db: &Db, ns: Option<&str>, text: &str, limit: usize) -> Result<Vec<RunRow>> {

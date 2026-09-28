@@ -365,3 +365,22 @@ fn nothing_starts_under_memory_pressure() {
     assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
     assert!(stderr(&out).contains("memory pressure"), "{}", stderr(&out));
 }
+
+#[test]
+fn auto_pause_pauses_the_newest_job_and_resumes_it_when_the_rest_is_done() {
+    // Memory is always "full" at 1%, and never low enough to resume on its
+    // own: the paused job resumes because nothing else runs any more.
+    let e = Env::new("auto_pause = true\npause_at = 1\nresume_at = 0\nsample_every = 0.2\n");
+    let a = e.spawn(&["--", "sh", "-c", "touch a_started; sleep 1; echo a >> log"]);
+    wait_for(&e.file("a_started"));
+    // A --now job is never paused, so the other one, A, is.
+    let b = e.spawn(&["--now", "--", "sh", "-c", "sleep 3; echo b >> log"]);
+    let (a, b) = (a.wait_with_output().unwrap(), b.wait_with_output().unwrap());
+    let err = stderr(&a);
+    assert!(err.contains("paused") && err.contains("resumed"), "{err}");
+    assert!(!stderr(&b).contains("paused"), "{}", stderr(&b));
+    let log = std::fs::read_to_string(e.file("log")).unwrap();
+    assert_eq!(log, "b\na\n", "the short job only went on after the long one ended");
+    let paused: f64 = e.db().query_row("SELECT paused_s FROM runs WHERE cmd LIKE '%a_started%'", [], |r| r.get(0)).unwrap();
+    assert!(paused > 1.0, "the pause is recorded: {paused}");
+}

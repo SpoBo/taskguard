@@ -368,11 +368,13 @@ The built-in defaults cover the DALP monorepo out of the box:
 
 ## Known limits
 
-- taskguard decides when a job starts. It never touches a job that runs. When
-  another program suddenly takes a lot of memory after taskguard's jobs have
-  started, the machine can still fill up; taskguard then starts nothing new
-  until the pressure eases. A future version may pause (SIGSTOP) its newest
-  running jobs under critical pressure and resume them when memory frees up.
+- By default taskguard only decides when a job starts. When another program
+  suddenly takes a lot of memory after taskguard's jobs have started, the
+  machine can still fill up; taskguard then starts nothing new until the
+  pressure eases. With `auto_pause = true` it also pauses (SIGSTOP) its newest
+  running jobs when memory reaches `pause_at`, and resumes them (SIGCONT) under
+  `resume_at`. A paused job keeps its memory: the pause stops it from growing
+  and lets the system compress it or move it to swap. It does not free it.
 - A job with no history reserves an estimate. A first run far bigger than
   similar jobs can still take more than its estimate before it is learned.
 
@@ -422,7 +424,8 @@ the others write:
 
 A version only follows the rules it knows. A version before 0.2.0 does not
 read priorities: its waiting jobs start in ticket order and do not step aside
-for a job with a higher priority.
+for a job with a higher priority. It does not know auto_pause either: its jobs
+are never paused, and its waiting jobs may start while another job is paused.
 
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each

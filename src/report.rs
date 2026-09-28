@@ -48,6 +48,7 @@ pub fn blocker_text(b: &Blocker) -> String {
         Blocker::Pressure { level, .. } => {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
+        Blocker::Paused { key } => format!("{key} is paused for memory; it resumes before anything new starts"),
         Blocker::Memory { would_pct, limit_pct, short_kb, .. } => {
             format!("memory: would reach {would_pct:.0}% (limit {limit_pct:.0}%), {} short", gb(*short_kb))
         }
@@ -123,6 +124,7 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         Blocker::LearnStagger { wait_s } => (format!("starts in about {:.0}s", wait_s.ceil()), Some(*wait_s)),
         Blocker::Settling { key, wait_s } => (format!("starts when {key} stops growing (at most {:.0}s)", wait_s.ceil()), Some(*wait_s)),
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
+        Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
@@ -454,7 +456,11 @@ pub fn render_status(s: &Snapshot) -> String {
         let _ = writeln!(o, "  (nothing running)");
     }
     for e in &s.running {
-        let tag = if e.now { " NOW" } else { "" };
+        let tag = match (e.paused_since, e.now) {
+            (Some(since), _) => format!(" PAUSED {}", dur(s.now - since)),
+            (None, true) => " NOW".into(),
+            (None, false) => String::new(),
+        };
         let est = if e.known || e.raised_by_min { "" } else { " est" };
         let needs_cpu = format!("{:.1}{est}", e.need_cpu);
         let needs_mem = format!("{}{est}", gb(e.need_mem_kb));

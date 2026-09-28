@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS runs (
   starved TEXT,
   starved_detail TEXT,
   machine_full_frac REAL,
-  imported INTEGER NOT NULL DEFAULT 0
+  imported INTEGER NOT NULL DEFAULT 0,
+  paused_s REAL
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -207,6 +208,8 @@ pub struct RunResult {
     pub machine_full_frac: f64,
     /// False when the run never produced a sample: nothing is learned from it.
     pub measured: bool,
+    /// Seconds the run was paused for memory; not part of its duration.
+    pub paused_s: f64,
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -239,12 +242,17 @@ impl Db {
         if !has_span {
             conn.execute_batch("ALTER TABLE job_samples ADD COLUMN span_s REAL")?;
         }
+        // Databases made before auto_pause: how long a run was paused.
+        let has_paused: bool = conn.prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'paused_s'")?.exists([])?;
+        if !has_paused {
+            conn.execute_batch("ALTER TABLE runs ADD COLUMN paused_s REAL")?;
+        }
         Ok(Db { conn })
     }
 
     pub fn learned(&self, key: &str, keep: usize, boost_runs: usize) -> Result<Learned> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at, starved FROM runs
+            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved FROM runs
              WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC LIMIT ?2",
         )?;
@@ -315,7 +323,7 @@ impl Db {
         self.conn.execute(
             "UPDATE runs SET ended_at = ?2, exit = ?3, peak_mem_kb = ?4, cores_used = ?5, cores_wanted = ?6,
                 cpu_seconds = ?7, runnable_seconds = ?8, pageins = ?9, starved = ?10, starved_detail = ?11,
-                machine_full_frac = ?12
+                machine_full_frac = ?12, paused_s = ?13
              WHERE id = ?1",
             params![
                 id,
@@ -329,7 +337,8 @@ impl Db {
                 if r.measured { Some(r.pageins as i64) } else { None },
                 r.starved,
                 r.starved_detail,
-                r.machine_full_frac
+                r.machine_full_frac,
+                (r.paused_s > 0.0).then_some(r.paused_s)
             ],
         )?;
         Ok(())
@@ -430,7 +439,7 @@ impl Db {
     /// Median duration of past runs, for the slowdown check.
     pub fn median_duration(&self, key: &str, keep: usize, exclude: i64) -> Result<Option<f64>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT ended_at - started_at FROM runs WHERE key = ?1 AND id != ?2 AND ended_at IS NOT NULL
+            "SELECT ended_at - started_at - coalesce(paused_s, 0) FROM runs WHERE key = ?1 AND id != ?2 AND ended_at IS NOT NULL
              AND started_at IS NOT NULL AND exit = 0 ORDER BY ended_at DESC LIMIT ?3",
         )?;
         let v: Vec<f64> = stmt.query_map(params![key, exclude, keep as i64], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;

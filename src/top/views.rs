@@ -556,7 +556,11 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         let over =
             e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05 || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
         rows.push(Row::new(vec![
-            Cell::from(if e.now { "NOW" } else { "RUN" }).style(Style::default().fg(Color::Green)),
+            match (e.paused_since, e.now) {
+                (Some(_), _) => Cell::from("PAUSE").style(Style::default().fg(Color::LightMagenta)),
+                (None, true) => Cell::from("NOW").style(Style::default().fg(Color::Green)),
+                (None, false) => Cell::from("RUN").style(Style::default().fg(Color::Green)),
+            },
             Cell::from(report::job_name(e, 44)),
             Cell::from(e.ns.clone()),
             Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
@@ -685,6 +689,16 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         }
         if e.now {
             lines.push(Line::raw("it skipped the queue (--now); it is measured like any other job"));
+        }
+        if let Some(since) = e.paused_since {
+            lines.push(Line::styled(
+                format!(
+                    "paused for memory {} ago (auto_pause); it resumes when memory is under resume_at ({:.0}%), or when nothing else runs",
+                    dur(s.now - since),
+                    app.cfg.pause_rules().resume_at
+                ),
+                Style::default().fg(Color::LightMagenta),
+            ));
         }
         lines.push(Line::styled("Enter details: CPU and memory over time   e lower what it still reserves", DIM));
     } else {
@@ -1153,6 +1167,7 @@ KEYS
   Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
             Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
+         PAUSE: a job paused for memory (auto_pause, in Config); nothing new starts before it resumes
   mouse: click a tab, a key in the bottom line, or a row; the wheel scrolls lists and zooms the Overview
 
 CHART LAYERS (Overview)

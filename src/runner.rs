@@ -293,6 +293,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         now: o.now,
         est_dur_s: learned.dur_s,
         priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
+        pausable: true,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
@@ -499,6 +500,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
         }
     };
     let child_pid = child.id() as i32;
+    me.child_pid = child_pid;
+    let _ = q.write(&q.run_path(me_pid), &me);
+    let mut pause_rules = cfg.pause_rules();
     // No reading at the very start: a job holds almost nothing in its first
     // instant, and a job shorter than one interval is covered by the final
     // reading below instead.
@@ -521,6 +525,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
             break child.wait()?;
         }
         let now = db::now();
+        // A paused command cannot act on a signal: resume it first.
+        if me.paused_since.is_some() && sig.any().is_some() {
+            queue::signal_tree(child_pid, libc::SIGCONT);
+            me.paused_since = None;
+        }
         // TERM and HUP are passed on at once. INT usually reaches the child from
         // the terminal already, since both share the foreground process group;
         // it is only passed on if the child is still alive a moment later, which
@@ -566,7 +575,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 if let Some(d) = &database {
                     let _ = d.job_sample(run_id, now, span, r.used, r.wanted, r.mem_kb, r.pageins_per_s);
                 }
-                if let Some(m) = machine::read_cache(&dir) {
+                if let Some(m) = machine::read_cache(&dir).filter(|_| me.paused_since.is_none()) {
                     let cpu_full = m.cpu_busy >= 0.95 * m.ncpu as f64 * cfg.cpu_max / 100.0;
                     let mem_full = m.mem_pct() >= cfg.mem_max;
                     if cpu_full || mem_full {
@@ -576,6 +585,17 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         tracker.pressure_samples += 1;
                     }
                 }
+            }
+            // auto_pause can be switched on or off while the job runs.
+            let mtime = conf_mtime(&conf_path);
+            if mtime != seen_mtime {
+                seen_mtime = mtime;
+                if let Ok(c) = Config::load(&cwd, &checkout) {
+                    pause_rules = c.pause_rules();
+                }
+            }
+            if pause_rules.on || me.paused_since.is_some() {
+                auto_pause(&q, &dir, &mut me, &pause_rules, now, database.as_ref(), cfg.sample_every);
             }
         }
         std::thread::sleep(POLL);
@@ -603,6 +623,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
     }
     tracker.cpu_ns = tracker.cpu_ns.max(ru_cpu_ns);
     tracker.peak_mem_kb = tracker.peak_mem_kb.max(ru_maxrss_kb);
+    // Time paused for memory is not part of the run.
+    let wall = (wall - me.paused_s).max(0.0);
     let (used, wanted) = tracker.sustained(wall);
     let measured = tracker.peak_mem_kb > 0;
 
@@ -639,6 +661,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 starved_detail: starved.as_ref().map(|s| serde_json::to_string(&s.evidence).unwrap_or_default()),
                 machine_full_frac: tracker.full_samples as f64 / n,
                 measured,
+                paused_s: me.paused_s,
             },
         );
     }
@@ -664,6 +687,42 @@ pub fn run(mut o: Opts) -> Result<i32> {
         );
     }
     Ok(code)
+}
+
+/// Pause or resume this job's command when the pause rules pick it.
+fn auto_pause(q: &Queue, dir: &Path, me: &mut Entry, rules: &queue::PauseRules, now: f64, database: Option<&Db>, max_age: f64) {
+    let Ok(_g) = q.lock() else { return };
+    let running = q.running();
+    let m = machine::current(dir, max_age, running.iter().map(|e| e.live_mem_kb).sum());
+    match queue::pause_step(&m, rules, &running, now, q.last_pause(), me.pid) {
+        Some(true) => {
+            queue::signal_tree(me.child_pid, libc::SIGSTOP);
+            me.paused_since = Some(now);
+            me.pauses += 1;
+            q.set_last_pause(now);
+            let _ = q.write(&q.run_path(me.pid), me);
+            say(&format!(
+                "paused {} - memory at {:.0}% (pause_at {:.0}%); it resumes under {:.0}%, and nothing new starts before it",
+                me.key,
+                m.mem_pct(),
+                rules.pause_at,
+                rules.resume_at
+            ));
+        }
+        Some(false) => {
+            queue::signal_tree(me.child_pid, libc::SIGCONT);
+            let since = me.paused_since.take().unwrap_or(now);
+            me.paused_s += now - since;
+            q.set_last_pause(now);
+            let _ = q.write(&q.run_path(me.pid), me);
+            let why = if rules.on { format!("memory at {:.0}%", m.mem_pct()) } else { "auto_pause is off".into() };
+            if let Some(d) = database {
+                let _ = d.wait_span(me.run_id, since, now, "paused", &format!("paused for memory; resumed at {why}"));
+            }
+            say(&format!("resumed {} - paused {}; {why}", me.key, report::dur(now - since)));
+        }
+        None => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

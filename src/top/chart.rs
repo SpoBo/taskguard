@@ -127,7 +127,7 @@ pub struct WaitStrip<'a> {
 pub fn blocker_color(name: &str) -> Color {
     match name {
         "cpu" => Color::Red,
-        "pressure" => Color::LightMagenta,
+        "pressure" | "paused" => Color::LightMagenta,
         "memory" => Color::Magenta,
         "slots" => Color::Yellow,
         "reserved" | "priority" => Color::Blue,

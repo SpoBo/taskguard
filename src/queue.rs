@@ -74,6 +74,17 @@ pub struct Entry {
     pub start_need_mem_kb: Option<u64>,
     /// Higher goes first. 0 by default; older versions leave it out.
     pub priority: i32,
+    /// The owner pauses its command itself under memory pressure (auto_pause).
+    /// Older versions leave it out, and their jobs are never picked to pause.
+    pub pausable: bool,
+    /// The command's pid, so a paused command can be resumed when its owner
+    /// dies.
+    pub child_pid: i32,
+    /// Set while the command is paused (SIGSTOP), with when it was paused.
+    pub paused_since: Option<f64>,
+    /// How often, and how long in total, this run was paused so far.
+    pub pauses: u32,
+    pub paused_s: f64,
 }
 
 impl Entry {
@@ -221,6 +232,11 @@ impl Queue {
         for sub in ["wait", "run"] {
             for (p, e) in self.read_dir(sub) {
                 if !alive(e.pid) {
+                    // An owner that died while its command was paused cannot
+                    // resume it any more: do it here.
+                    if e.paused_since.is_some() {
+                        signal_tree(e.child_pid, libc::SIGCONT);
+                    }
                     let _ = fs::remove_file(&p);
                     gone.push(e.run_id);
                 }
@@ -269,6 +285,15 @@ impl Queue {
         v.push(t);
         let text: String = v.iter().map(|s| format!("{s}\n")).collect();
         let _ = fs::write(self.dir.join("unknown_starts"), text);
+    }
+
+    /// When a job last paused or resumed for memory.
+    pub fn last_pause(&self) -> f64 {
+        fs::read_to_string(self.dir.join("last_pause")).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0)
+    }
+
+    pub fn set_last_pause(&self, t: f64) {
+        let _ = fs::write(self.dir.join("last_pause"), t.to_string());
     }
 
     /// When the queue was last busy, for the recorder's idle exit.
@@ -342,6 +367,10 @@ pub enum Blocker {
         level: f64,
         limit: f64,
     },
+    /// A running job is paused for memory: it resumes before anything new starts.
+    Paused {
+        key: String,
+    },
     Memory {
         would_pct: f64,
         limit_pct: f64,
@@ -371,6 +400,7 @@ impl Blocker {
             Blocker::LearnStagger { .. } | Blocker::Settling { .. } => "learning",
             Blocker::Memory { .. } => "memory",
             Blocker::Pressure { .. } => "pressure",
+            Blocker::Paused { .. } => "paused",
             Blocker::Cpu { .. } => "cpu",
         }
     }
@@ -421,6 +451,11 @@ pub fn decide(
     // start again as soon as the pressure eases, and --now still skips it.
     if let Some(p) = m.mem_pressure.filter(|p| *p >= lim.pressure_max) {
         return Decision::Wait { blockers: vec![Blocker::Pressure { level: p, limit: lim.pressure_max }] };
+    }
+
+    // A job paused for memory gets its room back before anything new starts.
+    if let Some(p) = running.iter().find(|e| e.paused_since.is_some()) {
+        return Decision::Wait { blockers: vec![Blocker::Paused { key: p.key.clone() }] };
     }
 
     // Always make progress: with nothing running, the oldest job starts,
@@ -516,6 +551,88 @@ pub fn decide(
         Decision::Admit { reason: format!("fits: {cpu}, memory {:.0}% of {:.0}%", pct(mem_would, m.mem_total_kb as f64), lim.mem_max_pct) }
     } else {
         Decision::Wait { blockers }
+    }
+}
+
+// ----------------------------------------------------------------- pause ----
+
+/// When running jobs are paused for memory (auto_pause in the config).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PauseRules {
+    pub on: bool,
+    /// Pause a job when memory in use reaches this share of RAM...
+    pub pause_at: f64,
+    /// ...and resume one when it is back under this share.
+    pub resume_at: f64,
+}
+
+/// Seconds between two pauses or resumes, so the readings can show what the
+/// last one did before the next one.
+pub const PAUSE_GAP: f64 = 10.0;
+/// A paused job stays paused this long at least. Each new pause of the same
+/// run doubles it, up to `PAUSE_MAX`, so a job that fills the machine again at
+/// once does not flip between the two states.
+pub const PAUSE_MIN: f64 = 10.0;
+pub const PAUSE_MAX: f64 = 300.0;
+
+/// What the job of `me` (a pid) must do now: Some(true) pause, Some(false)
+/// resume. Every job asks for itself; the rules pick the same job for every
+/// asker, so only that one acts. `last` is when any job last paused or resumed.
+///
+/// - Memory at or above `pause_at`, or the kernel at critical pressure: pause
+///   the running job with the lowest priority, newest first. At least one job
+///   keeps running, --now jobs are never paused, and only one job pauses per
+///   `PAUSE_GAP`.
+/// - Memory under `resume_at` and no pressure warning: the paused job with the
+///   highest priority, paused first, resumes after its minimum pause.
+/// - A paused job always resumes when no other job runs, and when auto_pause
+///   is off: nothing is left paused for good.
+pub fn pause_step(m: &MachineSample, r: &PauseRules, running: &[Entry], now: f64, last: f64, me: i32) -> Option<bool> {
+    let mine = running.iter().find(|e| e.pid == me)?;
+    let active: Vec<&Entry> = running.iter().filter(|e| e.paused_since.is_none()).collect();
+    let pressure = m.mem_pressure.unwrap_or(0.0);
+    if let Some(since) = mine.paused_since {
+        // The paused job that resumes first: the highest priority, then the one paused first.
+        let first = running
+            .iter()
+            .filter_map(|e| e.paused_since.map(|s| (e, s)))
+            .min_by(|(a, sa), (b, sb)| b.priority.cmp(&a.priority).then(sa.total_cmp(sb)))
+            .map(|(e, _)| e.pid);
+        if !r.on {
+            return Some(false);
+        }
+        if first != Some(me) {
+            return None;
+        }
+        if active.is_empty() {
+            return Some(false);
+        }
+        let min = (PAUSE_MIN * 2f64.powi(mine.pauses.saturating_sub(1).min(8) as i32)).min(PAUSE_MAX);
+        let room = m.mem_pct() < r.resume_at && pressure < 50.0;
+        return (room && now - since >= min && now - last >= PAUSE_GAP).then_some(false);
+    }
+    let high = m.mem_pct() >= r.pause_at || pressure >= 100.0;
+    if !r.on || !high || active.len() < 2 || now - last < PAUSE_GAP {
+        return None;
+    }
+    let victim = active
+        .iter()
+        .filter(|e| e.pausable && !e.now && e.child_pid > 0)
+        .min_by(|a, b| a.priority.cmp(&b.priority).then(b.started_at.unwrap_or(0.0).total_cmp(&a.started_at.unwrap_or(0.0))))?;
+    (victim.pid == me).then_some(true)
+}
+
+/// Send `sig` to a command and every process below it. Twice for SIGSTOP:
+/// a process that was forking during the first pass is caught by the second.
+pub fn signal_tree(root: i32, sig: i32) {
+    if root <= 0 {
+        return;
+    }
+    for _ in 0..if sig == libc::SIGSTOP { 2 } else { 1 } {
+        let procs = crate::sys::list_procs();
+        for pid in crate::sys::descendants(root, &crate::sys::children_map(&procs)) {
+            unsafe { libc::kill(pid, sig) };
+        }
     }
 }
 
@@ -661,6 +778,70 @@ mod tests {
         // With nothing running, the highest priority starts, not the oldest.
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[], &waiting, &old, 1000.0, &[])), vec!["order"]);
         assert!(blockers(decide(&machine(1.0, 8), &LIM, &[], &waiting, &urgent, 1000.0, &[])).is_empty());
+    }
+
+    fn running(pid: i32, started: f64, priority: i32) -> Entry {
+        Entry {
+            pid,
+            child_pid: pid + 1000,
+            started_at: Some(started),
+            priority,
+            pausable: true,
+            ..job(pid as u64, &format!("j{pid}"), 1.0, 2)
+        }
+    }
+
+    #[test]
+    fn auto_pause_picks_the_newest_lowest_priority_job_and_keeps_one_running() {
+        let rules = PauseRules { on: true, pause_at: 90.0, resume_at: 80.0 };
+        let full = machine(1.0, 30); // 94%
+        let (old, new, urgent) = (running(1, 100.0, 0), running(2, 200.0, 0), running(3, 300.0, 1));
+        let jobs = [old.clone(), new.clone(), urgent.clone()];
+        let step = |m: &MachineSample, jobs: &[Entry], pid, now, last| pause_step(m, &rules, jobs, now, last, pid);
+        // The newest job with the lowest priority pauses; the others stay.
+        assert_eq!(step(&full, &jobs, 2, 1000.0, 0.0), Some(true));
+        assert_eq!(step(&full, &jobs, 1, 1000.0, 0.0), None);
+        assert_eq!(step(&full, &jobs, 3, 1000.0, 0.0), None);
+        // Room enough, or off: nothing pauses.
+        assert_eq!(step(&machine(1.0, 20), &jobs, 2, 1000.0, 0.0), None);
+        assert_eq!(pause_step(&full, &PauseRules { on: false, ..rules }, &jobs, 1000.0, 0.0, 2), None);
+        // Only one pause per gap.
+        assert_eq!(step(&full, &jobs, 2, 1000.0, 995.0), None);
+        // Old versions and --now jobs are never picked; the last running job is never paused.
+        let mut now_job = new.clone();
+        now_job.now = true;
+        let mut old_version = old.clone();
+        old_version.pausable = false;
+        assert_eq!(step(&full, &[old_version, now_job], 2, 1000.0, 0.0), None);
+        assert_eq!(step(&full, std::slice::from_ref(&new), 2, 1000.0, 0.0), None);
+    }
+
+    #[test]
+    fn auto_pause_resumes_under_resume_at_after_the_minimum_pause() {
+        let rules = PauseRules { on: true, pause_at: 90.0, resume_at: 80.0 };
+        let mut paused = running(2, 200.0, 0);
+        paused.paused_since = Some(1000.0);
+        paused.pauses = 1;
+        let jobs = [running(1, 100.0, 0), paused.clone()];
+        let step = |m: &MachineSample, jobs: &[Entry], now| pause_step(m, &rules, jobs, now, 1000.0, 2);
+        assert_eq!(step(&machine(1.0, 28), &jobs, 1020.0), None, "85% is not under resume_at");
+        assert_eq!(step(&machine(1.0, 20), &jobs, 1005.0), None, "the minimum pause is not over");
+        assert_eq!(step(&machine(1.0, 20), &jobs, 1010.0), Some(false));
+        let mut warned = machine(1.0, 20);
+        warned.mem_pressure = Some(50.0);
+        assert_eq!(step(&warned, &jobs, 1020.0), None, "not while the kernel warns");
+        // A job paused before waits longer each time.
+        let mut again = paused.clone();
+        again.pauses = 3;
+        assert_eq!(step(&machine(1.0, 20), &[jobs[0].clone(), again.clone()], 1030.0), None);
+        assert_eq!(step(&machine(1.0, 20), &[jobs[0].clone(), again], 1040.0), Some(false));
+        // Nothing else runs: it resumes whatever memory says. Off: it resumes too.
+        assert_eq!(step(&machine(1.0, 31), std::slice::from_ref(&paused), 1001.0), Some(false));
+        let off = PauseRules { on: false, ..rules };
+        assert_eq!(pause_step(&machine(1.0, 31), &off, &jobs, 1001.0, 1000.0, 2), Some(false));
+        // While a job is paused, nothing new starts.
+        let me = job(9, "new", 0.1, 0);
+        assert_eq!(blockers(decide(&machine(1.0, 1), &LIM, &jobs, std::slice::from_ref(&me), &me, 1001.0, &[])), vec!["paused"]);
     }
 
     #[test]

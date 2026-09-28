@@ -31,6 +31,9 @@ pub struct Layer {
     pub cpu_min_duration: Option<f64>,
     pub pressure_max: Option<f64>,
     pub priority: Option<i32>,
+    pub auto_pause: Option<bool>,
+    pub pause_at: Option<f64>,
+    pub resume_at: Option<f64>,
     pub new_job_mem: Option<String>,
     pub max_bypass: Option<u64>,
     pub boost_runs: Option<usize>,
@@ -94,6 +97,11 @@ pub struct Config {
     pub pressure_max: f64,
     /// The priority of a job that no rule or flag gives one.
     pub priority: i32,
+    /// Pause running jobs when memory fills up, and resume them when it frees
+    /// up. Off by default.
+    pub auto_pause: bool,
+    pub pause_at: f64,
+    pub resume_at: f64,
     pub new_job_mem_kb: u64,
     pub max_bypass: u64,
     pub boost_runs: usize,
@@ -123,6 +131,9 @@ impl Default for Config {
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
             priority: 0,
+            auto_pause: false,
+            pause_at: 92.0,
+            resume_at: 80.0,
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
             boost_runs: 5,
@@ -177,7 +188,7 @@ pub enum SettingKind {
     Size(u64, u64, u64),
 }
 
-pub const SETTINGS: [Setting; 9] = [
+pub const SETTINGS: [Setting; 12] = [
     Setting {
         key: "cpu_max",
         what: "CPU limit: jobs start while busy + promised + need stay under this share of all cores",
@@ -192,6 +203,21 @@ pub const SETTINGS: [Setting; 9] = [
         key: "pressure_max",
         what: "Linux: no new job while memory pressure (PSI) is above this",
         kind: SettingKind::Number(5.0, 5.0, 90.0, "%"),
+    },
+    Setting {
+        key: "auto_pause",
+        what: "pause the newest running job when memory reaches pause_at; resume it under resume_at",
+        kind: SettingKind::Bool,
+    },
+    Setting {
+        key: "pause_at",
+        what: "auto_pause: pause a running job at this share of RAM in use",
+        kind: SettingKind::Number(1.0, 50.0, 99.0, "%"),
+    },
+    Setting {
+        key: "resume_at",
+        what: "auto_pause: resume a paused job under this share of RAM in use",
+        kind: SettingKind::Number(1.0, 30.0, 98.0, "%"),
     },
     Setting { key: "hints", what: "agent hints on the status lines of jobs", kind: SettingKind::Bool },
     Setting {
@@ -225,6 +251,9 @@ impl Config {
             "mem_max" => format!("{:.0}%", self.mem_max),
             "pressure_max" => format!("{:.0}%", self.pressure_max),
             "hints" => (if self.hints { "on" } else { "off" }).into(),
+            "auto_pause" => (if self.auto_pause { "on" } else { "off" }).into(),
+            "pause_at" => format!("{:.0}%", self.pause_at),
+            "resume_at" => format!("{:.0}%", self.resume_at),
             "max_bypass" => format!("{}s", self.max_bypass),
             "learn_stagger" => format!("{:.0}s", self.learn_stagger),
             "cpu_min_duration" => format!("{:.0}s", self.cpu_min_duration),
@@ -234,11 +263,26 @@ impl Config {
         }
     }
 
+    fn setting_bool(&self, key: &str) -> bool {
+        match key {
+            "hints" => self.hints,
+            "auto_pause" => self.auto_pause,
+            _ => false,
+        }
+    }
+
+    /// The pause rules, with resume_at kept under pause_at.
+    pub fn pause_rules(&self) -> crate::queue::PauseRules {
+        crate::queue::PauseRules { on: self.auto_pause, pause_at: self.pause_at, resume_at: self.resume_at.min(self.pause_at - 2.0) }
+    }
+
     fn setting_number(&self, key: &str) -> f64 {
         match key {
             "cpu_max" => self.cpu_max,
             "mem_max" => self.mem_max,
             "pressure_max" => self.pressure_max,
+            "pause_at" => self.pause_at,
+            "resume_at" => self.resume_at,
             "max_bypass" => self.max_bypass as f64,
             "learn_stagger" => self.learn_stagger,
             "cpu_min_duration" => self.cpu_min_duration,
@@ -255,7 +299,7 @@ pub fn step_user_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> 
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("reading {}", path.display()))?;
     let value: toml_edit::Item = match set.kind {
-        SettingKind::Bool => toml_edit::value(!cfg.hints),
+        SettingKind::Bool => toml_edit::value(!cfg.setting_bool(set.key)),
         SettingKind::Number(step, lo, hi, _) => {
             let cur = cfg.setting_number(set.key);
             let next = ((cur / step).round() * step + if up { step } else { -step }).clamp(lo, hi);
@@ -285,9 +329,8 @@ pub fn step_user_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> 
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, doc.to_string())?;
     std::fs::rename(&tmp, path)?;
-    let new = Config { hints: !cfg.hints, ..Default::default() };
     let shown = match set.kind {
-        SettingKind::Bool => new.setting_text("hints"),
+        SettingKind::Bool => (if cfg.setting_bool(set.key) { "off" } else { "on" }).to_string(),
         _ => match doc.get(set.key).and_then(|v| v.as_value()) {
             Some(toml_edit::Value::Integer(i)) => i.value().to_string(),
             Some(toml_edit::Value::Float(f)) => f.value().to_string(),
@@ -380,6 +423,9 @@ impl Config {
         set!(cpu_min_duration);
         set!(pressure_max);
         set!(priority);
+        set!(auto_pause);
+        set!(pause_at);
+        set!(resume_at);
         if let Some(v) = &l.new_job_mem
             && let Ok(kb) = parse_size_kb(v)
         {
@@ -655,10 +701,13 @@ mod tests {
         assert!(text.contains("cpu_max = 75") && text.contains("mem_max = 70"), "{text}");
         let hints = SETTINGS.iter().find(|s| s.key == "hints").unwrap();
         assert_eq!(step_user_setting(&path, &cfg, hints, true).unwrap(), "hints = off");
+        let pause = SETTINGS.iter().find(|s| s.key == "auto_pause").unwrap();
+        assert_eq!(step_user_setting(&path, &cfg, pause, true).unwrap(), "auto_pause = on");
         let size = SETTINGS.iter().find(|s| s.key == "new_job_mem").unwrap();
         assert_eq!(step_user_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
         let c = read_layer(&path).unwrap().unwrap();
         assert_eq!((c.cpu_max, c.hints, c.new_job_mem.as_deref()), (Some(75.0), Some(false), Some("1792M")));
+        assert_eq!(c.auto_pause, Some(true));
     }
 
     #[test]
