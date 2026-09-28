@@ -323,6 +323,7 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard --wait [--id NAME]` | Wait until no job of the pool runs or waits |
 | `taskguard top` | The dashboard |
 | `taskguard status [--json]` | What runs, what waits, and why |
+| `taskguard pause JOB`, `taskguard resume JOB` | Pause or resume a running job by hand. JOB is a pid, a key, or a unique part of a key |
 | `taskguard history` | Learned needs per command |
 | `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
 | `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
@@ -375,6 +376,12 @@ The built-in defaults cover the DALP monorepo out of the box:
   running jobs when memory reaches `pause_at`, and resumes them (SIGCONT) under
   `resume_at`. A paused job keeps its memory: the pause stops it from growing
   and lets the system compress it or move it to swap. It does not free it.
+- A job can also be paused by hand: `taskguard pause JOB`, or `p` in the
+  dashboard's Queue view. It stays paused until `taskguard resume JOB` or `p`
+  again; auto_pause leaves it alone. New jobs may start while it is paused, and
+  they may use its CPU. Its memory stays reserved. taskguard also sees a job
+  that someone stopped with `kill -STOP` and treats it as paused by hand. It
+  cannot see a Ctrl-Z in the terminal: that stops taskguard itself too.
 - A job with no history reserves an estimate. A first run far bigger than
   similar jobs can still take more than its estimate before it is learned.
 

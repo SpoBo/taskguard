@@ -85,6 +85,16 @@ pub struct Entry {
     /// How often, and how long in total, this run was paused so far.
     pub pauses: u32,
     pub paused_s: f64,
+    /// Paused by hand (taskguard pause, or p in the dashboard). Only a resume
+    /// by hand ends it; auto_pause leaves it alone.
+    pub paused_by_hand: bool,
+}
+
+impl Entry {
+    /// Paused by auto_pause, not by hand: it resumes before anything new starts.
+    pub fn auto_paused(&self) -> bool {
+        self.paused_since.is_some() && !self.paused_by_hand
+    }
 }
 
 impl Entry {
@@ -126,6 +136,8 @@ impl Entry {
 #[serde(default)]
 pub struct Nudge {
     pub start: bool,
+    /// Pause (true) or resume (false) a running job by hand.
+    pub pause: Option<bool>,
     pub need_cpu: Option<f64>,
     pub need_mem_kb: Option<u64>,
 }
@@ -417,8 +429,14 @@ pub enum Decision {
 /// history says it peaks at 20 GB still has 18 GB to take, and that has to be
 /// reserved now. Without this, a second job is admitted into space the first
 /// one is about to eat. The same holds for CPU.
+/// A job paused by hand reserves no CPU: it uses none until someone resumes
+/// it, and the room it leaves is what the pause was for. Its memory stays
+/// reserved, since it keeps what it holds and grows again when it resumes.
 pub fn reserve(running: &[Entry]) -> (f64, u64) {
-    running.iter().fold((0.0, 0), |(c, m), e| ((c + (e.need_cpu - e.live_cpu).max(0.0)), m + e.need_mem_kb.saturating_sub(e.live_mem_kb)))
+    running.iter().fold((0.0, 0), |(c, m), e| {
+        let cpu = if e.paused_by_hand { 0.0 } else { (e.need_cpu - e.live_cpu).max(0.0) };
+        (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb))
+    })
 }
 
 /// How far running jobs are above their needs right now: the part of the
@@ -454,7 +472,7 @@ pub fn decide(
     }
 
     // A job paused for memory gets its room back before anything new starts.
-    if let Some(p) = running.iter().find(|e| e.paused_since.is_some()) {
+    if let Some(p) = running.iter().find(|e| e.auto_paused()) {
         return Decision::Wait { blockers: vec![Blocker::Paused { key: p.key.clone() }] };
     }
 
@@ -587,14 +605,17 @@ pub const PAUSE_MAX: f64 = 300.0;
 ///   highest priority, paused first, resumes after its minimum pause.
 /// - A paused job always resumes when no other job runs, and when auto_pause
 ///   is off: nothing is left paused for good.
+/// - A job paused by hand is left alone: only a resume by hand ends it, and it
+///   does not count as running.
 pub fn pause_step(m: &MachineSample, r: &PauseRules, running: &[Entry], now: f64, last: f64, me: i32) -> Option<bool> {
-    let mine = running.iter().find(|e| e.pid == me)?;
+    let mine = running.iter().find(|e| e.pid == me).filter(|e| !e.paused_by_hand)?;
     let active: Vec<&Entry> = running.iter().filter(|e| e.paused_since.is_none()).collect();
     let pressure = m.mem_pressure.unwrap_or(0.0);
     if let Some(since) = mine.paused_since {
         // The paused job that resumes first: the highest priority, then the one paused first.
         let first = running
             .iter()
+            .filter(|e| !e.paused_by_hand)
             .filter_map(|e| e.paused_since.map(|s| (e, s)))
             .min_by(|(a, sa), (b, sb)| b.priority.cmp(&a.priority).then(sa.total_cmp(sb)))
             .map(|(e, _)| e.pid);
@@ -842,6 +863,26 @@ mod tests {
         // While a job is paused, nothing new starts.
         let me = job(9, "new", 0.1, 0);
         assert_eq!(blockers(decide(&machine(1.0, 1), &LIM, &jobs, std::slice::from_ref(&me), &me, 1001.0, &[])), vec!["paused"]);
+    }
+
+    #[test]
+    fn a_job_paused_by_hand_is_left_alone_and_gives_up_its_cpu() {
+        let rules = PauseRules { on: true, pause_at: 90.0, resume_at: 80.0 };
+        let mut held = running(2, 200.0, 0);
+        held.paused_since = Some(1000.0);
+        held.paused_by_hand = true;
+        held.need_cpu = 4.0;
+        let other = running(1, 100.0, 0);
+        let jobs = [other.clone(), held.clone()];
+        // Memory is free and auto_pause may resume: it still stays paused.
+        assert_eq!(pause_step(&machine(1.0, 5), &rules, &jobs, 2000.0, 0.0, 2), None);
+        assert_eq!(pause_step(&machine(1.0, 5), &PauseRules { on: false, ..rules }, &jobs, 2000.0, 0.0, 2), None);
+        // It does not count as running: the last running job is not paused.
+        assert_eq!(pause_step(&machine(1.0, 31), &rules, &jobs, 2000.0, 0.0, 1), None);
+        // New jobs may start, and use its CPU.
+        assert_eq!(reserve(std::slice::from_ref(&held)).0, 0.0);
+        let me = job(9, "new", 1.0, 1);
+        assert!(blockers(decide(&machine(1.0, 5), &LIM, &jobs, std::slice::from_ref(&me), &me, 2000.0, &[])).is_empty());
     }
 
     #[test]

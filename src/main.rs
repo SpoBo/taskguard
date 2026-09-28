@@ -32,6 +32,7 @@ usage:
   taskguard --wait [--id NAME]                 wait until no job of the pool runs or waits
   taskguard top                                the dashboard
   taskguard status [--json]                    what runs, what waits, and why
+  taskguard pause JOB | resume JOB             pause or resume a running job (a pid, or its key or part of it)
   taskguard history                            learned needs per command
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
@@ -58,7 +59,7 @@ settings: ~/.config/taskguard/config.toml, [dir.\"<path>\"] sections in it, and 
 repo .taskguard.toml. See taskguard.example.toml.
 ";
 
-const SUBCOMMANDS: &[&str] = &["top", "status", "history", "doctor", "import-history", "version", "help", "__recorder"];
+const SUBCOMMANDS: &[&str] = &["top", "status", "pause", "resume", "history", "doctor", "import-history", "version", "help", "__recorder"];
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     let a = &args[*i];
@@ -152,6 +153,8 @@ fn dispatch(args: &[String]) -> Result<i32> {
                 Ok(0)
             }
             "status" => commands::status(rest.iter().any(|a| a == "--json")),
+            "pause" => commands::pause(rest, true),
+            "resume" => commands::pause(rest, false),
             "history" => commands::history(),
             "doctor" => commands::doctor(rest),
             "import-history" => commands::import_history(),

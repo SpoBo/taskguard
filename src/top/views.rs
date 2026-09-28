@@ -136,6 +136,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Enter".into(), "details", Some(KeyCode::Enter)),
             ("g".into(), "start now", Some(KeyCode::Char('g'))),
             ("e".into(), "edit needs", Some(KeyCode::Char('e'))),
+            ("p".into(), "pause/resume", Some(KeyCode::Char('p'))),
             ("k".into(), "stop", Some(KeyCode::Char('k'))),
         ],
         View::Runs => vec![
@@ -690,7 +691,12 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         if e.now {
             lines.push(Line::raw("it skipped the queue (--now); it is measured like any other job"));
         }
-        if let Some(since) = e.paused_since {
+        if let Some(since) = e.paused_since.filter(|_| e.paused_by_hand) {
+            lines.push(Line::styled(
+                format!("paused by hand {} ago; it stays paused until p here, or taskguard resume {}", dur(s.now - since), e.pid),
+                Style::default().fg(Color::LightMagenta),
+            ));
+        } else if let Some(since) = e.paused_since {
             lines.push(Line::styled(
                 format!(
                     "paused for memory {} ago (auto_pause); it resumes when memory is under resume_at ({:.0}%), or when nothing else runs",
@@ -1167,7 +1173,9 @@ KEYS
   Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
             Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
-         PAUSE: a job paused for memory (auto_pause, in Config); nothing new starts before it resumes
+         p pause or resume a running job by hand (or: taskguard pause JOB / taskguard resume JOB)
+         PAUSE: a paused job. Paused for memory (auto_pause, in Config): nothing new starts before it
+         resumes. Paused by hand, or with kill -STOP: it stays paused until resumed by hand
   mouse: click a tab, a key in the bottom line, or a row; the wheel scrolls lists and zooms the Overview
 
 CHART LAYERS (Overview)
@@ -1438,6 +1446,26 @@ mod tests {
         assert_eq!(app.view, View::Job, "j opens the last job again");
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.view, View::Queue);
+    }
+
+    #[test]
+    fn p_pauses_the_selected_running_job() {
+        let (_t, mut app) = fixture();
+        with_queue(&mut app, false);
+        app.view = View::Queue;
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.message.as_deref().unwrap_or("").contains("older taskguard"), "{:?}", app.message);
+        let q = crate::queue::Queue::open(&app.dir).unwrap();
+        let mut e = app.queue_row(0).unwrap().0.clone();
+        e.pausable = true;
+        q.write(&q.run_path(e.pid), &e).unwrap();
+        app.load().unwrap();
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.message.as_deref().unwrap_or("").contains("pauses within 2 s"), "{:?}", app.message);
+        assert_eq!(q.take_nudge(e.pid).and_then(|n| n.pause), Some(true));
+        app.sel = 1;
+        press(&mut app, KeyCode::Char('p'));
+        assert!(app.message.as_deref().unwrap_or("").contains("only a running job"), "{:?}", app.message);
     }
 
     #[test]

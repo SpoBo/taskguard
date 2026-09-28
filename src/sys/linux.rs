@@ -53,6 +53,15 @@ fn stat_fields(pid: i32) -> Option<Vec<String>> {
     Some(rest.split_whitespace().map(str::to_string).collect())
 }
 
+/// Some(true) when the process is stopped (SIGSTOP, SIGTSTP), Some(false)
+/// when it runs or sleeps, None when it is gone or a zombie.
+pub fn proc_stopped(pid: i32) -> Option<bool> {
+    match stat_fields(pid)?.first()?.as_str() {
+        "Z" | "X" => None,
+        s => Some(s == "T"),
+    }
+}
+
 pub fn list_procs() -> Vec<ProcInfo> {
     let Ok(dir) = fs::read_dir("/proc") else {
         return Vec::new();

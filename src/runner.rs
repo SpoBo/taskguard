@@ -529,6 +529,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         if me.paused_since.is_some() && sig.any().is_some() {
             queue::signal_tree(child_pid, libc::SIGCONT);
             me.paused_since = None;
+            me.paused_by_hand = false;
         }
         // TERM and HUP are passed on at once. INT usually reaches the child from
         // the terminal already, since both share the foreground process group;
@@ -552,8 +553,40 @@ pub fn run(mut o: Opts) -> Result<i32> {
         if now - last_sample >= cfg.sample_every {
             let span = now - last_sample;
             last_sample = now;
+            // Checked before this round pauses or resumes anything itself: a
+            // signal just sent may not have arrived yet.
+            // Paused or resumed from outside (kill -STOP, kill -CONT): count it
+            // as done by hand, so new jobs may use its room and nothing resumes
+            // it behind the back of whoever paused it.
+            match (outside_stopped(child_pid), me.paused_since.is_some()) {
+                (Some(true), false) => {
+                    pause_cmd(&q, &mut me, now, true);
+                    say(&format!("paused {} - stopped from outside taskguard; treated as paused by hand", me.key));
+                }
+                (Some(false), true) => {
+                    let p = resume_cmd(&q, &mut me, now, database.as_ref(), "resumed from outside taskguard");
+                    say(&format!("resumed {} - from outside taskguard, after {}", me.key, report::dur(p)));
+                }
+                _ => {}
+            }
             if let Some(n) = q.take_nudge(me_pid) {
                 apply_nudge(&mut me, &n, database.as_ref());
+                match (n.pause, me.paused_since.is_some()) {
+                    (Some(true), false) => pause_cmd(&q, &mut me, now, true),
+                    // An auto pause becomes a pause by hand: it stays until a resume by hand.
+                    (Some(true), true) => {
+                        me.paused_by_hand = true;
+                        let _ = q.write(&q.run_path(me_pid), &me);
+                    }
+                    (Some(false), true) => {
+                        let p = resume_cmd(&q, &mut me, now, database.as_ref(), "resumed by hand");
+                        say(&format!("resumed {} - by hand, after {}", me.key, report::dur(p)));
+                    }
+                    _ => {}
+                }
+                if n.pause == Some(true) {
+                    say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
+                }
             }
             if let Some(r) = tracker.sample(child_pid, now) {
                 me.live_cpu = r.used;
@@ -696,11 +729,8 @@ fn auto_pause(q: &Queue, dir: &Path, me: &mut Entry, rules: &queue::PauseRules, 
     let m = machine::current(dir, max_age, running.iter().map(|e| e.live_mem_kb).sum());
     match queue::pause_step(&m, rules, &running, now, q.last_pause(), me.pid) {
         Some(true) => {
-            queue::signal_tree(me.child_pid, libc::SIGSTOP);
-            me.paused_since = Some(now);
-            me.pauses += 1;
+            pause_cmd(q, me, now, false);
             q.set_last_pause(now);
-            let _ = q.write(&q.run_path(me.pid), me);
             say(&format!(
                 "paused {} - memory at {:.0}% (pause_at {:.0}%); it resumes under {:.0}%, and nothing new starts before it",
                 me.key,
@@ -710,19 +740,43 @@ fn auto_pause(q: &Queue, dir: &Path, me: &mut Entry, rules: &queue::PauseRules, 
             ));
         }
         Some(false) => {
-            queue::signal_tree(me.child_pid, libc::SIGCONT);
-            let since = me.paused_since.take().unwrap_or(now);
-            me.paused_s += now - since;
-            q.set_last_pause(now);
-            let _ = q.write(&q.run_path(me.pid), me);
             let why = if rules.on { format!("memory at {:.0}%", m.mem_pct()) } else { "auto_pause is off".into() };
-            if let Some(d) = database {
-                let _ = d.wait_span(me.run_id, since, now, "paused", &format!("paused for memory; resumed at {why}"));
-            }
-            say(&format!("resumed {} - paused {}; {why}", me.key, report::dur(now - since)));
+            let p = resume_cmd(q, me, now, database, &format!("paused for memory; resumed at {why}"));
+            q.set_last_pause(now);
+            say(&format!("resumed {} - paused {}; {why}", me.key, report::dur(p)));
         }
         None => {}
     }
+}
+
+/// Whether the command's processes are stopped: Some(true) when every live one
+/// is, Some(false) when any runs, None when none can be read.
+fn outside_stopped(child_pid: i32) -> Option<bool> {
+    let procs = sys::list_procs();
+    let states: Vec<bool> = sys::descendants(child_pid, &sys::children_map(&procs)).into_iter().filter_map(sys::proc_stopped).collect();
+    (!states.is_empty()).then(|| states.iter().all(|s| *s))
+}
+
+/// Stop the command and every process below it, and say so in the entry.
+fn pause_cmd(q: &Queue, me: &mut Entry, now: f64, by_hand: bool) {
+    queue::signal_tree(me.child_pid, libc::SIGSTOP);
+    me.paused_since = Some(now);
+    me.paused_by_hand = by_hand;
+    me.pauses += 1;
+    let _ = q.write(&q.run_path(me.pid), me);
+}
+
+/// Let the command go on, record the pause, and return how long it lasted.
+fn resume_cmd(q: &Queue, me: &mut Entry, now: f64, database: Option<&Db>, detail: &str) -> f64 {
+    queue::signal_tree(me.child_pid, libc::SIGCONT);
+    let since = me.paused_since.take().unwrap_or(now);
+    me.paused_by_hand = false;
+    me.paused_s += now - since;
+    let _ = q.write(&q.run_path(me.pid), me);
+    if let Some(d) = database {
+        let _ = d.wait_span(me.run_id, since, now, "paused", detail);
+    }
+    now - since
 }
 
 #[allow(clippy::too_many_arguments)]

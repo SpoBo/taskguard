@@ -1,4 +1,4 @@
-//! The one-shot subcommands: status, history, doctor, import-history.
+//! The one-shot subcommands: status, history, doctor, import-history, pause, resume.
 
 use crate::config::{self, Config};
 use crate::dash;
@@ -47,6 +47,71 @@ pub fn snapshot(dir: &Path, cfg: &Config, db: Option<&Db>) -> Result<Snapshot> {
         s.top_other = d.latest_top_procs().unwrap_or_default();
     }
     Ok(s)
+}
+
+/// `taskguard pause|resume JOB`: JOB is a pid, a key, or a unique part of a key.
+/// The job's own process does the work; this waits until it has.
+pub fn pause(args: &[String], pause: bool) -> Result<i32> {
+    let verb = if pause { "pause" } else { "resume" };
+    let Some(target) = args.first() else { anyhow::bail!("usage: taskguard {verb} JOB (a pid, a key, or part of a key)") };
+    let q = Queue::open(&config::state_dir())?;
+    let running = {
+        let _g = q.lock()?;
+        q.reap();
+        q.running()
+    };
+    let exact: Vec<&crate::queue::Entry> =
+        running.iter().filter(|e| target.parse::<i32>().is_ok_and(|p| p == e.pid || p == e.child_pid) || &e.key == target).collect();
+    let found = if exact.is_empty() { running.iter().filter(|e| e.key.contains(target.as_str())).collect() } else { exact };
+    let e = match found.as_slice() {
+        [e] => *e,
+        [] => {
+            let keys: Vec<String> = running.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect();
+            anyhow::bail!("no running job matches {target:?}; running: {}", if keys.is_empty() { "none".into() } else { keys.join(", ") })
+        }
+        many => anyhow::bail!(
+            "{target:?} matches {} jobs: {}; give the pid",
+            many.len(),
+            many.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if !e.pausable {
+        anyhow::bail!("{} runs an older taskguard (before 0.2.0); it cannot be paused from here", e.key);
+    }
+    match (pause, e.paused_since.is_some(), e.paused_by_hand) {
+        (true, true, true) => {
+            println!("{} is already paused", e.key);
+            return Ok(0);
+        }
+        (false, false, _) => {
+            println!("{} is not paused", e.key);
+            return Ok(0);
+        }
+        _ => {}
+    }
+    q.nudge(e.pid, |n| n.pause = Some(pause))?;
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let now = q.running().into_iter().find(|r| r.pid == e.pid);
+        match now {
+            None => {
+                println!("{} ended", e.key);
+                return Ok(0);
+            }
+            Some(r) if pause && r.paused_by_hand => {
+                println!("paused {} (pid {}); it stays paused until: taskguard resume {}", r.key, r.pid, r.pid);
+                return Ok(0);
+            }
+            Some(r) if !pause && r.paused_since.is_none() => {
+                println!("resumed {} (pid {})", r.key, r.pid);
+                return Ok(0);
+            }
+            _ => {}
+        }
+    }
+    eprintln!("taskguard: {} did not {verb} within 10 s; is its process stuck?", e.key);
+    Ok(1)
 }
 
 pub fn status(json: bool) -> Result<i32> {

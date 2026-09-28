@@ -127,4 +127,21 @@ mod tests {
         assert!(t.total >= t.busy);
         assert!(list_procs().iter().any(|p| p.pid == std::process::id() as i32));
     }
+
+    #[test]
+    fn a_stopped_process_is_seen_as_stopped() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert_eq!(proc_stopped(pid), Some(false));
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let t = std::time::Instant::now();
+        while proc_stopped(pid) != Some(true) && t.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(proc_stopped(pid), Some(true));
+        unsafe { libc::kill(pid, libc::SIGCONT) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(proc_stopped(pid), None, "gone");
+    }
 }

@@ -129,6 +129,19 @@ pub fn list_procs() -> Vec<ProcInfo> {
         .collect()
 }
 
+/// Some(true) when the process is stopped (SIGSTOP, SIGTSTP), Some(false)
+/// when it runs or sleeps, None when it is gone or a zombie.
+pub fn proc_stopped(pid: i32) -> Option<bool> {
+    let mut info: libc::proc_bsdinfo = unsafe { zeroed() };
+    let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let r = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+    match info.pbi_status {
+        _ if r != size => None,
+        libc::SZOMB => None,
+        s => Some(s == libc::SSTOP),
+    }
+}
+
 pub fn proc_sample(pid: i32) -> Option<ProcSample> {
     let mut ri: libc::rusage_info_v4 = unsafe { zeroed() };
     let r = unsafe { libc::proc_pid_rusage(pid, RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t) };

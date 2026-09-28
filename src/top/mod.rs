@@ -639,6 +639,11 @@ impl App {
                     self.open_job(k);
                 }
             }
+            KeyCode::Char('p') => match (self.view, self.queue_row(self.sel).map(|(e, w)| (e.clone(), w))) {
+                (View::Queue, Some((e, false))) => self.toggle_pause(&e),
+                (View::Queue, Some((e, true))) => self.message = Some(format!("{} waits; only a running job can be paused", e.key)),
+                _ => self.message = Some("p works on a running job in the Queue view".into()),
+            },
             KeyCode::Char('k') => {
                 if let (View::Queue, Some((e, _))) = (self.view, self.queue_row(self.sel)) {
                     self.input = Input::ConfirmKill(e.pid, e.key.clone());
@@ -667,6 +672,21 @@ impl App {
             _ => {}
         }
         true
+    }
+
+    /// Pause a running job by hand, or resume a paused one.
+    fn toggle_pause(&mut self, e: &crate::queue::Entry) {
+        if !e.pausable {
+            self.message = Some(format!("{} runs an older taskguard (before 0.2.0); it cannot be paused from here", e.key));
+            return;
+        }
+        let pause = !e.paused_by_hand;
+        let q = Queue { dir: self.dir.clone() };
+        self.message = Some(match q.nudge(e.pid, |n| n.pause = Some(pause)) {
+            Ok(()) if pause => format!("{} pauses within 2 s; p again resumes it", e.key),
+            Ok(()) => format!("{} resumes within 2 s", e.key),
+            Err(err) => format!("could not reach {}: {err}", e.key),
+        });
     }
 
     fn then(&mut self, f: impl FnOnce(&mut App)) -> bool {

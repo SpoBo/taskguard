@@ -457,7 +457,7 @@ pub fn render_status(s: &Snapshot) -> String {
     }
     for e in &s.running {
         let tag = match (e.paused_since, e.now) {
-            (Some(since), _) => format!(" PAUSED {}", dur(s.now - since)),
+            (Some(since), _) => format!(" PAUSED {}{}", dur(s.now - since), if e.paused_by_hand { " by hand" } else { "" }),
             (None, true) => " NOW".into(),
             (None, false) => String::new(),
         };

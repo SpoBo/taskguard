@@ -384,3 +384,54 @@ fn auto_pause_pauses_the_newest_job_and_resumes_it_when_the_rest_is_done() {
     let paused: f64 = e.db().query_row("SELECT paused_s FROM runs WHERE cmd LIKE '%a_started%'", [], |r| r.get(0)).unwrap();
     assert!(paused > 1.0, "the pause is recorded: {paused}");
 }
+
+/// The running job's entry, from `taskguard status --json`.
+fn running_job(e: &Env) -> Option<serde_json::Value> {
+    let out = e.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    v["running"].as_array().and_then(|r| r.first().cloned())
+}
+
+fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
+    let t = Instant::now();
+    while !ok() {
+        assert!(t.elapsed() < Duration::from_secs(10), "{what} never happened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_job_is_paused_and_resumed_by_hand() {
+    let e = Env::new("sample_every = 0.2\n");
+    let job = e.spawn(&["--", "sh", "-c", "touch started; sleep 1; echo done >> log"]);
+    wait_for(&e.file("started"));
+    let out = e.run(&["pause", "sleep_1"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("paused"), "{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+    let status = String::from_utf8_lossy(&e.run(&["status"]).stdout).into_owned();
+    assert!(status.contains("PAUSED") && status.contains("by hand"), "{status}");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!e.file("log").exists(), "a paused job does not go on");
+    let out = e.run(&["resume", "sleep_1"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("resumed"), "{}", stderr(&out));
+    let out = job.wait_with_output().unwrap();
+    assert!(e.file("log").exists());
+    assert!(stderr(&out).contains("paused") && stderr(&out).contains("by hand"), "{}", stderr(&out));
+    assert!(!String::from_utf8_lossy(&e.run(&["pause", "nothing-like-this"]).stderr).is_empty());
+}
+
+#[test]
+fn a_job_stopped_from_outside_counts_as_paused_by_hand() {
+    let e = Env::new("sample_every = 0.2\n");
+    // exec: the command is one process, so one signal stops all of it.
+    let mut job = e.spawn(&["--", "sh", "-c", "touch started; exec sleep 30"]);
+    wait_for(&e.file("started"));
+    wait_until("the command's pid is known", || running_job(&e).is_some_and(|r| r["child_pid"].as_i64().unwrap_or(0) > 0));
+    let child = running_job(&e).unwrap()["child_pid"].as_i64().unwrap() as i32;
+    unsafe { libc::kill(child, libc::SIGSTOP) };
+    wait_until("the pause is seen", || running_job(&e).is_some_and(|r| r["paused_by_hand"] == true));
+    unsafe { libc::kill(child, libc::SIGCONT) };
+    wait_until("the resume is seen", || running_job(&e).is_some_and(|r| r["paused_since"].is_null()));
+    let _ = job.kill();
+    let _ = job.wait();
+    unsafe { libc::kill(child, libc::SIGKILL) };
+}
