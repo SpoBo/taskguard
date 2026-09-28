@@ -813,7 +813,7 @@ fn job(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     let head_h = lines.len() as u16 + 1;
-    let [top, list] = Layout::vertical([Constraint::Length(head_h), Constraint::Min(3)]).areas(area);
+    let [top, list, detail] = Layout::vertical([Constraint::Length(head_h), Constraint::Min(3), Constraint::Length(6)]).areas(area);
     f.render_widget(Paragraph::new(lines), top);
     let rows: Vec<Row> = j
         .runs
@@ -850,6 +850,38 @@ fn job(f: &mut Frame, app: &mut App, area: Rect) {
     .row_highlight_style(Style::default().bg(Color::DarkGray))
     .block(Block::new().borders(Borders::TOP).title(" last runs "));
     render_list(f, app, t, list, 2, n);
+    let lines = match (app.data.job.as_ref(), app.data.job.as_ref().and_then(|j| j.runs.get(app.sel))) {
+        (Some(j), Some(r)) => past_run(r, &j.samples, detail.width.saturating_sub(44) as usize),
+        _ => Vec::new(),
+    };
+    f.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::TOP)), detail);
+}
+
+/// The selected past run: its load over the run, from its samples.
+fn past_run(r: &dash::RunRow, s: &[dash::Sample], w: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::styled(
+        format!("run that ended {}: waited {}, took {} (oldest → end)", datetime(r.ended_at), dur(r.waited_s), dur(r.dur_s)),
+        BOLD,
+    )];
+    if s.is_empty() {
+        lines.push(Line::styled("no samples left for this run: they are kept for retention_raw_hours (48 by default)", DIM));
+        return lines;
+    }
+    let w = w.clamp(10, 80);
+    // Squeeze a long run into the width: each cell is the highest of its samples.
+    let fit = |v: Vec<f64>| -> Vec<f64> {
+        if v.len() <= w {
+            return v;
+        }
+        (0..w).map(|i| v[i * v.len() / w..((i + 1) * v.len() / w).max(i * v.len() / w + 1)].iter().copied().fold(0.0, f64::max)).collect()
+    };
+    let used: Vec<f64> = s.iter().map(|x| x.1).collect();
+    let peak_cpu = used.iter().copied().fold(0.0, f64::max);
+    let peak_mem = s.iter().map(|x| x.3).max().unwrap_or(0);
+    lines.push(Line::raw(format!("cores used    {}  peak {peak_cpu:.1}", spark(&fit(used), w))));
+    lines.push(Line::raw(format!("cores wanted  {}", spark(&fit(s.iter().map(|x| x.2).collect()), w))));
+    lines.push(Line::raw(format!("memory        {}  peak {}", spark(&fit(s.iter().map(|x| x.3 as f64).collect()), w), gb(peak_mem))));
+    lines
 }
 
 /// The run that is going on now: its load over time, next to its needs, and
@@ -1294,6 +1326,10 @@ mod tests {
         let s = screen(&mut app, 150, 40);
         assert!(s.contains("needs CPU:    6.0 cores (learned"), "{s}");
         assert!(s.contains("next run reserves 6.0 cores (was 3.0)"), "{s}");
+        assert!(
+            s.contains("run that ended") && s.contains("peak 4.0 GB") && s.contains("cores wanted  ▄"),
+            "the selected run's load:\n{s}"
+        );
         app.view = View::Warnings;
         let s = screen(&mut app, 150, 40);
         assert!(s.contains("possibly starved (cpu): packages/api:vitest_run"), "{s}");

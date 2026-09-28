@@ -97,13 +97,16 @@ pub struct JobData {
     pub min_mem_kb: Option<u64>,
     /// The run of this job that is going on now, if any.
     pub live: Option<LiveRun>,
+    /// The samples of the selected past run: time, cores used, cores wanted,
+    /// memory, page-ins per second.
+    pub samples: Vec<dash::Sample>,
 }
 
 pub struct LiveRun {
     pub entry: crate::queue::Entry,
     pub waiting: bool,
     /// Samples so far: time, cores used, cores wanted, memory, page-ins per second.
-    pub samples: Vec<(f64, f64, f64, u64, f64)>,
+    pub samples: Vec<dash::Sample>,
 }
 
 pub struct App {
@@ -246,18 +249,18 @@ impl App {
                     running.or_else(|| s.waiting.into_iter().find(|w| &w.entry.key == k).map(|w| (w.entry, true)))
                 });
                 let live = match live {
-                    Some((entry, waiting)) => {
-                        let mut st = db.conn.prepare(
-                            "SELECT ts, cores_used, cores_wanted, mem_kb, pageins_per_s FROM job_samples WHERE run_id = ?1 ORDER BY ts",
-                        )?;
-                        let samples = st
-                            .query_map([entry.run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64, r.get(4)?)))?
-                            .collect::<std::result::Result<_, _>>()?;
-                        Some(LiveRun { entry, waiting, samples })
-                    }
+                    Some((entry, waiting)) => Some(LiveRun { samples: dash::run_samples(&db, entry.run_id)?, entry, waiting }),
                     None => None,
                 };
+                if let Some(id) = self.open_run.take() {
+                    self.sel = runs.iter().position(|r| r.id == id).unwrap_or(0);
+                }
+                let samples = match (self.view, runs.get(self.sel)) {
+                    (View::Job, Some(r)) => dash::run_samples(&db, r.id)?,
+                    _ => Vec::new(),
+                };
                 Some(JobData {
+                    samples,
                     live,
                     key: k.clone(),
                     learned: db.learned(k, self.cfg.hist_keep, self.cfg.boost_runs)?,
@@ -299,9 +302,6 @@ impl App {
             run_spans,
         };
         self.pick = self.pick.map(|p| p.min(self.data.cursor_runs.len().saturating_sub(1))).filter(|_| !self.data.cursor_runs.is_empty());
-        if let (Some(id), Some(j)) = (self.open_run.take(), &self.data.job) {
-            self.sel = j.runs.iter().position(|r| r.id == id).unwrap_or(0);
-        }
         Ok(())
     }
 

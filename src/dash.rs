@@ -262,6 +262,20 @@ pub fn key_runs(db: &Db, key: &str, limit: usize) -> Result<Vec<RunRow>> {
     Ok(v)
 }
 
+/// One sample of a run: time, cores used, cores wanted, memory, page-ins per second.
+pub type Sample = (f64, f64, f64, u64, f64);
+
+/// The samples of one run, oldest first.
+pub fn run_samples(db: &Db, run_id: i64) -> Result<Vec<Sample>> {
+    let mut s = db
+        .conn
+        .prepare_cached("SELECT ts, cores_used, cores_wanted, mem_kb, pageins_per_s FROM job_samples WHERE run_id = ?1 ORDER BY ts")?;
+    let v = s
+        .query_map([run_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as u64, r.get(4)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
 pub fn wait_spans(db: &Db, run_id: i64) -> Result<Vec<(f64, String, String)>> {
     let mut s = db
         .conn
