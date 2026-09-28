@@ -175,6 +175,7 @@ taskguard --wait [--id NAME]
 | `--key KEY` | History key. The default is the project path plus the command. |
 | `--min-cpu N` | Never start with fewer than N free cores. |
 | `--min-mem SIZE` | Never start with less than SIZE free (`6G`, `512M`). |
+| `--priority N` | Higher starts first. The default is 0, or `priority` from the config. |
 | `--now` | Skip the queue, but still measure and learn. |
 | `--bg` | Wait for room, then return and let the job run on. |
 | `--pipe` | With `--bg`: pass stdin to the command. |
@@ -418,6 +419,10 @@ the others write:
 - A job gets the same history key in every version.
 - `TASKGUARD_HELD` keeps its meaning, so a nested call never takes a second
   slot, whatever version the outer call was.
+
+A version only follows the rules it knows. A version before 0.2.0 does not
+read priorities: its waiting jobs start in ticket order and do not step aside
+for a job with a higher priority.
 
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each

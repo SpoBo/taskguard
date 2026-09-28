@@ -37,6 +37,8 @@ pub struct Opts {
     pub quiet: bool,
     pub hints: Option<bool>,
     pub wait: bool,
+    /// Higher goes first; the default comes from the config, else 0.
+    pub priority: Option<i32>,
     pub cmd: Vec<String>,
 }
 
@@ -290,6 +292,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         raised_by_min: raised,
         now: o.now,
         est_dur_s: learned.dur_s,
+        priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     };
@@ -378,8 +381,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &q.unknown_starts());
                 let forced = started_by_hand || matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
                 if matches!(decision, Decision::Admit { .. }) || forced {
-                    // Every older job that is still waiting has now been passed.
-                    for w in waiting.iter().filter(|w| w.ticket < me.ticket && w.bypassed_since.is_none()) {
+                    // Every older job that is still waiting has now been passed,
+                    // unless it waits because this one has a higher priority.
+                    for w in waiting.iter().filter(|w| w.ticket < me.ticket && w.priority >= me.priority && w.bypassed_since.is_none()) {
                         let mut w = w.clone();
                         w.bypassed_since = Some(now);
                         let _ = q.write(&q.wait_path(&w), &w);
@@ -792,6 +796,9 @@ fn run_bg(o: &Opts) -> Result<i32> {
     }
     if let Some(v) = o.min_mem_kb {
         args.extend(["--min-mem".into(), format!("{v}K")]);
+    }
+    if let Some(v) = o.priority {
+        args.extend(["--priority".into(), v.to_string()]);
     }
     if o.now {
         args.push("--now".into());

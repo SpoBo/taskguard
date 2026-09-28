@@ -27,6 +27,13 @@ cpu_max = 100         # percent of all cores
 mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
 
+# -------------------------------------------------------------- priority ----
+# A waiting job with a higher priority starts before jobs with a lower one:
+# they wait while it waits, unless its own pool is full. Jobs with the same
+# priority keep the order they came in. Set it per directory, per repository,
+# per command ([[job]] below), or for one call with --priority N.
+priority = 0
+
 # ---------------------------------------------------------------- hints ----
 # Extra words for LLM agents on every status line ("this is not a hang",
 # "starts when X finishes"), and advice after a starved run. On by default.
@@ -87,6 +94,7 @@ retention_rollup_days = 90  # keep one-minute averages this long
 # [[job]]
 # key = "packages/api:*"
 # pool = "e2e"
+# priority = 1          # starts before jobs with priority 0
 #
 # [[job]]
 # match = "tsc -p tsconfig.quick.json"

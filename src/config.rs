@@ -30,6 +30,7 @@ pub struct Layer {
     pub learn_stagger: Option<f64>,
     pub cpu_min_duration: Option<f64>,
     pub pressure_max: Option<f64>,
+    pub priority: Option<i32>,
     pub new_job_mem: Option<String>,
     pub max_bypass: Option<u64>,
     pub boost_runs: Option<usize>,
@@ -69,6 +70,7 @@ pub struct JobRule {
     pub min_mem: Option<String>,
     pub now: Option<bool>,
     pub pool: Option<String>,
+    pub priority: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +92,8 @@ pub struct Config {
     pub learn_stagger: f64,
     pub cpu_min_duration: f64,
     pub pressure_max: f64,
+    /// The priority of a job that no rule or flag gives one.
+    pub priority: i32,
     pub new_job_mem_kb: u64,
     pub max_bypass: u64,
     pub boost_runs: usize,
@@ -118,6 +122,7 @@ impl Default for Config {
             learn_stagger: 5.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            priority: 0,
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
             boost_runs: 5,
@@ -374,6 +379,7 @@ impl Config {
         set!(learn_stagger);
         set!(cpu_min_duration);
         set!(pressure_max);
+        set!(priority);
         if let Some(v) = &l.new_job_mem
             && let Ok(kb) = parse_size_kb(v)
         {
@@ -453,6 +459,7 @@ pub struct Classified {
     pub min_cpu: Option<f64>,
     pub min_mem_kb: Option<u64>,
     pub now: bool,
+    pub priority: Option<i32>,
     /// For `doctor --explain`: which rule set what.
     pub why: Vec<String>,
 }
@@ -497,6 +504,10 @@ impl Config {
             if let Some(v) = &rule.min_mem {
                 c.min_mem_kb = Some(parse_size_kb(v)?);
                 c.why.push(format!("min_mem {v} from [[job]] {what:?} in {layer}"));
+            }
+            if let Some(v) = rule.priority {
+                c.priority = Some(v);
+                c.why.push(format!("priority {v} from [[job]] {what:?} in {layer}"));
             }
             if let Some(v) = rule.now {
                 c.now = v;

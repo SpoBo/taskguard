@@ -130,7 +130,7 @@ pub fn blocker_color(name: &str) -> Color {
         "pressure" => Color::LightMagenta,
         "memory" => Color::Magenta,
         "slots" => Color::Yellow,
-        "reserved" => Color::Blue,
+        "reserved" | "priority" => Color::Blue,
         "learning" => Color::Cyan,
         _ => Color::Gray,
     }

@@ -32,6 +32,7 @@ pub fn blocker_text(b: &Blocker) -> String {
         Blocker::Reserved { key, waited_s } => {
             format!("held back so {key}, waiting {}, can start first", dur(*waited_s))
         }
+        Blocker::Priority { key, priority } => format!("{key} has priority {priority} and goes first"),
         Blocker::Slots { pool, busy, max, holders } => {
             format!("pool {pool}: {busy} of {max} busy ({})", holders.join(", "))
         }
@@ -112,7 +113,9 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         None => (format!("starts when {key} finishes"), None),
     };
     match b {
-        Blocker::Older { key } | Blocker::Reserved { key, .. } => (format!("starts after {key} has started"), None),
+        Blocker::Older { key } | Blocker::Reserved { key, .. } | Blocker::Priority { key, .. } => {
+            (format!("starts after {key} has started"), None)
+        }
         Blocker::Slots { holders, .. } => match holders.first() {
             Some(h) => when(h.clone(), running.iter().find(|e| &e.key == h).and_then(remaining)),
             None => ("starts when a slot frees up".into(), None),
@@ -315,7 +318,7 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
     };
     let failed = |name: &str| blockers.iter().find(|b| b.name() == name).copied();
     let mut out = Vec::new();
-    if let Some(b) = failed("order").or(failed("reserved")) {
+    if let Some(b) = failed("order").or(failed("reserved")).or(failed("priority")) {
         out.push((false, format!("order: {}", blocker_text(b))));
     } else {
         out.push((true, "order: no older job is held back for this one".into()));
@@ -398,6 +401,15 @@ pub fn bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: u
         .collect()
 }
 
+/// The job's key cut to `n` characters, with its priority when it has one: "api:tsc p2".
+pub fn job_name(e: &Entry, n: usize) -> String {
+    if e.priority == 0 {
+        return trunc(&e.key, n);
+    }
+    let p = format!(" p{}", e.priority);
+    format!("{}{p}", trunc(&e.key, n.saturating_sub(p.len())))
+}
+
 fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -450,7 +462,7 @@ pub fn render_status(s: &Snapshot) -> String {
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:>4.1} / {:<9}  {:>8} / {}{min}{tag}",
-            trunc(&e.key, 36),
+            job_name(e, 36),
             trunc(e.pool.as_deref().unwrap_or("-"), 12),
             dur(s.now - e.started_at.unwrap_or(s.now)),
             e.live_cpu,
@@ -475,7 +487,7 @@ pub fn render_status(s: &Snapshot) -> String {
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:<21} {}",
-            trunc(&e.key, 36),
+            job_name(e, 36),
             trunc(e.pool.as_deref().unwrap_or("-"), 12),
             dur(s.now - e.queued_at),
             needs,

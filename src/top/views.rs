@@ -557,7 +557,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05 || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
         rows.push(Row::new(vec![
             Cell::from(if e.now { "NOW" } else { "RUN" }).style(Style::default().fg(Color::Green)),
-            Cell::from(trunc(&e.key, 44)),
+            Cell::from(report::job_name(e, 44)),
             Cell::from(e.ns.clone()),
             Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
             Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))).style(if over {
@@ -574,7 +574,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             + &w.eta_s.map(|t| format!("  ~{}", dur(t.max(1.0)))).unwrap_or_default();
         rows.push(Row::new(vec![
             Cell::from("WAIT").style(Style::default().fg(Color::Yellow)),
-            Cell::from(trunc(&e.key, 44)),
+            Cell::from(report::job_name(e, 44)),
             Cell::from(e.ns.clone()),
             Cell::from(dur(s.now - e.queued_at)),
             Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),

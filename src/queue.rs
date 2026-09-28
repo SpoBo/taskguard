@@ -72,6 +72,16 @@ pub struct Entry {
     /// peak; these keep what it was admitted with, to show the overage.
     pub start_need_cpu: Option<f64>,
     pub start_need_mem_kb: Option<u64>,
+    /// Higher goes first. 0 by default; older versions leave it out.
+    pub priority: i32,
+}
+
+impl Entry {
+    /// Is `self` ahead of `other` in line: a higher priority, or the same
+    /// priority and an older ticket.
+    pub fn ahead_of(&self, other: &Entry) -> bool {
+        self.priority > other.priority || (self.priority == other.priority && self.ticket < other.ticket)
+    }
 }
 
 /// A first run has settled when its memory has not grown for this long...
@@ -307,6 +317,11 @@ pub enum Blocker {
         key: String,
         waited_s: f64,
     },
+    /// A waiting job with a higher priority goes first.
+    Priority {
+        key: String,
+        priority: i32,
+    },
     Slots {
         pool: String,
         busy: u32,
@@ -351,6 +366,7 @@ impl Blocker {
         match self {
             Blocker::Older { .. } => "order",
             Blocker::Reserved { .. } => "reserved",
+            Blocker::Priority { .. } => "priority",
             Blocker::Slots { .. } => "slots",
             Blocker::LearnStagger { .. } | Blocker::Settling { .. } => "learning",
             Blocker::Memory { .. } => "memory",
@@ -395,7 +411,9 @@ pub fn decide(
     now: f64,
     unknown_starts: &[f64],
 ) -> Decision {
-    let older: Vec<&Entry> = waiting.iter().filter(|w| w.ticket < me.ticket).collect();
+    // Jobs ahead in line: a higher priority first, then the oldest.
+    let mut older: Vec<&Entry> = waiting.iter().filter(|w| w.ahead_of(me)).collect();
+    older.sort_by_key(|w| (std::cmp::Reverse(w.priority), w.ticket));
 
     // The kernel's own alarm comes first and holds back every job, even when
     // taskguard runs nothing: then the pressure comes from other programs, and
@@ -424,6 +442,15 @@ pub fn decide(
 
     if let Some(r) = older.iter().find(|w| w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass) {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
+    }
+    // A waiting job with a higher priority goes first, unless its own pool is
+    // full: then it cannot start anyway, and holding others back gains nothing.
+    let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
+        (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
+        _ => false,
+    };
+    if let Some(h) = older.iter().find(|w| w.priority > me.priority && !pool_full(w)) {
+        blockers.push(Blocker::Priority { key: h.key.clone(), priority: h.priority });
     }
     if let (Some(pk), Some(max)) = (&me.pool_key, me.pool_slots) {
         let holders: Vec<String> = running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).map(|e| e.key.clone()).collect();
@@ -517,6 +544,7 @@ mod tests {
         // there, with the same JSON type. Fields may only be added.
         let old: serde_json::Map<String, serde_json::Value> = serde_json::from_str(ENTRY_V0_1_2).unwrap();
         let new = serde_json::to_value(Entry { started_at: Some(1.0), ..Default::default() }).unwrap();
+        assert!(new["priority"].is_i64(), "the priority is a whole number");
         let kind = |v: &serde_json::Value| match v {
             serde_json::Value::Number(n) if n.is_f64() => "float",
             serde_json::Value::Number(_) => "integer",
@@ -610,6 +638,29 @@ mod tests {
         let waiting = [big.clone(), small.clone()];
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &big, 1000.0, &[])), vec!["memory"]);
         assert!(blockers(decide(&machine(1.0, 8), &LIM, &[running], &waiting, &small, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_higher_priority_goes_first() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        // The urgent job is newer and waits for memory; the small old one fits.
+        let old = job(2, "old", 1.0, 1);
+        let mut urgent = job(3, "urgent", 1.0, 30);
+        urgent.priority = 1;
+        let waiting = [old.clone(), urgent.clone()];
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &old, 1000.0, &[])), vec!["priority"]);
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &urgent, 1000.0, &[])), vec!["memory"]);
+        // Its pool is full: it cannot start anyway, so it holds nobody back.
+        urgent.pool_key = Some("e2e".into());
+        urgent.pool_slots = Some(1);
+        let mut in_pool = running.clone();
+        in_pool.pool_key = Some("e2e".into());
+        let waiting = [old.clone(), urgent.clone()];
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, &[in_pool], &waiting, &old, 1000.0, &[])).is_empty());
+        // With nothing running, the highest priority starts, not the oldest.
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[], &waiting, &old, 1000.0, &[])), vec!["order"]);
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, &[], &waiting, &urgent, 1000.0, &[])).is_empty());
     }
 
     #[test]

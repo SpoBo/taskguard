@@ -46,6 +46,7 @@ options (sem style; the default is to run in the foreground):
   --key KEY               history key (default: project path + command)
   --min-cpu N             never start with fewer than N free cores
   --min-mem SIZE          never start with less than SIZE free (6G, 512M)
+  --priority N            higher starts first (default 0; negative is allowed)
   --now                   skip the queue, but still measure and learn
   --bg                    wait for room, then return and let the job run on
   --fg                    run in the foreground (the default)
@@ -104,6 +105,10 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
                 o.min_cpu = Some(v.parse().map_err(|_| anyhow::anyhow!("--min-cpu needs a number of cores"))?);
             }
             "--min-mem" => o.min_mem_kb = Some(config::parse_size_kb(&take_value(args, &mut i, name)?)?),
+            "--priority" => {
+                let v = take_value(args, &mut i, name)?;
+                o.priority = Some(v.parse().map_err(|_| anyhow::anyhow!("--priority needs a whole number"))?);
+            }
             "--now" => o.now = true,
             "--bg" => o.bg = true,
             "--fg" => o.bg = false,
@@ -182,7 +187,8 @@ mod tests {
         assert_eq!(o.timeout, Some(-30.0));
         assert_eq!(o.cmd, v("bunx playwright test --workers 2"));
 
-        let o = parse_opts(&v("--min-cpu 4 --min-mem=6G --now -- tsc -p .")).unwrap();
+        let o = parse_opts(&v("--min-cpu 4 --min-mem=6G --priority=-2 --now -- tsc -p .")).unwrap();
+        assert_eq!(o.priority, Some(-2));
         assert_eq!(o.min_cpu, Some(4.0));
         assert_eq!(o.min_mem_kb, Some(6 * 1024 * 1024));
         assert!(o.now);
