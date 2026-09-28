@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Layer {
     pub hints: Option<bool>,
     pub cpu_max: Option<f64>,
@@ -55,7 +54,6 @@ pub struct Layer {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PoolCfg {
     pub max_slots: Option<u32>,
     /// One pool per checkout rather than one for the machine. Default true.
@@ -65,7 +63,6 @@ pub struct PoolCfg {
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct JobRule {
     #[serde(rename = "match")]
     pub pattern: Option<String>,
@@ -118,6 +115,10 @@ pub struct Config {
     pub origin: BTreeMap<String, String>,
     /// Every layer that was read, in order.
     pub layers: Vec<String>,
+    /// Settings a file names that this version does not know. They are
+    /// ignored, not fatal: a repo may pin a newer taskguard that knows them,
+    /// and every version on the machine reads the same files.
+    pub unknown: Vec<String>,
 }
 
 impl Default for Config {
@@ -157,6 +158,7 @@ impl Default for Config {
             jobs: Vec::new(),
             origin: BTreeMap::new(),
             layers: vec!["built-in".into()],
+            unknown: Vec::new(),
         };
         for k in [
             "hints",
@@ -384,7 +386,7 @@ impl Config {
         let mut c = Config::default();
         let user_path = user_config_path();
         let mut dirs: Vec<(String, Layer)> = Vec::new();
-        if let Some(user) = read_layer(&user_path)? {
+        if let Some(user) = read_layer(&user_path, &mut c.unknown)? {
             dirs = user.dir.clone().into_iter().collect();
             c.apply(&user, &user_path.display().to_string());
         }
@@ -397,7 +399,7 @@ impl Config {
             }
         }
         if let Some(repo_file) = find_repo_file(cwd, checkout)
-            && let Some(layer) = read_layer(&repo_file)?
+            && let Some(layer) = read_layer(&repo_file, &mut c.unknown)?
         {
             if !layer.dir.is_empty() {
                 bail!("{}: [dir] sections are only read from the user config", repo_file.display());
@@ -476,14 +478,25 @@ fn expand_home(p: &str) -> PathBuf {
     }
 }
 
-fn read_layer(path: &Path) -> Result<Option<Layer>> {
+/// Read one settings file. Settings it names that this version does not know
+/// are added to `unknown`, as "file: setting".
+fn read_layer(path: &Path, unknown: &mut Vec<String>) -> Result<Option<Layer>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let layer: Layer = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    let (layer, ignored) = parse_layer(&text).with_context(|| format!("parsing {}", path.display()))?;
+    unknown.extend(ignored.into_iter().map(|k| format!("{}: {k}", path.display())));
     Ok(Some(layer))
+}
+
+/// A settings file, and the settings in it that this version does not know.
+fn parse_layer(text: &str) -> Result<(Layer, Vec<String>)> {
+    let mut ignored = Vec::new();
+    let de = toml::Deserializer::parse(text)?;
+    let layer: Layer = serde_ignored::deserialize(de, |p| ignored.push(p.to_string()))?;
+    Ok((layer, ignored))
 }
 
 fn find_repo_file(cwd: &Path, checkout: &Path) -> Option<PathBuf> {
@@ -587,7 +600,7 @@ mod tests {
     #[test]
     fn the_example_config_is_valid() {
         let text = include_str!("../taskguard.example.toml");
-        toml::from_str::<Layer>(text).expect("as shipped");
+        assert_eq!(parse_layer(text).expect("as shipped").1, Vec::<String>::new(), "every setting in it exists");
         let on: String = text
             .lines()
             .map(|l| match l.strip_prefix("# ") {
@@ -596,10 +609,21 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let layer = toml::from_str::<Layer>(&on).expect("with every setting on");
+        let (layer, unknown) = parse_layer(&on).expect("with every setting on");
+        assert_eq!(unknown, Vec::<String>::new(), "every commented-out setting exists");
         assert!(layer.pool.contains_key("docker"));
         assert_eq!(layer.job.len(), 3);
         assert_eq!(layer.dir.values().next().map(|d| d.job.len()), Some(1));
+    }
+
+    #[test]
+    fn unknown_settings_are_ignored_and_named() {
+        let (layer, unknown) =
+            parse_layer("cpu_max = 90\nnew_thing = 3\n[pool.e2e]\nmax_slots = 1\nshiny = true\n[[job]]\nmatch = \"x\"\nlater = 1\n")
+                .unwrap();
+        assert_eq!(layer.cpu_max, Some(90.0), "the known settings still apply");
+        assert_eq!(unknown, vec!["job.0.later", "new_thing", "pool.e2e.shiny"]);
+        assert!(parse_layer("cpu_max = \"lots\"").is_err(), "a known setting with a wrong value is still an error");
     }
 
     #[test]
@@ -714,7 +738,7 @@ mod tests {
         assert_eq!(step_user_setting(&path, &cfg, pause, true).unwrap(), "auto_pause = on");
         let size = SETTINGS.iter().find(|s| s.key == "new_job_mem").unwrap();
         assert_eq!(step_user_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
-        let c = read_layer(&path).unwrap().unwrap();
+        let c = read_layer(&path, &mut Vec::new()).unwrap().unwrap();
         assert_eq!((c.cpu_max, c.hints, c.new_job_mem.as_deref()), (Some(75.0), Some(false), Some("1792M")));
         assert_eq!(c.auto_pause, Some(true));
     }

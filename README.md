@@ -437,6 +437,11 @@ the others write:
 - `TASKGUARD_HELD` keeps its meaning, so a nested call never takes a second
   slot, whatever version the outer call was.
 
+A setting that a version does not know is ignored with a warning, not an
+error: a repo can pin a newer taskguard that knows it, while an older one runs
+from another worktree. `taskguard doctor` lists them. Versions before 0.2.1
+stop with an error instead.
+
 A version only follows the rules it knows. A version before 0.2.0 does not
 read priorities: its waiting jobs start in ticket order and do not step aside
 for a job with a higher priority. It does not know auto_pause either: its jobs

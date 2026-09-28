@@ -175,6 +175,9 @@ pub fn doctor(args: &[String]) -> Result<i32> {
         if config::user_config_path().exists() { "" } else { " (not present; built-in defaults)" }
     );
     println!("layers here:    {}", cfg.layers.join("  <  "));
+    for u in &cfg.unknown {
+        println!("unknown here:   {u} (ignored: a typo, or a setting of a newer taskguard)");
+    }
     println!("namespace here: {}", key::namespace(&cwd));
     println!();
     println!(

@@ -175,6 +175,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
 
     let hints = o.hints.unwrap_or(cfg.hints);
     let lines = Lines { hints, quiet: o.quiet };
+    if !o.quiet && !cfg.unknown.is_empty() {
+        say(&format!("warning - unknown settings ignored: {} (a typo, or a setting of a newer taskguard)", cfg.unknown.join(", ")));
+    }
     o.now |= cls.now;
     let min_cpu = o.min_cpu.or(cls.min_cpu);
     let min_mem = o.min_mem_kb.or(cls.min_mem_kb);
