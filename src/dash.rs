@@ -179,12 +179,26 @@ pub fn markers(db: &Db, from: f64, to: f64) -> Result<Vec<(f64, Marker)>> {
     Ok(out)
 }
 
+/// One run of a job, as the time cursor lists it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunAt {
+    pub id: i64,
+    pub ns: String,
+    pub key: String,
+    pub started_at: f64,
+    /// None while the run goes on.
+    pub ended_at: Option<f64>,
+}
+
 /// Jobs that ran at a moment, for the time cursor.
-pub fn runs_at(db: &Db, t: f64) -> Result<Vec<(String, String)>> {
+pub fn runs_at(db: &Db, t: f64) -> Result<Vec<RunAt>> {
     let mut s = db.conn.prepare_cached(
-        "SELECT ns, key FROM runs WHERE started_at <= ?1 AND coalesce(ended_at, ?1 + 1) >= ?1 ORDER BY started_at LIMIT 20",
+        "SELECT id, ns, key, started_at, ended_at FROM runs \
+         WHERE started_at <= ?1 AND coalesce(ended_at, ?1 + 1) >= ?1 ORDER BY started_at LIMIT 20",
     )?;
-    let v = s.query_map([t], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+    let v = s
+        .query_map([t], |r| Ok(RunAt { id: r.get(0)?, ns: r.get(1)?, key: r.get(2)?, started_at: r.get(3)?, ended_at: r.get(4)? }))?
+        .collect::<std::result::Result<_, _>>()?;
     Ok(v)
 }
 

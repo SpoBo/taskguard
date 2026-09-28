@@ -22,6 +22,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
     draw_tabs(f, app, tabs);
     app.list_rows = (0, 0, 0);
+    app.page = 0;
     match app.view {
         View::Overview => overview(f, app, main),
         View::Queue => queue(f, app, main),
@@ -59,6 +60,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     if app.paused {
         spans.push(Span::styled("PAUSED  ", Style::default().fg(Color::Yellow)));
+    }
+    if app.window_end.is_some() {
+        spans.push(Span::styled(format!("PAST, to {} (l live)  ", datetime(d.to)), Style::default().fg(Color::Yellow)));
     }
     if !d.warnings.is_empty() {
         spans.push(Span::styled(
@@ -105,13 +109,28 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let mut items: Vec<(String, &str, Option<KeyCode>)> =
         vec![("q".into(), "quit", Some(KeyCode::Char('q'))), ("⇧←/→".into(), "tabs", None)];
     let view_items: Vec<(String, &str, Option<KeyCode>)> = match app.view {
-        View::Overview => vec![
-            ("t".into(), "range", Some(KeyCode::Char('t'))),
-            ("n".into(), "namespace", Some(KeyCode::Char('n'))),
-            ("←/→".into(), "time cursor", None),
-            ("c/m/b".into(), "charts", None),
-            ("o".into(), "other layer", Some(KeyCode::Char('o'))),
+        View::Overview if app.pick.is_some() => vec![
+            ("↑/↓".into(), "select job", None),
+            ("Enter".into(), "open run", Some(KeyCode::Enter)),
+            ("Esc".into(), "back to chart", Some(KeyCode::Esc)),
+            ("PgUp/PgDn".into(), "page time", None),
         ],
+        View::Overview => {
+            let mut v = vec![
+                ("t".into(), "range", Some(KeyCode::Char('t'))),
+                ("n".into(), "namespace", Some(KeyCode::Char('n'))),
+                ("←/→".into(), "time cursor", None),
+                ("PgUp/PgDn".into(), "page time", None),
+            ];
+            if app.window_end.is_some() {
+                v.push(("l".into(), "live", Some(KeyCode::Char('l'))));
+            }
+            if app.cursor.is_some() && !app.data.cursor_runs.is_empty() {
+                v.push(("Enter".into(), "jobs at cursor", Some(KeyCode::Enter)));
+            }
+            v.extend([("c/m/b".into(), "charts", None), ("o".into(), "other layer", Some(KeyCode::Char('o')))]);
+            v
+        }
         View::Queue => vec![
             ("↑/↓".into(), "select", None),
             ("Enter".into(), "details", Some(KeyCode::Enter)),
@@ -247,9 +266,10 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
         let mid = chrono_like((d.from + d.to) / 2.0).to_string();
         let mut line = format!("{:<w2$}", chrono_like(d.from), w2 = w / 2 - mid.len() / 2);
         line.push_str(&mid);
-        let pad = w.saturating_sub(line.chars().count() + 3);
+        let end = if app.window_end.is_some() { chrono_like(d.to) } else { "now".into() };
+        let pad = w.saturating_sub(line.chars().count() + end.len());
         line.push_str(&" ".repeat(pad));
-        line.push_str("now");
+        line.push_str(&end);
         f.render_widget(Paragraph::new(format!("{}{line}", " ".repeat(AXIS_W as usize))).style(DIM), axis);
     }
     legend(f, app, right);
@@ -258,7 +278,8 @@ fn overview(f: &mut Frame, app: &mut App, area: Rect) {
 fn legend(f: &mut Frame, app: &App, area: Rect) {
     let d = &app.data;
     let n = d.machine.len();
-    let at = app.cursor.filter(|c| *c < n);
+    // A window in the past has no "now": without a cursor it shows its last column.
+    let at = app.cursor.or(app.window_end.and(n.checked_sub(1))).filter(|c| *c < n);
     let mut lines: Vec<Line> = Vec::new();
     match at {
         Some(c) => lines.push(Line::styled(format!("at {}", chrono_like(d.from + (c as f64 + 0.5) * (d.to - d.from) / n as f64)), BOLD)),
@@ -359,11 +380,18 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
         Span::styled("» ", Style::default().fg(Color::Red)),
         Span::raw("--now start"),
     ]));
-    if at.is_some() {
+    if app.pick.is_some() {
+        // Picking a job: the list goes first, so every row fits.
+        let head = lines.drain(..2).collect::<Vec<_>>();
+        lines = head.into_iter().chain(picked_runs(app)).collect();
+    } else if at.is_some() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled("jobs running then:", BOLD));
-        for (ns, k) in d.cursor_runs.iter().take(10) {
-            lines.push(Line::from(vec![Span::styled("■ ", Style::default().fg(ns_color(app, ns))), Span::raw(trunc(k, 33))]));
+        lines.push(Line::styled(if d.cursor_runs.is_empty() { "jobs running then:" } else { "jobs running then (Enter picks):" }, BOLD));
+        for r in d.cursor_runs.iter().take(10) {
+            lines.push(Line::from(vec![Span::styled("■ ", Style::default().fg(ns_color(app, &r.ns))), Span::raw(trunc(&r.key, 33))]));
+        }
+        if d.cursor_runs.len() > 10 {
+            lines.push(Line::styled(format!("  and {} more", d.cursor_runs.len() - 10), DIM));
         }
         if d.cursor_runs.is_empty() {
             lines.push(Line::styled("(none)", DIM));
@@ -372,18 +400,41 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::LEFT).border_style(DIM)), area);
 }
 
+/// The runs at the time cursor, with the picked one marked, and when each ran.
+fn picked_runs(app: &App) -> Vec<Line<'static>> {
+    let d = &app.data;
+    let mut lines = vec![Line::styled("pick a run (↑/↓, Enter opens):", BOLD)];
+    for (i, r) in d.cursor_runs.iter().enumerate() {
+        let picked = app.pick == Some(i);
+        let style = if picked { Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else { Style::default() };
+        lines.push(Line::from(vec![
+            Span::styled(if picked { "▶ " } else { "■ " }, Style::default().fg(ns_color(app, &r.ns))),
+            Span::styled(trunc(&r.key, 33), style),
+        ]));
+        let took = match r.ended_at {
+            Some(end) => format!("took {}", dur(end - r.started_at)),
+            None => format!("running for {}", dur(d.now - r.started_at)),
+        };
+        lines.push(Line::styled(format!("  {} {took}", datetime(r.started_at)), DIM));
+    }
+    lines.push(Line::styled("Esc: back to the chart", DIM));
+    lines
+}
+
 fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>()) }
 }
 
 fn table_state(app: &App) -> TableState {
-    TableState::default().with_selected(Some(app.sel))
+    TableState::default().with_offset(app.offset).with_selected(Some(app.sel))
 }
 
 fn remember_rows(app: &mut App, area: Rect, header: u16, state: &TableState, len: usize) {
     let visible = area.height.saturating_sub(header) as usize;
     let first = state.offset();
     app.list_rows = (area.y + header, visible.min(len.saturating_sub(first)), first);
+    app.offset = first;
+    app.page = visible;
 }
 
 /// Draw a table. When it has more rows than fit, the last line says how many
@@ -994,6 +1045,9 @@ fn warnings(f: &mut Frame, app: &mut App, area: Rect) {
     // Keep the selected warning in view.
     let before: usize = d.warnings.iter().take(app.sel).map(|w| 1 + w.lines.len()).sum();
     let scroll = before.saturating_sub(area.height as usize / 3) as u16;
+    // Page Up / Page Down step over about a screen of warnings.
+    let avg = d.warnings.iter().map(|w| 1 + w.lines.len()).sum::<usize>() / d.warnings.len().max(1);
+    app.page = area.height as usize / avg.max(1);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)), area);
 }
 
@@ -1056,7 +1110,9 @@ VIEWS
 KEYS
   q quit   1-8 / Tab / Shift, Option or Cmd + ←/→ views   t / T time range   n next namespace
   / filter jobs   Esc clear or back   ←/→ time cursor (Overview)   c / m / b charts   o the \"other\" layer
-  ↑/↓ select   Enter details   s sort   r reverse   space pause
+  ↑/↓ select   PgUp/PgDn a page   Enter details   s sort   r reverse   space pause
+  Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
+            Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
   mouse: click a tab, a key in the bottom line, or a row; the wheel scrolls lists and zooms the Overview
 
@@ -1374,6 +1430,81 @@ mod tests {
         app.sel = 35;
         let s = screen(&mut app, 150, 30);
         assert!(s.contains("more above"), "{s}");
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.key(crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn page_keys_jump_and_keep_the_row_in_place() {
+        let (_t, mut app) = fixture();
+        let db = crate::db::Db::open_dir(&app.dir).unwrap();
+        for i in 0..80 {
+            let id = db.insert_run(&NewRun { ns: "dalp", key: &format!("k{i}"), ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+            db.finish_run(id, &RunResult { ended_at: now(), measured: true, peak_mem_kb: 1, ..Default::default() }).unwrap();
+        }
+        app.view = View::Runs;
+        app.load().unwrap();
+        let _ = screen(&mut app, 150, 40);
+        app.sel = 9;
+        let _ = screen(&mut app, 150, 40);
+        let (row, page) = (app.sel - app.offset, app.page);
+        press(&mut app, KeyCode::PageDown);
+        let _ = screen(&mut app, 150, 40);
+        assert_eq!(app.sel, 9 + page * 4 / 5, "a page is most of the rows on screen");
+        assert_eq!(app.sel - app.offset, row, "the selected row keeps its place on screen");
+        press(&mut app, KeyCode::PageUp);
+        let _ = screen(&mut app, 150, 40);
+        assert_eq!((app.sel, app.sel - app.offset), (9, row));
+    }
+
+    #[test]
+    fn page_keys_move_the_chart_in_time_and_l_goes_live() {
+        let (_t, mut app) = fixture();
+        let _ = screen(&mut app, 150, 40);
+        let (to, cols) = (app.data.to, app.columns);
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.cursor, Some(cols - 1), "the cursor starts on the live column and keeps it");
+        app.load().unwrap();
+        let w = RANGES[app.range].1 / cols as f64;
+        assert!((to - app.data.to - (cols * 4 / 5) as f64 * w).abs() < w, "back by 80% of the chart");
+        let s = screen(&mut app, 150, 40);
+        assert!(s.contains("PAST, to") && !s.contains(" now"), "{s}");
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.window_end, None, "forward again reaches live");
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::PageDown);
+        press(&mut app, KeyCode::Char('l'));
+        assert_eq!((app.window_end, app.cursor), (None, Some(cols - 1)), "l goes live and keeps the cursor");
+    }
+
+    #[test]
+    fn enter_picks_a_job_at_the_cursor_and_opens_that_run() {
+        let (_t, mut app) = fixture();
+        let _ = screen(&mut app, 150, 40);
+        // The fixture's run went from 5 to about 10 minutes ago.
+        let t = now() - 150.0;
+        app.cursor = Some(((t - app.data.from) / (app.data.to - app.data.from) * app.columns as f64) as usize);
+        app.load().unwrap();
+        assert_eq!(app.data.cursor_runs.len(), 1);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.pick, Some(0));
+        let s = screen(&mut app, 150, 40);
+        assert!(s.contains("▶ packages/api:vitest_run") && s.contains("took 4m50s"), "{s}");
+        let cursor = app.cursor;
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.cursor, cursor, "while picking, the arrows work on the list");
+        press(&mut app, KeyCode::Enter);
+        app.load().unwrap();
+        assert_eq!((app.view, app.job_key.as_deref(), app.sel), (View::Job, Some("packages/api:vitest_run"), 0));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.view, app.pick), (View::Overview, Some(0)), "back in the list of jobs");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.pick, None);
+        press(&mut app, KeyCode::Left);
+        assert_ne!(app.cursor, cursor, "the arrows move the cursor again");
     }
 
     #[test]

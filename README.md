@@ -274,7 +274,15 @@ opens the last job again.
 Keys: `1`-`8`, `Tab`, or Shift, Option or Cmd with `←`/`→` change views. `t`
 time range (5m to 7d), `n` namespace, `/` filter, `←`/`→` time cursor,
 `c`/`m`/`b` charts, `o` hide the load taskguard did not start, `s`/`r` sort,
-`q` quit. Long lists say how many rows are hidden above and below. The mouse
+`q` quit. `PgUp`/`PgDn` jump most of a screen; the selected row keeps its
+place on screen. Long lists say how many rows are hidden above and below.
+
+On the Overview, `PgDn` moves the chart back in time and `PgUp` forward, by
+80% of its width; the time cursor keeps its column. `l` (or `End`) goes back
+to live. `Enter` at the time cursor picks one of the jobs that ran then: `↑`/`↓`
+select a run, `Enter` opens it in the job view, `Esc` goes back to the chart.
+
+The mouse
 works on the tabs, the keys in the bottom line, and the rows; the wheel
 scrolls lists and zooms the Overview.
 

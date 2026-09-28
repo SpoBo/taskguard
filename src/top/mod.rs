@@ -83,7 +83,7 @@ pub struct Data {
     pub namespaces: Vec<NsRow>,
     pub ns_list: Vec<String>,
     pub recorder: bool,
-    pub cursor_runs: Vec<(String, String)>,
+    pub cursor_runs: Vec<dash::RunAt>,
     pub job: Option<JobData>,
     pub run_spans: Vec<(f64, String, String)>,
 }
@@ -111,8 +111,8 @@ pub struct App {
     pub cfg: Config,
     pub view: View,
     pub prev_view: View,
-    /// The view and row to return to when the Job view closes.
-    pub back: (View, usize),
+    /// The view, row and first row on screen to return to when the Job view closes.
+    pub back: (View, usize, usize),
     pub range: usize,
     pub ns_filter: Option<String>,
     pub text_filter: String,
@@ -123,6 +123,18 @@ pub struct App {
     pub sort: usize,
     pub reverse: bool,
     pub sel: usize,
+    /// The first list row on screen. It is kept between frames, so a page
+    /// jump moves the list and the selected row by the same amount.
+    pub offset: usize,
+    /// How many list rows fit on screen.
+    pub page: usize,
+    /// Where the chart ends, when it does not show the live time.
+    pub window_end: Option<f64>,
+    /// The selected job in the list of jobs at the time cursor. While it is
+    /// set, ↑/↓ and Enter work on that list and not on the chart.
+    pub pick: Option<usize>,
+    /// The run to select when the Job view opens.
+    pub open_run: Option<i64>,
     pub job_key: Option<String>,
     pub input: Input,
     pub columns: usize,
@@ -151,7 +163,7 @@ impl App {
             cfg,
             view: View::Overview,
             prev_view: View::Overview,
-            back: (View::Overview, 0),
+            back: (View::Overview, 0, 0),
             range: 2,
             ns_filter: None,
             text_filter: String::new(),
@@ -162,6 +174,11 @@ impl App {
             sort: 0,
             reverse: false,
             sel: 0,
+            offset: 0,
+            page: 0,
+            window_end: None,
+            pick: None,
+            open_run: None,
             job_key: None,
             input: Input::None,
             columns: 100,
@@ -185,7 +202,15 @@ impl App {
         // finished column never changes: only the newest one grows, and the
         // chart moves one column left when a new one starts.
         let w = span / n as f64;
-        let to = (now / w).ceil() * w;
+        let live_to = (now / w).ceil() * w;
+        // A window in the past also ends on a column edge.
+        let to = match self.window_end {
+            Some(end) if (end / w).round() * w < live_to => (end / w).round() * w,
+            _ => {
+                self.window_end = None;
+                live_to
+            }
+        };
         let from = to - span;
         let (machine, ncpu, mem_total) = dash::machine_series(&db, from, to, n)?;
         let mut ns = dash::ns_series(&db, from, to, n, self.cfg.sample_every)?;
@@ -248,7 +273,7 @@ impl App {
             (View::Runs, Some(r)) => dash::wait_spans(&db, r.id)?,
             _ => Vec::new(),
         };
-        let mut namespaces = dash::namespaces(&db, from, self.cfg.sample_every)?;
+        let mut namespaces = dash::namespaces(&db, live_to - span, self.cfg.sample_every)?;
         sort_ns(&mut namespaces, self.sort, self.reverse);
         self.data = Data {
             now,
@@ -273,6 +298,10 @@ impl App {
             job,
             run_spans,
         };
+        self.pick = self.pick.map(|p| p.min(self.data.cursor_runs.len().saturating_sub(1))).filter(|_| !self.data.cursor_runs.is_empty());
+        if let (Some(id), Some(j)) = (self.open_run.take(), &self.data.job) {
+            self.sel = j.runs.iter().position(|r| r.id == id).unwrap_or(0);
+        }
         Ok(())
     }
 
@@ -294,6 +323,8 @@ impl App {
             self.prev_view = self.view;
             self.view = v;
             self.sel = 0;
+            self.offset = 0;
+            self.pick = None;
             self.sort = 0;
             self.reverse = false;
         }
@@ -302,17 +333,90 @@ impl App {
     /// Open the Job view for a key, and remember where to return to.
     fn open_job(&mut self, key: String) {
         if self.view != View::Job {
-            self.back = (self.view, self.sel);
+            self.back = (self.view, self.sel, self.offset);
         }
         self.job_key = Some(key);
         self.view = View::Job;
         self.sel = 0;
+        self.offset = 0;
     }
 
     fn close_job(&mut self) {
-        let (view, sel) = self.back;
+        let (view, sel, offset) = self.back;
         self.view = view;
         self.sel = sel;
+        self.offset = offset;
+    }
+
+    /// Page Up / Page Down in a list: the list and the selected row move by
+    /// most of a screen, so the selected row keeps its place on screen.
+    fn page_list(&mut self, down: bool) {
+        let len = self.list_len();
+        if len == 0 {
+            return;
+        }
+        let step = (self.page * 4 / 5).max(1);
+        if down {
+            self.sel = (self.sel + step).min(len - 1);
+            self.offset = (self.offset + step).min(len.saturating_sub(self.page));
+        } else {
+            self.sel = self.sel.saturating_sub(step);
+            self.offset = self.offset.saturating_sub(step);
+        }
+    }
+
+    /// Move the chart window by whole columns: back in time when negative.
+    /// It cannot move past the live time.
+    fn pan(&mut self, cols: isize) {
+        let w = RANGES[self.range].1 / self.columns.max(10) as f64;
+        let live_to = (db::now() / w).ceil() * w;
+        let end = self.window_end.unwrap_or(live_to) + cols as f64 * w;
+        self.window_end = (end < live_to - w / 2.0).then_some(end);
+    }
+
+    /// Page Down goes back in time, Page Up forward, by most of the chart.
+    /// The time cursor keeps its column, so it points into the new window.
+    fn page_chart(&mut self, back: bool) {
+        let step = (self.columns * 4 / 5).max(1) as isize;
+        if self.cursor.is_none() {
+            self.cursor = Some(self.columns.saturating_sub(1));
+        }
+        self.pan(if back { -step } else { step });
+    }
+
+    /// Keys of the Overview. Returns None when the key is not one of them.
+    fn overview_key(&mut self, code: KeyCode) -> Option<()> {
+        let n = self.data.cursor_runs.len();
+        match (self.pick, code) {
+            (Some(_), KeyCode::Esc) => self.pick = None,
+            (Some(p), KeyCode::Up) => self.pick = Some(p.saturating_sub(1)),
+            (Some(p), KeyCode::Down) => self.pick = Some((p + 1).min(n.saturating_sub(1))),
+            (Some(_), KeyCode::Left | KeyCode::Right) => {}
+            (Some(p), KeyCode::Enter) => {
+                if let Some(r) = self.data.cursor_runs.get(p).cloned() {
+                    self.open_run = Some(r.id);
+                    self.open_job(r.key);
+                }
+            }
+            (None, KeyCode::Enter) => match (self.cursor, n) {
+                (None, _) => self.message = Some("move the time cursor with ←/→ first, then Enter picks a job at that time".into()),
+                (Some(_), 0) => self.message = Some("no jobs ran at the time cursor".into()),
+                _ => self.pick = Some(0),
+            },
+            (_, KeyCode::PageUp | KeyCode::PageDown) => self.page_chart(code == KeyCode::PageDown),
+            (_, KeyCode::Char('l') | KeyCode::End) => self.window_end = None,
+            (None, KeyCode::Left) => match self.cursor {
+                Some(0) => self.pan(-1),
+                c => self.cursor = Some(c.unwrap_or(self.columns).saturating_sub(1)),
+            },
+            (None, KeyCode::Right) => match self.cursor {
+                Some(c) if c + 1 >= self.columns && self.window_end.is_some() => self.pan(1),
+                Some(c) => self.cursor = if c + 1 >= self.columns { None } else { Some(c + 1) },
+                None => {}
+            },
+            _ => return None,
+        }
+        Some(())
     }
 
     fn step_tab(&mut self, forward: bool) {
@@ -471,6 +575,9 @@ impl App {
             self.close_job();
             return true;
         }
+        if self.view == View::Overview && self.overview_key(k.code).is_some() {
+            return true;
+        }
         if self.view == View::Config {
             match k.code {
                 KeyCode::Left | KeyCode::Char('-') => return self.then(|a| a.step_setting(false)),
@@ -501,10 +608,11 @@ impl App {
             }
             KeyCode::Char('/') => self.input = Input::Filter(self.text_filter.clone()),
             KeyCode::Esc => {
-                if self.ns_filter.is_some() || !self.text_filter.is_empty() || self.cursor.is_some() {
+                if self.ns_filter.is_some() || !self.text_filter.is_empty() || self.cursor.is_some() || self.window_end.is_some() {
                     self.ns_filter = None;
                     self.text_filter.clear();
                     self.cursor = None;
+                    self.window_end = None;
                 } else {
                     let back = self.prev_view;
                     self.set_view(back);
@@ -517,15 +625,7 @@ impl App {
             KeyCode::Char('s') => self.sort += 1,
             KeyCode::Char('r') => self.reverse = !self.reverse,
             KeyCode::Char(' ') => self.paused = !self.paused,
-            KeyCode::Left => {
-                let c = self.cursor.unwrap_or(self.columns);
-                self.cursor = Some(c.saturating_sub(1));
-            }
-            KeyCode::Right => {
-                if let Some(c) = self.cursor {
-                    self.cursor = if c + 1 >= self.columns { None } else { Some(c + 1) };
-                }
-            }
+            KeyCode::PageUp | KeyCode::PageDown => self.page_list(k.code == KeyCode::PageDown),
             KeyCode::Up => self.sel = self.sel.saturating_sub(1),
             KeyCode::Down => {
                 if self.sel + 1 < self.list_len() {
