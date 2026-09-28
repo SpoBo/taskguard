@@ -78,6 +78,22 @@ pub fn main_blocker(d: &Decision) -> Option<&Blocker> {
 /// What must happen before a waiting job can start, in one sentence, with an
 /// estimate from the learned durations of the running jobs when there is one.
 pub fn unblock_text(b: &Blocker, running: &[Entry], now: f64) -> String {
+    unblock(b, running, now).0
+}
+
+/// In how many seconds a waiting job may start, when the learned durations
+/// of the running jobs tell. It is the earliest start: other waiting jobs
+/// can take the room first.
+pub fn start_eta(b: &Blocker, running: &[Entry], now: f64) -> Option<f64> {
+    unblock(b, running, now).1
+}
+
+/// "may start in about 2m00s", for a status line.
+pub fn eta_text(eta: f64) -> String {
+    format!("may start in about {}", dur(eta.max(1.0)))
+}
+
+fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
     let remaining = |e: &Entry| e.est_dur_s.map(|d| (d - (now - e.started_at.unwrap_or(now))).max(1.0));
     let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<(String, Option<f64>)> {
         let mut rs: Vec<&Entry> = running.iter().collect();
@@ -92,30 +108,30 @@ pub fn unblock_text(b: &Blocker, running: &[Entry], now: f64) -> String {
         None
     };
     let when = |key: String, rem: Option<f64>| match rem {
-        Some(r) => format!("starts when {key} finishes (about {} left)", dur(r)),
-        None => format!("starts when {key} finishes"),
+        Some(r) => (format!("starts when {key} finishes (about {} left)", dur(r)), Some(r)),
+        None => (format!("starts when {key} finishes"), None),
     };
     match b {
-        Blocker::Older { key } | Blocker::Reserved { key, .. } => format!("starts after {key} has started"),
+        Blocker::Older { key } | Blocker::Reserved { key, .. } => (format!("starts after {key} has started"), None),
         Blocker::Slots { holders, .. } => match holders.first() {
             Some(h) => when(h.clone(), running.iter().find(|e| &e.key == h).and_then(remaining)),
-            None => "starts when a slot frees up".into(),
+            None => ("starts when a slot frees up".into(), None),
         },
-        Blocker::LearnStagger { wait_s } => format!("starts in about {:.0}s", wait_s.ceil()),
-        Blocker::Settling { key, wait_s } => format!("starts when {key} stops growing (at most {:.0}s)", wait_s.ceil()),
-        Blocker::Pressure { .. } => "starts when the memory pressure eases".into(),
+        Blocker::LearnStagger { wait_s } => (format!("starts in about {:.0}s", wait_s.ceil()), Some(*wait_s)),
+        Blocker::Settling { key, wait_s } => (format!("starts when {key} stops growing (at most {:.0}s)", wait_s.ceil()), Some(*wait_s)),
+        Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
                 Some((k, r)) => when(k, r),
-                None => format!("starts when {} of memory frees up", gb(*short_kb)),
+                None => (format!("starts when {} of memory frees up", gb(*short_kb)), None),
             }
         }
         Blocker::Cpu { short, .. } => {
             let need = |e: &Entry| e.need_cpu.max(e.live_cpu);
             match first_to_free(&need, *short) {
                 Some((k, r)) => when(k, r),
-                None => format!("starts when {short:.1} cores free up"),
+                None => (format!("starts when {short:.1} cores free up"), None),
             }
         }
     }
@@ -176,7 +192,8 @@ impl Lines {
             _ => vec![],
         };
         let also = if others.is_empty() { String::new() } else { format!(" (also: {})", others.join(", ")) };
-        let text = format!("waiting {} {} - blocked by {}{also}{}", dur(waited), e.key, blocker_text(b), timeout_text(timeout));
+        let eta = start_eta(b, running, now).map(|t| format!("; {}", eta_text(t))).unwrap_or_default();
+        let text = format!("waiting {} {} - blocked by {}{also}{eta}{}", dur(waited), e.key, blocker_text(b), timeout_text(timeout));
         let hint = format!("It {}; this is not a hang", unblock_text(b, running, now));
         self.out(text, &hint);
     }
@@ -242,6 +259,8 @@ pub struct Waiting {
     pub decision: Decision,
     pub blocked_by: Option<String>,
     pub next: Option<String>,
+    /// In how many seconds it may start, when the running jobs' durations tell.
+    pub eta_s: Option<f64>,
 }
 
 impl Snapshot {
@@ -263,6 +282,7 @@ impl Snapshot {
                     entry: e.clone(),
                     blocked_by: b.as_ref().map(blocker_text),
                     next: b.as_ref().map(|b| unblock_text(b, &running, now)),
+                    eta_s: b.as_ref().and_then(|b| start_eta(b, &running, now)),
                     decision: d,
                 }
             })
@@ -449,7 +469,7 @@ pub fn render_status(s: &Snapshot) -> String {
         let est = if e.known || e.raised_by_min { "" } else { " (est)" };
         let needs = format!("{:.1} cores, {}{est}", e.need_cpu, gb(e.need_mem_kb));
         let blocked = match main_blocker(&w.decision) {
-            Some(b) => blocker_text(b),
+            Some(b) => blocker_text(b) + &w.eta_s.map(|t| format!(" ({})", eta_text(t))).unwrap_or_default(),
             None => "nothing - starting now".into(),
         };
         let _ = writeln!(
@@ -560,6 +580,8 @@ mod tests {
         let text = render_status(&s);
         assert!(text.contains("memory: would reach 91% (limit 85%), 1.8 GB short"), "{text}");
         assert!(text.contains("NEXT  packages/worker:tsc starts when packages/api:tsc finishes (about 43s left)"), "{text}");
+        assert!(text.contains("1.8 GB short (may start in about 43s)"), "the waiting row says when:\n{text}");
+        assert_eq!(s.waiting[0].eta_s.map(|t| t.round()), Some(43.0));
         assert!(text.contains("packages/api:tsc"));
     }
 }

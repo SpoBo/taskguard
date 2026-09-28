@@ -570,7 +570,8 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
     }
     for w in &s.waiting {
         let e = &w.entry;
-        let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into());
+        let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into())
+            + &w.eta_s.map(|t| format!("  ~{}", dur(t.max(1.0)))).unwrap_or_default();
         rows.push(Row::new(vec![
             Cell::from("WAIT").style(Style::default().fg(Color::Yellow)),
             Cell::from(trunc(&e.key, 44)),
@@ -612,6 +613,12 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         if let Some(next) = &w.next {
             lines.push(Line::raw(""));
             lines.push(Line::from(vec![Span::styled("What unblocks it: ", BOLD), Span::raw(next.clone())]));
+        }
+        if let Some(t) = w.eta_s {
+            lines.push(Line::from(vec![
+                Span::styled("When: ", BOLD),
+                Span::raw(format!("{}, at the earliest; other waiting jobs may take the room first", report::eta_text(t))),
+            ]));
         }
         if let Some(b) = report::main_blocker(&w.decision)
             && b.name() == "memory"
