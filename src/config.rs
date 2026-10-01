@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct Layer {
+    pub enabled: Option<bool>,
     pub hints: Option<bool>,
     pub cpu_max: Option<f64>,
     pub mem_max: Option<f64>,
@@ -56,6 +57,11 @@ pub struct Layer {
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct PoolCfg {
     pub max_slots: Option<u32>,
+    /// Take away a slot ceiling that an earlier layer set, such as a built-in
+    /// pool's. Ignored when the same section sets max_slots. A separate key,
+    /// because a version that does not know it ignores it and keeps the old
+    /// ceiling, where `max_slots = 0` would block its jobs for ever.
+    pub unlimited: Option<bool>,
     /// One pool per checkout rather than one for the machine. Default true.
     pub per_checkout: Option<bool>,
     #[serde(default, rename = "match")]
@@ -84,6 +90,8 @@ pub struct Pool {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Off: every command runs straight through, as with TASKGUARD_DISABLE=1.
+    pub enabled: bool,
     pub hints: bool,
     pub cpu_max: f64,
     pub mem_max: f64,
@@ -124,6 +132,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         let mut c = Config {
+            enabled: true,
             hints: true,
             cpu_max: 100.0,
             mem_max: 85.0,
@@ -161,6 +170,7 @@ impl Default for Config {
             unknown: Vec::new(),
         };
         for k in [
+            "enabled",
             "hints",
             "cpu_max",
             "mem_max",
@@ -194,7 +204,12 @@ pub enum SettingKind {
     Size(u64, u64, u64),
 }
 
-pub const SETTINGS: [Setting; 12] = [
+pub const SETTINGS: [Setting; 13] = [
+    Setting {
+        key: "enabled",
+        what: "off: every command runs straight through, unqueued and unmeasured (as TASKGUARD_DISABLE=1)",
+        kind: SettingKind::Bool,
+    },
     Setting {
         key: "cpu_max",
         what: "CPU limit: jobs start while busy + promised + need stay under this share of all cores",
@@ -256,6 +271,7 @@ impl Config {
             "cpu_max" => format!("{:.0}%", self.cpu_max),
             "mem_max" => format!("{:.0}%", self.mem_max),
             "pressure_max" => format!("{:.0}%", self.pressure_max),
+            "enabled" => (if self.enabled { "on" } else { "off" }).into(),
             "hints" => (if self.hints { "on" } else { "off" }).into(),
             "auto_pause" => (if self.auto_pause { "on" } else { "off" }).into(),
             "pause_at" => format!("{:.0}%", self.pause_at),
@@ -271,6 +287,7 @@ impl Config {
 
     fn setting_bool(&self, key: &str) -> bool {
         match key {
+            "enabled" => self.enabled,
             "hints" => self.hints,
             "auto_pause" => self.auto_pause,
             _ => false,
@@ -298,12 +315,109 @@ impl Config {
     }
 }
 
-/// Move a setting one step up or down from its current value, and write it at
-/// the top level of the user config. Comments and other settings stay as they
-/// are. Returns what changed, in words.
-pub fn step_user_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> Result<String> {
+/// The slot ceiling of a pool, as the Config view shows it.
+pub fn slots_text(max: Option<u32>) -> String {
+    match max {
+        None => "no limit".into(),
+        Some(1) => "1 slot".into(),
+        Some(n) => format!("{n} slots"),
+    }
+}
+
+/// The repo file that the Config view writes for this worktree: the one that
+/// applies here, or a new one at the checkout root.
+pub fn repo_file(cwd: &Path, checkout: &Path) -> PathBuf {
+    find_repo_file(cwd, checkout).unwrap_or_else(|| checkout.join(".taskguard.toml"))
+}
+
+fn read_doc(path: &Path) -> Result<toml_edit::DocumentMut> {
     let text = std::fs::read_to_string(path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("reading {}", path.display()))?;
+    text.parse().with_context(|| format!("reading {}", path.display()))
+}
+
+fn write_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Move a pool's slot ceiling one step: no limit, 1, 2, 3 and so on. Write it
+/// in `[pool.NAME]` of the file at `path`. Comments and other settings stay
+/// as they are. Returns what changed, in words.
+pub fn step_pool(path: &Path, cfg: &Config, name: &str, up: bool) -> Result<String> {
+    let cur = cfg.pools.iter().find(|p| p.name == name).and_then(|p| p.max_slots);
+    let next = match (cur, up) {
+        (None, true) => Some(1),
+        (None, false) | (Some(0 | 1), false) => None,
+        (Some(n), true) => Some((n + 1).min(64)),
+        (Some(n), false) => Some(n - 1),
+    };
+    let mut doc = read_doc(path)?;
+    let pool = pool_table(&mut doc, name)?;
+    match next {
+        Some(n) => {
+            pool.remove("unlimited");
+            pool.insert("max_slots", toml_edit::value(n as i64));
+        }
+        None => {
+            pool.remove("max_slots");
+            pool.insert("unlimited", toml_edit::value(true));
+        }
+    }
+    write_doc(path, &doc)?;
+    Ok(format!("pool {name}: {}", slots_text(next)))
+}
+
+/// Add a pool with 1 slot in `[pool.NAME]` of the file at `path`. It matches
+/// nothing until it gets a pattern. Names are letters, digits, `-` and `_`.
+pub fn new_pool(path: &Path, cfg: &Config, name: &str) -> Result<()> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("a pool name is letters, digits, - and _");
+    }
+    if cfg.pools.iter().any(|p| p.name == name) {
+        bail!("pool {name} already exists");
+    }
+    let mut doc = read_doc(path)?;
+    pool_table(&mut doc, name)?.insert("max_slots", toml_edit::value(1));
+    write_doc(path, &doc)
+}
+
+/// Write the full match list of a pool in `[pool.NAME]` of the file at
+/// `path`. A layer's list replaces the lists before it, so it holds every
+/// pattern, the built-in ones included. Comments and other settings stay.
+pub fn set_pool_patterns(path: &Path, name: &str, patterns: &[String]) -> Result<()> {
+    if patterns.is_empty() {
+        bail!("pool {name} needs at least one pattern");
+    }
+    let mut doc = read_doc(path)?;
+    let pool = pool_table(&mut doc, name)?;
+    let list: toml_edit::Array = patterns.iter().map(String::as_str).collect();
+    pool.insert("match", toml_edit::value(list));
+    write_doc(path, &doc)
+}
+
+/// `[pool.NAME]` of a settings file, made if it is not there yet.
+fn pool_table<'a>(doc: &'a mut toml_edit::DocumentMut, name: &str) -> Result<&'a mut dyn toml_edit::TableLike> {
+    let pools = doc.entry("pool").or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        toml_edit::Item::Table(t)
+    });
+    match pools.as_table_like_mut().and_then(|t| t.entry(name).or_insert(toml_edit::table()).as_table_like_mut()) {
+        Some(t) => Ok(t),
+        None => bail!("cannot write pool.{name}"),
+    }
+}
+
+/// Move a setting one step up or down from its current value, and write it at
+/// the top level of the file at `path`. Comments and other settings stay as
+/// they are. Returns what changed, in words.
+pub fn step_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> Result<String> {
+    let mut doc = read_doc(path)?;
     let value: toml_edit::Item = match set.kind {
         SettingKind::Bool => toml_edit::value(!cfg.setting_bool(set.key)),
         SettingKind::Number(step, lo, hi, _) => {
@@ -329,12 +443,7 @@ pub fn step_user_setting(path: &Path, cfg: &Config, set: &Setting, up: bool) -> 
         }
         (_, Err(_)) => bail!("cannot write {}", set.key),
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, doc.to_string())?;
-    std::fs::rename(&tmp, path)?;
+    write_doc(path, &doc)?;
     let shown = match set.kind {
         SettingKind::Bool => (if cfg.setting_bool(set.key) { "off" } else { "on" }).to_string(),
         _ => match doc.get(set.key).and_then(|v| v.as_value()) {
@@ -419,6 +528,7 @@ impl Config {
                 }
             };
         }
+        set!(enabled);
         set!(hints);
         set!(cpu_max);
         set!(mem_max);
@@ -449,7 +559,11 @@ impl Config {
             let base = existing.map(|i| self.pools[i].clone());
             let pool = Pool {
                 name: n.clone(),
-                max_slots: p.max_slots.or(base.as_ref().and_then(|b| b.max_slots)),
+                max_slots: match (p.max_slots, p.unlimited) {
+                    (Some(n), _) => Some(n),
+                    (None, Some(true)) => None,
+                    _ => base.as_ref().and_then(|b| b.max_slots),
+                },
                 per_checkout: p.per_checkout.or(base.as_ref().map(|b| b.per_checkout)).unwrap_or(true),
                 patterns: if p.patterns.is_empty() { base.map(|b| b.patterns).unwrap_or_default() } else { p.patterns.clone() },
             };
@@ -635,9 +749,10 @@ mod tests {
         assert!(parse_size_kb("lots").is_err());
     }
 
-    /// Every DALP command from the inventory lands where it should.
+    /// Common commands of a JavaScript monorepo land where they should. Script
+    /// paths of one repo belong in that repo's .taskguard.toml, not here.
     #[test]
-    fn dalp_commands() {
+    fn common_commands() {
         let c = Config::default();
         let cases: &[(&str, Option<&str>, bool, Option<&str>)] = &[
             // command, pool, passthrough, label
@@ -657,14 +772,16 @@ mod tests {
             ("bun tools/generate.ts", None, false, Some("codegen")),
             ("fumadocs-mdx", None, false, Some("codegen")),
             ("tsr generate", None, false, Some("codegen")),
-            ("bun scripts/compile.ts", Some("contracts"), false, None),
-            ("bun scripts/hardhat-runtime.ts --max-old-space-size=16384 compile", Some("contracts"), false, None),
-            ("bun tools/dpm.ts build --all", Some("contracts"), false, None),
+            ("bun scripts/compile.ts", None, false, None),
+            ("bun scripts/hardhat-runtime.ts --max-old-space-size=16384 compile", None, false, None),
+            ("bun tools/dpm.ts build --all", None, false, None),
             ("bunx --bun playwright test --config=tests/e2e/playwright.config.ts", Some("e2e"), false, None),
-            ("bun web/dapp/tools/run-dapp-e2e.ts", Some("e2e"), false, None),
-            ("bun e2e/dapi/tests/run.ts", Some("e2e"), false, None),
-            ("bun testkit/helpers/tools/run-integration.ts --task e2e", Some("integration"), false, None),
-            ("bun src/run-drizzle.ts migrate", Some("db"), false, None),
+            ("bun web/app/tools/run-app-e2e.ts", None, false, None),
+            ("bunx cypress run --spec cypress/e2e", Some("e2e"), false, None),
+            ("bun e2e/api/tests/run.ts", None, false, None),
+            ("bun testkit/helpers/tools/run-integration.ts --task e2e", None, false, None),
+            ("bun src/run-drizzle.ts migrate", None, false, None),
+            ("npx prisma migrate deploy", Some("db"), false, None),
             ("bunx --bun drizzle-kit push", Some("db"), false, None),
             ("bun tools/check-boundaries.ts", None, false, Some("check")),
             ("bunx --bun stryker run", None, false, Some("test")),
@@ -728,19 +845,53 @@ mod tests {
         std::fs::write(&path, "# my limits\ncpu_max = 80 # leave room for the editor\n\n[dir.\"/w\"]\nmem_max = 70\n").unwrap();
         let cfg = Config { cpu_max: 80.0, ..Default::default() };
         let set = SETTINGS.iter().find(|s| s.key == "cpu_max").unwrap();
-        assert_eq!(step_user_setting(&path, &cfg, set, false).unwrap(), "cpu_max = 75%");
+        assert_eq!(step_setting(&path, &cfg, set, false).unwrap(), "cpu_max = 75%");
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# my limits") && text.contains("# leave room for the editor"), "{text}");
         assert!(text.contains("cpu_max = 75") && text.contains("mem_max = 70"), "{text}");
         let hints = SETTINGS.iter().find(|s| s.key == "hints").unwrap();
-        assert_eq!(step_user_setting(&path, &cfg, hints, true).unwrap(), "hints = off");
+        assert_eq!(step_setting(&path, &cfg, hints, true).unwrap(), "hints = off");
         let pause = SETTINGS.iter().find(|s| s.key == "auto_pause").unwrap();
-        assert_eq!(step_user_setting(&path, &cfg, pause, true).unwrap(), "auto_pause = on");
+        assert_eq!(step_setting(&path, &cfg, pause, true).unwrap(), "auto_pause = on");
         let size = SETTINGS.iter().find(|s| s.key == "new_job_mem").unwrap();
-        assert_eq!(step_user_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
+        assert_eq!(step_setting(&path, &cfg, size, true).unwrap(), "new_job_mem = 1792M");
         let c = read_layer(&path, &mut Vec::new()).unwrap().unwrap();
         assert_eq!((c.cpu_max, c.hints, c.new_job_mem.as_deref()), (Some(75.0), Some(false), Some("1792M")));
         assert_eq!(c.auto_pause, Some(true));
+    }
+
+    #[test]
+    fn a_pool_ceiling_steps_through_no_limit_and_keeps_the_rest_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".taskguard.toml");
+        std::fs::write(&path, "# repo limits\ncpu_max = 80\n\n[pool.e2e]\nmatch = [\"playwright test\"] # ours\n").unwrap();
+        let load = || {
+            let mut c = Config::default();
+            c.apply(&read_layer(&path, &mut Vec::new()).unwrap().unwrap(), "repo");
+            c
+        };
+        let slots = |c: &Config, n: &str| c.pools.iter().find(|p| p.name == n).unwrap().max_slots;
+        assert_eq!(step_pool(&path, &load(), "db", false).unwrap(), "pool db: no limit");
+        assert_eq!(slots(&load(), "db"), None, "unlimited = true takes away the built-in ceiling");
+        assert_eq!(step_pool(&path, &load(), "db", true).unwrap(), "pool db: 1 slot");
+        assert_eq!(step_pool(&path, &load(), "db", true).unwrap(), "pool db: 2 slots");
+        assert_eq!(step_pool(&path, &load(), "e2e", true).unwrap(), "pool e2e: 2 slots");
+        let c = load();
+        assert_eq!((slots(&c, "db"), slots(&c, "e2e"), slots(&c, "integration")), (Some(2), Some(2), Some(1)));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# repo limits") && text.contains("# ours") && text.contains("cpu_max = 80"), "{text}");
+        assert!(!text.contains("unlimited"), "a number replaces unlimited:\n{text}");
+        assert_eq!(c.pools.iter().find(|p| p.name == "e2e").unwrap().patterns, vec!["playwright test"]);
+        let (_, unknown) = parse_layer(&text).unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    #[test]
+    fn max_slots_wins_over_unlimited_in_one_section() {
+        let mut c = Config::default();
+        c.apply(&parse_layer("[pool.db]\nmax_slots = 3\nunlimited = true\n[pool.e2e]\nunlimited = true\n").unwrap().0, "x");
+        let slots = |n: &str| c.pools.iter().find(|p| p.name == n).unwrap().max_slots;
+        assert_eq!((slots("db"), slots("e2e"), slots("integration")), (Some(3), None, Some(1)));
     }
 
     #[test]

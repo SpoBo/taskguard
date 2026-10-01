@@ -1,7 +1,7 @@
-//! Built-in defaults. They cover the DALP monorepo out of the box (turbo 2,
-//! bun, 281 packages) and most JavaScript monorepos with it. Every list can be
-//! extended in config; a config pool or label with the same name replaces the
-//! built-in one.
+//! Built-in defaults for common JavaScript tools. They name commands that
+//! people run, never the script paths of one repo: those go in that repo's
+//! .taskguard.toml. Every list can be extended in config; a config pool or
+//! label with the same name replaces the built-in one.
 
 /// Long-running commands. Queueing them would hold room forever, so they run
 /// straight through, unmeasured. The same idea as tsc-queue's skip of
@@ -44,21 +44,20 @@ pub const PASSTHROUGH: &[&str] = &[
 /// running services, or one lock file, and so must not run at the same time.
 /// Worktrees get separate pools, because they do not share those things.
 pub const POOLS: &[(&str, &[&str])] = &[
-    ("db", &["drizzle-kit migrate", "drizzle-kit push", "**/run-drizzle.ts", "**/template-db.ts"]),
     (
-        "contracts",
+        "db",
         &[
-            "hardhat compile",
-            "**/hardhat-runtime.ts compile",
-            "onchain/**/compile.ts",
-            "scripts/compile.ts",
-            "forge build",
-            "**/dpm.ts build",
-            "dpm build",
+            "drizzle-kit migrate",
+            "drizzle-kit push",
+            "prisma migrate",
+            "prisma db push",
+            "knex migrate:latest",
+            "sequelize db:migrate",
+            "typeorm migration:run",
         ],
     ),
-    ("e2e", &["playwright test", "**/run-dapp-e2e.ts", "e2e/**/run.ts", "vitest * --project e2e", "vitest --project e2e"]),
-    ("integration", &["**/run-integration.ts", "vitest * --project integration", "vitest --project integration"]),
+    ("e2e", &["playwright test", "cypress run", "vitest * --project e2e", "vitest --project e2e"]),
+    ("integration", &["vitest * --project integration", "vitest --project integration"]),
 ];
 
 /// Labels for the dashboard and history. They never change scheduling.

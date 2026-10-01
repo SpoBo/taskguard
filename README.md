@@ -93,8 +93,12 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   stream of small jobs cannot keep it out. Off by default (`0`); `1800` lets
   small jobs through for half an hour.
 - **Pools** add a slot ceiling where jobs share something: one database, one
-  set of services, one lock file. `taskguard --id e2e -j1 ...`. CPU and memory
-  are always shared by the whole machine.
+  set of services, one lock file. A slot ceiling only stops such jobs from
+  running at the same time and breaking each other; CPU and memory are always
+  shared by the whole machine. Pools count per worktree unless
+  `per_checkout = false`, so other worktrees are never held up.
+  `taskguard --id e2e -j1 ...`, a `[pool.NAME]` section, or the Config view
+  of `taskguard top`.
 
 ### What is measured
 
@@ -193,12 +197,16 @@ taskguard --wait [--id NAME]
 The `--` is optional. Options stop at the first word that is not an option.
 Use `taskguard run ...` for a command that has the same name as a subcommand.
 
-`TASKGUARD_DISABLE=1` skips taskguard for one command. A call nested inside a
+`TASKGUARD_DISABLE=1` skips taskguard for one command. `enabled = false` in a
+config file does the same for every command it applies to: all of them run
+straight through, unqueued and unmeasured. A call nested inside a
 running job starts at once and takes no second slot, even when a task runner in
 between drops environment variables.
 
 Long-running commands are never queued: watch modes, dev servers, `--version`
-and `--help` run straight through. See `taskguard doctor --explain "COMMAND"`.
+and `--help` run straight through (the list is in `src/builtin.rs`). Add your
+own with `passthrough = ["storybook", "my-dev-server"]` in a config file; it
+adds to the built-in list. See `taskguard doctor --explain "COMMAND"`.
 
 ### What a waiting job prints
 
@@ -272,7 +280,7 @@ run, and the minimum to pin when a job starves again and again.
 | 4 Trends | Commands whose memory, CPU or duration grows: the last 10 runs against the 10 before. |
 | 5 Warnings | Starved runs with the evidence, suggested minimums, trend alerts, and `--now` runs that went over a limit. |
 | 6 Namespaces | CPU-hours, GB-hours, runs, waits and starved runs per namespace. |
-| 7 Config | The limits and other settings. `←`/`→` change one and save it in your user config, comments kept. Jobs that already wait follow the change. |
+| 7 Config | The limits, other settings and the slot ceiling of each pool. `←`/`→` change one. `Enter` on a pool lists its match patterns: `a` adds one, `d` removes one. `n` adds a new pool. The first change asks where to save it: your user config (every repo) or this worktree's `.taskguard.toml`; `w` switches later. Comments are kept. Jobs that already wait follow the change. |
 
 `Enter` on a row opens that job: its learned needs and where each comes
 from, sparklines over its runs, and what taskguard changed on its own. For a
@@ -358,8 +366,11 @@ cpu_max = 100          # percent of all cores
 mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
 
-[pool.e2e]             # a slot ceiling for one kind of job
+[pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
+
+[pool.db]              # take away a built-in pool's ceiling
+unlimited = true
 
 [[job]]                # settings for one command
 match = "vitest run --project integration"
@@ -367,10 +378,12 @@ min_cpu = 4
 min_mem = "6G"
 ```
 
-The built-in defaults cover the DALP monorepo out of the box:
+The built-in defaults name common JavaScript tools, not the scripts of one
+repo. Put a repo's own scripts in its `.taskguard.toml`:
 
-- single-slot pools per checkout for database migrations, contract compiles,
-  e2e runs and integration runs
+- single-slot pools per checkout for database migrations (`drizzle-kit`,
+  `prisma`, `knex`, `sequelize`, `typeorm`), e2e runs (`playwright test`,
+  `cypress run`) and integration runs (`vitest --project integration`)
 - launchers such as `bun --bun`, `bunx`, `npx`, `pnpm exec`, `devenv shell --`
   and `node` are stripped before matching
 - watch modes and dev servers run straight through
@@ -451,11 +464,13 @@ Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each
 other's jobs. They still see the load of those jobs in the machine readings.
 
-Settings files are read strictly: a version that does not know a setting
-rejects the file. The user config and a repo's `.taskguard.toml` are read by
-every version that runs there, so set a new setting such as `max_backfill`
-in them only once every such version knows it. The dashboard's Config view
-does not offer `max_backfill` for that reason.
+Versions before 0.2.1 read settings files strictly: they reject a file with a
+setting they do not know. The user config and a repo's `.taskguard.toml` are
+read by every version that runs there, so set a new setting such as
+`max_backfill` in them only once every such version is 0.2.1 or newer. The
+dashboard's Config view does not offer `max_backfill` for that reason. It
+writes `unlimited = true` only when you take a pool down to no limit; a
+version that does not know `unlimited` keeps that pool's old ceiling.
 
 ## Uninstall
 

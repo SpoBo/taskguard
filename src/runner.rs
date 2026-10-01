@@ -166,7 +166,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let cfg = Config::load(&cwd, &checkout)?;
     let jkey = o.key.clone().unwrap_or_else(|| key::run_key(&cwd, &o.cmd));
     let cls = cfg.classify(&o.cmd, &jkey)?;
-    if cls.passthrough {
+    if !cfg.enabled || cls.passthrough {
         exec(&o.cmd);
     }
     if o.bg {

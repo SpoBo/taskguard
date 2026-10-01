@@ -219,16 +219,7 @@ pub fn doctor(args: &[String]) -> Result<i32> {
     println!();
     println!(
         "pools: {}",
-        cfg.pools
-            .iter()
-            .map(|p| format!(
-                "{} ({} slot{})",
-                p.name,
-                p.max_slots.map(|s| s.to_string()).unwrap_or("no limit".into()),
-                if p.max_slots == Some(1) { "" } else { "s" }
-            ))
-            .collect::<Vec<_>>()
-            .join(", ")
+        cfg.pools.iter().map(|p| format!("{} ({})", p.name, crate::config::slots_text(p.max_slots))).collect::<Vec<_>>().join(", ")
     );
     println!("passthrough patterns: {}", cfg.passthrough.len());
     println!("[[job]] rules: {}", cfg.jobs.len());

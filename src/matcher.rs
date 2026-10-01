@@ -316,7 +316,7 @@ mod tests {
             effective(&v("node --max-old-space-size=8192 node_modules/typescript/bin/tsc -p .")),
             v("node_modules/typescript/bin/tsc -p .")
         );
-        assert_eq!(effective(&v("bun run --cwd web/dapp e2e:ui")), v("e2e:ui"));
+        assert_eq!(effective(&v("bun run --cwd web/app e2e:ui")), v("e2e:ui"));
         assert_eq!(effective(&v("time nice -n 5 tsc")), v("tsc"));
         assert_eq!(effective(&v("sh -c 'tsc -p . && echo done'")), v("tsc -p ."));
         assert_eq!(effective(&v("bun build src/main.ts --compile")), v("bun build src/main.ts --compile"));

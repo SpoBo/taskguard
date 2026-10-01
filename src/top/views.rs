@@ -1,7 +1,7 @@
 //! Drawing the dashboard's views.
 
 use super::chart::{self, AXIS_W, PALETTE, Stacked, WaitStrip, spark};
-use super::{App, Charts, Click, Input, NS_SORTS, RANGES, RUN_SORTS, VIEWS, View};
+use super::{App, Charts, Click, Input, NS_SORTS, RANGES, RUN_SORTS, SaveTo, VIEWS, View};
 use crate::config::{SETTINGS, SettingKind};
 use crate::dash::{self, Marker};
 use crate::report::{self, chrono_like, datetime, dur, gb};
@@ -99,6 +99,16 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         Input::ConfirmKill(pid, key) => Some(format!("send SIGTERM to {key} (pid {pid})? y / n")),
         Input::ConfirmStart(_, key) => Some(format!("start {key} now, whatever the limits say? y / n")),
         Input::EditNeeds(_, key, t) => Some(format!("needs of {key} for this run, as CORES MEMORY: {t}▏   Enter apply, Esc cancel")),
+        Input::SaveWhere(_) => Some(format!(
+            "save where?  u = your config {} (every repo)   w = this worktree {} (commit it to share)   Esc cancel",
+            crate::config::user_config_path().display(),
+            crate::config::repo_file(&app.cwd, &app.checkout).display()
+        )),
+        Input::AddPattern(t) => Some(format!(
+            "add to pool {}: {t}▏   a command word and words from its arguments, or a script path with * and ** globs   Enter add, Esc cancel",
+            app.pool_edit.as_ref().map(|p| p.0.as_str()).unwrap_or("-")
+        )),
+        Input::NewPool(t) => Some(format!("name of the new pool: {t}▏   letters, digits, - and _   Enter add, Esc cancel")),
         Input::None => app.message.clone(),
     };
     if let Some(text) = text {
@@ -154,11 +164,31 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         ],
         View::Trends | View::Warnings => vec![("↑/↓".into(), "select", None), ("Enter".into(), "details", Some(KeyCode::Enter))],
         View::Job => vec![("Esc".into(), "back", Some(KeyCode::Esc))],
-        View::Config => vec![
-            ("↑/↓".into(), "select", None),
-            ("←/-".into(), "lower", Some(KeyCode::Left)),
-            ("→/+".into(), "raise", Some(KeyCode::Right)),
-        ],
+        View::Config if app.pool_edit.is_some() => {
+            let mut v = vec![
+                ("↑/↓".into(), "select", None),
+                ("a".into(), "add pattern", Some(KeyCode::Char('a'))),
+                ("d".into(), "remove pattern", Some(KeyCode::Char('d'))),
+                ("Esc".into(), "back", Some(KeyCode::Esc)),
+            ];
+            if app.has_worktree() {
+                v.push(("w".into(), "save where", Some(KeyCode::Char('w'))));
+            }
+            v
+        }
+        View::Config => {
+            let mut v = vec![
+                ("↑/↓".into(), "select", None),
+                ("←/-".into(), "lower", Some(KeyCode::Left)),
+                ("→/+".into(), "raise", Some(KeyCode::Right)),
+                ("Enter".into(), "pool patterns", Some(KeyCode::Enter)),
+                ("n".into(), "new pool", Some(KeyCode::Char('n'))),
+            ];
+            if app.has_worktree() {
+                v.push(("w".into(), "save where", Some(KeyCode::Char('w'))));
+            }
+            v
+        }
         View::Help => vec![],
     };
     items.extend(view_items);
@@ -976,12 +1006,26 @@ fn live_run(lines: &mut Vec<Line<'static>>, live: &super::LiveRun, now: f64, w: 
 // ---------------------------------------------------------------- config ----
 
 fn config_view(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(pool) = app.open_pool().cloned() {
+        return pool_patterns_view(f, app, area, &pool);
+    }
     let user = crate::config::user_config_path().display().to_string();
-    let rows: Vec<Row> = SETTINGS
+    let target = app.save_path().display().to_string();
+    // A change in the user config loses to a [dir] section or a repo file
+    // that sets the same thing. Nothing applied here wins over a repo file.
+    let overridden = |origin: &str| app.save_to != Some(SaveTo::Worktree) && origin != "built-in" && origin != user;
+    let set_by = |origin: String| {
+        let elsewhere = overridden(&origin);
+        Cell::from(if elsewhere { format!("{origin} (wins over your change)") } else { origin }).style(if elsewhere {
+            Style::default().fg(Color::Yellow)
+        } else {
+            DIM
+        })
+    };
+    let mut rows: Vec<Row> = SETTINGS
         .iter()
         .map(|set| {
             let origin = app.cfg.origin.get(set.key).cloned().unwrap_or_else(|| "built-in".into());
-            let elsewhere = origin != "built-in" && origin != user;
             let kind = match set.kind {
                 SettingKind::Bool => "on / off",
                 SettingKind::Number(..) => "number",
@@ -990,27 +1034,85 @@ fn config_view(f: &mut Frame, app: &mut App, area: Rect) {
             Row::new(vec![
                 Cell::from(set.key),
                 Cell::from(app.cfg.setting_text(set.key)).style(BOLD),
-                Cell::from(if elsewhere { format!("{origin} (wins over your change)") } else { origin }).style(if elsewhere {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    DIM
-                }),
+                set_by(origin),
                 Cell::from(format!("{} ({kind})", set.what)),
             ])
         })
         .collect();
-    let [top, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(4)]).areas(area);
+    for pool in &app.cfg.pools {
+        let origin = app.cfg.origin.get(&format!("pool.{}", pool.name)).cloned().unwrap_or_else(|| "built-in".into());
+        let scope = if pool.per_checkout { "counted per worktree" } else { "counted for the whole machine" };
+        rows.push(Row::new(vec![
+            Cell::from(format!("pool {}", pool.name)),
+            Cell::from(crate::config::slots_text(pool.max_slots)).style(BOLD),
+            set_by(origin),
+            Cell::from(format!("{scope}, for: {}", pool.patterns.join(", "))),
+        ]));
+    }
+    let [top, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).areas(area);
+    let where_line = match (app.save_to, app.has_worktree()) {
+        (None, true) => "Your first change asks where to save it: your config (every repo) or this worktree's .taskguard.toml.".to_string(),
+        (_, true) => format!("Changes are saved in {target} (w to switch)."),
+        (_, false) => format!("Changes are saved in {target}."),
+    };
     f.render_widget(
         Paragraph::new(vec![
-            Line::raw(format!("Changes are saved in {user}. They apply to every job on this machine,")),
-            Line::raw("waiting jobs included, unless a repo's .taskguard.toml or a [dir] section sets the same thing."),
+            Line::raw(where_line),
+            Line::styled("A worktree's .taskguard.toml wins over your config; your config applies to every repo on this machine.", DIM),
             Line::styled("The limits are the headroom: jobs start only while the machine stays under them.", DIM),
+            Line::raw("Pools count jobs, not CPU or memory. A pool with 1 slot runs its jobs one at a time in each worktree,"),
+            Line::raw(
+                "so jobs that share one database, set of services or files cannot break each other. Other worktrees are not held up.",
+            ),
         ]),
         top,
     );
     let n = rows.len();
-    let table = Table::new(rows, [Constraint::Length(17), Constraint::Length(8), Constraint::Length(34), Constraint::Min(20)])
+    let table = Table::new(rows, [Constraint::Length(17), Constraint::Length(9), Constraint::Length(34), Constraint::Min(20)])
         .header(Row::new(vec!["setting", "value", "set by", "what it does"]).style(BOLD))
+        .row_highlight_style(Style::default().bg(Color::DarkGray))
+        .block(Block::new().borders(Borders::TOP));
+    render_list(f, app, table, list, 2, n);
+}
+
+/// The match patterns of one pool, opened with Enter on its Config row.
+fn pool_patterns_view(f: &mut Frame, app: &mut App, area: Rect, pool: &crate::config::Pool) {
+    let origin = app.cfg.origin.get(&format!("pool.{}", pool.name)).cloned().unwrap_or_else(|| "built-in".into());
+    let scope = if pool.per_checkout { "in each worktree" } else { "on the whole machine" };
+    let [top, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(4)]).areas(area);
+    let where_line = match app.save_to {
+        None if app.has_worktree() => {
+            "Your first change asks where to save it: your config (every repo) or this worktree's .taskguard.toml.".to_string()
+        }
+        _ => format!("Changes are saved in {}.", app.save_path().display()),
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!(
+                    "pool {}: {} {scope}. Jobs that match one of these patterns count against it.",
+                    pool.name,
+                    crate::config::slots_text(pool.max_slots)
+                ),
+                BOLD,
+            ),
+            Line::raw(format!("Patterns set by {origin}. {where_line}")),
+            Line::styled(
+                "A pattern is a command word and words that must appear among its arguments, in order (\"vitest --project e2e\"),",
+                DIM,
+            ),
+            Line::styled(
+                "or a script path with * and ** globs (\"**/run-*e2e.ts\"). Launchers such as bunx, npx and node are stripped first.",
+                DIM,
+            ),
+            Line::styled("A saved list replaces the whole list from earlier layers, the built-in patterns included.", DIM),
+        ]),
+        top,
+    );
+    let rows: Vec<Row> = pool.patterns.iter().map(|p| Row::new(vec![Cell::from(p.clone())])).collect();
+    let n = rows.len();
+    let table = Table::new(rows, [Constraint::Min(20)])
+        .header(Row::new(vec!["match pattern"]).style(BOLD))
         .row_highlight_style(Style::default().bg(Color::DarkGray))
         .block(Block::new().borders(Borders::TOP));
     render_list(f, app, table, list, 2, n);
@@ -1161,7 +1263,8 @@ VIEWS
   4 Trends      commands whose memory, CPU or duration grows
   5 Warnings    possibly starved runs, suggested minimums, trend alerts, --now runs over a limit
   6 Namespaces  load and waits per namespace
-  7 Config      limits and other settings, changed with ←/→ and saved in your config
+  7 Config      limits, settings and pools: ←/→ change one, Enter on a pool edits its match patterns, n adds a pool;
+                saved in your config or this worktree's .taskguard.toml
   8 Help        this page
   Enter on a row opens the job: its learned needs, its history, and the run going on now.
   Esc or Backspace goes back; j opens the last job again.
@@ -1604,6 +1707,94 @@ mod tests {
         let (y, x, _, _) = *app.hits.iter().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
         app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
         assert!(app.paused, "a click on 'space pause' pauses");
+    }
+
+    #[test]
+    fn config_view_lists_pools_and_asks_where_to_save() {
+        let (t, mut app) = fixture();
+        let wt = t.path().join("wt");
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+        (app.cwd, app.checkout) = (wt.clone(), wt.clone());
+        app.view = View::Config;
+        let s = screen(&mut app, 200, 40);
+        assert!(s.contains("pool db") && s.contains("1 slot") && s.contains("counted per worktree, for: drizzle-kit migrate"), "{s}");
+        assert!(s.contains("one at a time in each worktree"), "{s}");
+        app.sel = SETTINGS.len(); // the first pool: db
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.input, Input::SaveWhere(super::super::Change::Step(false)), "the first change asks where to save");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.input.clone(), app.save_to), (Input::None, None), "Esc saves nothing");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Char('w'));
+        let file = wt.join(".taskguard.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("[pool.db]") && text.contains("unlimited = true"), "{text}");
+        assert_eq!(app.cfg.pools.iter().find(|p| p.name == "db").unwrap().max_slots, None, "the change applies at once");
+        press(&mut app, KeyCode::Right);
+        assert!(std::fs::read_to_string(&file).unwrap().contains("max_slots = 1"), "the next change goes to the same file");
+        assert_eq!(app.input, Input::None, "and asks no second time");
+    }
+
+    #[test]
+    fn enter_on_a_pool_edits_its_match_patterns() {
+        let (t, mut app) = fixture();
+        let wt = t.path().join("wt");
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+        (app.cwd, app.checkout) = (wt.clone(), wt.clone());
+        app.save_to = Some(SaveTo::Worktree);
+        app.view = View::Config;
+        let e2e = SETTINGS.len() + app.cfg.pools.iter().position(|p| p.name == "e2e").unwrap();
+        app.sel = e2e;
+        press(&mut app, KeyCode::Enter);
+        let s = screen(&mut app, 200, 30);
+        assert!(s.contains("match pattern") && s.contains("playwright test") && s.contains("**/run-*e2e.ts"), "{s}");
+        press(&mut app, KeyCode::Char('a'));
+        for c in "**/my-e2e.ts".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Enter);
+        let pats = || app_patterns(&wt.join(".taskguard.toml"));
+        assert_eq!(pats().first().map(String::as_str), Some("playwright test"), "the built-in patterns stay");
+        assert_eq!(pats().last().map(String::as_str), Some("**/my-e2e.ts"));
+        app.sel = 0;
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!pats().contains(&"playwright test".to_string()), "{:?}", pats());
+        assert!(!app.cfg.pools.iter().find(|p| p.name == "e2e").unwrap().patterns.contains(&"playwright test".to_string()));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.pool_edit.clone(), app.sel, app.view), (None, e2e, View::Config), "Esc returns to the pool row");
+    }
+
+    #[test]
+    fn n_adds_a_pool_and_asks_for_its_first_pattern() {
+        let (t, mut app) = fixture();
+        let wt = t.path().join("wt");
+        std::fs::create_dir_all(wt.join(".git")).unwrap();
+        (app.cwd, app.checkout) = (wt.clone(), wt.clone());
+        app.save_to = Some(SaveTo::Worktree);
+        app.view = View::Config;
+        let typed = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                press(app, KeyCode::Char(c));
+            }
+            press(app, KeyCode::Enter);
+        };
+        press(&mut app, KeyCode::Char('n'));
+        typed(&mut app, "bad name");
+        assert!(app.message.as_deref().unwrap_or("").contains("letters, digits"), "{:?}", app.message);
+        press(&mut app, KeyCode::Char('n'));
+        typed(&mut app, "docker");
+        assert_eq!(app.input, Input::AddPattern(String::new()), "a new pool asks for its first pattern");
+        typed(&mut app, "docker build");
+        let doc: toml::Table = std::fs::read_to_string(wt.join(".taskguard.toml")).unwrap().parse().unwrap();
+        assert_eq!(doc["pool"]["docker"]["max_slots"].as_integer(), Some(1));
+        assert_eq!(doc["pool"]["docker"]["match"].as_array().map(|a| a.len()), Some(1));
+        let pool = app.open_pool().expect("the new pool is open");
+        assert_eq!((pool.name.as_str(), pool.patterns.clone()), ("docker", vec!["docker build".to_string()]));
+    }
+
+    fn app_patterns(file: &std::path::Path) -> Vec<String> {
+        let doc: toml::Table = std::fs::read_to_string(file).unwrap().parse().unwrap();
+        doc["pool"]["e2e"]["match"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
     }
 
     #[test]

@@ -59,6 +59,35 @@ pub enum Input {
     ConfirmStart(i32, String),
     /// Needs for a job, typed as "CORES MEMORY", for example "2 4G".
     EditNeeds(i32, String, String),
+    /// Where to save a Config change, asked before the first one. Holds the
+    /// change, made once the answer is in.
+    SaveWhere(Change),
+    /// A match pattern being typed, to add to the pool that is open.
+    AddPattern(String),
+    /// The name of a new pool being typed.
+    NewPool(String),
+}
+
+/// A change in the Config view, saved in the user config or the worktree.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Raise (true) or lower (false) the selected setting or pool by one step.
+    Step(bool),
+    /// Add a match pattern to the open pool.
+    AddPattern(String),
+    /// Remove the match pattern at this index from the open pool.
+    RemovePattern(usize),
+    /// Add a pool with this name and 1 slot, and open it to add patterns.
+    NewPool(String),
+}
+
+/// The file that Config view changes are saved in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SaveTo {
+    /// The user config: every repo and worktree on this machine.
+    User,
+    /// The `.taskguard.toml` of the worktree that the dashboard runs in.
+    Worktree,
 }
 
 /// Everything a frame draws, loaded once per refresh.
@@ -151,6 +180,11 @@ pub struct App {
     pub hits: Vec<(u16, u16, u16, Click)>,
     pub cwd: PathBuf,
     pub checkout: PathBuf,
+    /// Where Config view changes go; None until the first change asks.
+    pub save_to: Option<SaveTo>,
+    /// The pool whose match patterns the Config view lists, and the row of
+    /// that pool to return to.
+    pub pool_edit: Option<(String, usize)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,6 +225,8 @@ impl App {
             hits: Vec::new(),
             cwd: PathBuf::new(),
             checkout: PathBuf::new(),
+            save_to: None,
+            pool_edit: None,
         }
     }
 
@@ -313,7 +349,10 @@ impl App {
             View::Warnings => self.data.warnings.len(),
             View::Namespaces => self.data.namespaces.len(),
             View::Job => self.data.job.as_ref().map(|j| j.runs.len()).unwrap_or(0),
-            View::Config => SETTINGS.len(),
+            View::Config => match self.open_pool() {
+                Some(p) => p.patterns.len(),
+                None => SETTINGS.len() + self.cfg.pools.len(),
+            },
             _ => 0,
         }
     }
@@ -327,6 +366,7 @@ impl App {
             self.pick = None;
             self.sort = 0;
             self.reverse = false;
+            self.pool_edit = None;
         }
     }
 
@@ -486,23 +526,124 @@ impl App {
                     Err(e) => e,
                 });
             }
-            Input::None | Input::Filter(_) => {}
+            Input::None | Input::Filter(_) | Input::SaveWhere(_) | Input::AddPattern(_) | Input::NewPool(_) => {}
         }
     }
 
-    /// Change the selected setting by one step, and save it in the user config.
-    fn step_setting(&mut self, up: bool) {
-        let Some(set) = SETTINGS.get(self.sel) else { return };
-        let path = config::user_config_path();
-        self.message = Some(match config::step_user_setting(&path, &self.cfg, set, up) {
+    /// Is the dashboard inside a git checkout, so it has a worktree to save in?
+    pub fn has_worktree(&self) -> bool {
+        self.checkout.join(".git").exists()
+    }
+
+    /// The file that Config view changes go to now.
+    pub fn save_path(&self) -> PathBuf {
+        match self.save_to {
+            Some(SaveTo::Worktree) => config::repo_file(&self.cwd, &self.checkout),
+            _ => config::user_config_path(),
+        }
+    }
+
+    /// The pool whose match patterns the Config view lists now.
+    pub fn open_pool(&self) -> Option<&config::Pool> {
+        let (name, _) = self.pool_edit.as_ref()?;
+        self.cfg.pools.iter().find(|p| &p.name == name)
+    }
+
+    /// Make a Config view change. Before the first one, ask where to save
+    /// it, when there is a worktree to choose.
+    fn change(&mut self, ch: Change) {
+        if self.save_to.is_none() {
+            if self.has_worktree() {
+                self.input = Input::SaveWhere(ch);
+                return;
+            }
+            self.save_to = Some(SaveTo::User);
+        }
+        let path = self.save_path();
+        let done = match (ch, self.open_pool().cloned()) {
+            (Change::Step(up), None) => match SETTINGS.get(self.sel) {
+                Some(set) => config::step_setting(&path, &self.cfg, set, up),
+                None => match self.cfg.pools.get(self.sel - SETTINGS.len()) {
+                    Some(pool) => config::step_pool(&path, &self.cfg, &pool.name.clone(), up),
+                    None => return,
+                },
+            },
+            (Change::AddPattern(pat), Some(pool)) => {
+                let mut pats = pool.patterns.clone();
+                if pats.contains(&pat) {
+                    self.message = Some(format!("pool {} already matches {pat:?}", pool.name));
+                    return;
+                }
+                pats.push(pat.clone());
+                config::set_pool_patterns(&path, &pool.name, &pats).map(|()| format!("pool {}: added {pat:?}", pool.name))
+            }
+            (Change::NewPool(name), None) => match config::new_pool(&path, &self.cfg, &name) {
+                Ok(()) => {
+                    if let Ok(c) = Config::load(&self.cwd, &self.checkout) {
+                        self.cfg = c;
+                    }
+                    let row = SETTINGS.len() + self.cfg.pools.iter().position(|p| p.name == name).unwrap_or(0);
+                    self.pool_edit = Some((name, row));
+                    self.sel = 0;
+                    self.offset = 0;
+                    self.input = Input::AddPattern(String::new());
+                    return;
+                }
+                Err(e) => Err(e),
+            },
+            (Change::RemovePattern(i), Some(pool)) => {
+                let Some(pat) = pool.patterns.get(i).cloned() else { return };
+                if pool.patterns.len() == 1 {
+                    self.message =
+                        Some(format!("pool {} needs at least one pattern; to stop it counting jobs, set its slots to no limit", pool.name));
+                    return;
+                }
+                let pats: Vec<String> = pool.patterns.iter().filter(|p| **p != pat).cloned().collect();
+                config::set_pool_patterns(&path, &pool.name, &pats).map(|()| format!("pool {}: removed {pat:?}", pool.name))
+            }
+            _ => return,
+        };
+        self.message = Some(match done {
             Ok(text) => {
                 if let Ok(c) = Config::load(&self.cwd, &self.checkout) {
                     self.cfg = c;
                 }
+                let n = self.list_len();
+                self.sel = self.sel.min(n.saturating_sub(1));
                 format!("{text}, saved in {}", path.display())
             }
             Err(e) => format!("could not save: {e}"),
         });
+    }
+
+    /// Keys of the Config view. Returns None for keys it does not use.
+    fn config_key(&mut self, code: KeyCode) -> Option<()> {
+        let on_pool = self.pool_edit.is_none() && self.sel >= SETTINGS.len();
+        match (code, &self.pool_edit) {
+            (KeyCode::Left | KeyCode::Char('-'), None) => self.change(Change::Step(false)),
+            (KeyCode::Right | KeyCode::Char('+' | '='), None) => self.change(Change::Step(true)),
+            (KeyCode::Enter, None) if on_pool => {
+                let name = self.cfg.pools.get(self.sel - SETTINGS.len())?.name.clone();
+                self.pool_edit = Some((name, self.sel));
+                self.sel = 0;
+                self.offset = 0;
+            }
+            (KeyCode::Enter, None) => self.change(Change::Step(true)),
+            (KeyCode::Char('n'), None) => self.input = Input::NewPool(String::new()),
+            (KeyCode::Char('a'), Some(_)) => self.input = Input::AddPattern(String::new()),
+            (KeyCode::Char('d') | KeyCode::Delete, Some(_)) => self.change(Change::RemovePattern(self.sel)),
+            (KeyCode::Esc | KeyCode::Backspace, Some((_, row))) => {
+                self.sel = *row;
+                self.offset = 0;
+                self.pool_edit = None;
+            }
+            (KeyCode::Char('w'), _) if self.has_worktree() => {
+                self.save_to = Some(if self.save_to == Some(SaveTo::Worktree) { SaveTo::User } else { SaveTo::Worktree });
+                self.message = Some(format!("changes are now saved in {}", self.save_path().display()));
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     /// Returns false to quit.
@@ -531,6 +672,39 @@ impl App {
                 let input = std::mem::replace(&mut self.input, Input::None);
                 if let KeyCode::Char('y') = k.code {
                     self.apply_input(input);
+                }
+                return true;
+            }
+            Input::SaveWhere(ch) => {
+                let ch = ch.clone();
+                self.input = Input::None;
+                let to = match k.code {
+                    KeyCode::Char('u') => SaveTo::User,
+                    KeyCode::Char('w') => SaveTo::Worktree,
+                    _ => return true,
+                };
+                self.save_to = Some(to);
+                self.change(ch);
+                return true;
+            }
+            Input::AddPattern(text) | Input::NewPool(text) => {
+                match k.code {
+                    KeyCode::Enter => {
+                        let text = text.trim().to_string();
+                        let input = std::mem::replace(&mut self.input, Input::None);
+                        if !text.is_empty() {
+                            self.change(match input {
+                                Input::NewPool(_) => Change::NewPool(text),
+                                _ => Change::AddPattern(text),
+                            });
+                        }
+                    }
+                    KeyCode::Esc => self.input = Input::None,
+                    KeyCode::Backspace => {
+                        text.pop();
+                    }
+                    KeyCode::Char(c) => text.push(c),
+                    _ => {}
                 }
                 return true;
             }
@@ -578,12 +752,8 @@ impl App {
         if self.view == View::Overview && self.overview_key(k.code).is_some() {
             return true;
         }
-        if self.view == View::Config {
-            match k.code {
-                KeyCode::Left | KeyCode::Char('-') => return self.then(|a| a.step_setting(false)),
-                KeyCode::Right | KeyCode::Char('+' | '=') | KeyCode::Enter => return self.then(|a| a.step_setting(true)),
-                _ => {}
-            }
+        if self.view == View::Config && self.config_key(k.code).is_some() {
+            return true;
         }
         match k.code {
             KeyCode::Char('q') => return false,
@@ -687,11 +857,6 @@ impl App {
             Ok(()) => format!("{} resumes within 2 s", e.key),
             Err(err) => format!("could not reach {}: {err}", e.key),
         });
-    }
-
-    fn then(&mut self, f: impl FnOnce(&mut App)) -> bool {
-        f(self);
-        true
     }
 
     pub fn mouse(&mut self, kind: MouseEventKind, col: u16, row: u16) {

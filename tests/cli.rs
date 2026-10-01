@@ -435,3 +435,14 @@ fn a_job_stopped_from_outside_counts_as_paused_by_hand() {
     let _ = job.wait();
     unsafe { libc::kill(child, libc::SIGKILL) };
 }
+
+#[test]
+fn enabled_false_runs_every_command_straight_through() {
+    // A one-slot pool would queue the second job; switched off, nothing queues
+    // and nothing is recorded.
+    let e = Env::new("enabled = false\n");
+    let o = e.run(&["-j1", "--id", "one", "--", "sh", "-c", "echo $TASKGUARD_HELD > out"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(e.file("out")).unwrap().trim(), "", "no slot was taken");
+    assert!(!e.dir.join("taskguard.db").exists(), "nothing was recorded");
+}

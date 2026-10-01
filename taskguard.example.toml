@@ -17,6 +17,8 @@
 # Check what applies where you are:   taskguard doctor
 # Check how one command is treated:   taskguard doctor --explain "bunx vitest run"
 
+# enabled = false     # every command runs straight through, unqueued and unmeasured
+
 # --------------------------------------------------------------- limits ----
 # A job starts only when
 #   CPU busy     + CPU still promised to running jobs     + its CPU need     fits under cpu_max
@@ -83,10 +85,12 @@ retention_rollup_days = 90  # keep one-minute averages this long
 # belongs to that table.
 
 # ---------------------------------------------------------------- pools ----
-# A pool only adds a slot ceiling. CPU and memory are always shared by the
-# whole machine. Built-in single-slot pools: db, contracts, e2e, integration.
-# Set per_checkout to false for one pool for the whole machine; by default each
-# worktree gets its own.
+# A pool only adds a slot ceiling: jobs that share one database, set of
+# services or files run one (or max_slots) at a time, so they cannot break each
+# other. CPU and memory are always shared by the whole machine. Built-in
+# single-slot pools: db, e2e, integration. Change them here or in
+# the Config view of taskguard top. A pool counts per worktree; set
+# per_checkout to false for one pool for the whole machine.
 #
 # [pool.e2e]
 # max_slots = 2
@@ -95,6 +99,10 @@ retention_rollup_days = 90  # keep one-minute averages this long
 # max_slots = 1
 # per_checkout = false
 # match = ["docker compose up", "docker build"]
+#
+# Take away a built-in pool's ceiling, so only CPU and memory decide:
+# [pool.db]
+# unlimited = true
 
 # ---------------------------------------------------------- job rules ----
 # Per-command settings. `match` is a pattern: the command word, then words that
