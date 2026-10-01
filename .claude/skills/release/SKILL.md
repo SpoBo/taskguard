@@ -97,7 +97,7 @@ version.
 ## Move DALP to the new version
 
 DALP installs taskguard through devenv, from
-`.agents/skills/throttle/taskguard.nix`. That file pins `version` and one
+`tools/taskguard/taskguard.nix`. That file pins `version` and one
 hash for each platform. Change it on a DALP branch, not on `main`.
 
 1. Get the SRI hashes of the four archives:
@@ -122,8 +122,8 @@ hash for each platform. Change it on a DALP branch, not on `main`.
 
    This must print a `/nix/store/...-taskguard-NEW/` path and `taskguard NEW`.
    A hash error means one hash is wrong. Nix prints the hash it expected.
-4. Run the throttle tests:
-   `devenv shell -- bunx vitest run --dir .agents/skills/throttle/scripts`.
+4. Check how DALP's pools match a few commands, from the DALP checkout:
+   `devenv shell -- taskguard doctor --explain "bun scripts/compile.ts"`.
 5. Commit with a message like `chore(agents): taskguard NEW`. In the body, say
    in one line what the release fixes. If the PR text names the old version,
    update it.
