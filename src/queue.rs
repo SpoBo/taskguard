@@ -88,6 +88,12 @@ pub struct Entry {
     /// Paused by hand (taskguard pause, or p in the dashboard). Only a resume
     /// by hand ends it; auto_pause leaves it alone.
     pub paused_by_hand: bool,
+    /// The run of a task runner this job belongs to ("turbo:4242"), and when
+    /// that run queued its first job. A job of an older run that can start
+    /// goes first, so one run finishes before the next one takes the room.
+    /// Older versions leave both out, and their jobs never step aside.
+    pub pipeline: Option<String>,
+    pub pipeline_since: Option<f64>,
 }
 
 impl Entry {
@@ -152,7 +158,7 @@ pub struct Guard {
 
 impl Queue {
     pub fn open(dir: &Path) -> Result<Queue> {
-        for d in ["wait", "run", "viewers", "nudge"] {
+        for d in ["wait", "run", "viewers", "nudge", "pipeline"] {
             fs::create_dir_all(dir.join(d)).with_context(|| format!("creating {}", dir.join(d).display()))?;
         }
         Ok(Queue { dir: dir.to_path_buf() })
@@ -177,6 +183,18 @@ impl Queue {
 
     pub fn run_path(&self, pid: i32) -> PathBuf {
         self.dir.join("run").join(pid.to_string())
+    }
+
+    /// When the task-runner run `id` ("turbo:4242", owned by `pid`) queued
+    /// its first job. The first job of the run writes it; the file outlives
+    /// that job, so the run keeps its age between waves of jobs.
+    pub fn pipeline_since(&self, id: &str, pid: i32, now: f64) -> f64 {
+        let path = self.dir.join("pipeline").join(format!("{}.{pid}", id.split(':').next().unwrap_or("run")));
+        if let Some(t) = fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()) {
+            return t;
+        }
+        let _ = fs::write(&path, now.to_string());
+        now
     }
 
     fn nudge_path(&self, pid: i32) -> PathBuf {
@@ -268,10 +286,13 @@ impl Queue {
                 }
             }
         }
-        for sub in ["viewers", "nudge"] {
+        for sub in ["viewers", "nudge", "pipeline"] {
             let Ok(rd) = fs::read_dir(self.dir.join(sub)) else { continue };
             for f in rd.filter_map(|e| e.ok()) {
-                let pid: i32 = f.file_name().to_string_lossy().split('.').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+                // viewers/<pid>, nudge/<pid>, pipeline/<runner>.<pid>
+                let name = f.file_name().to_string_lossy().into_owned();
+                let field = if sub == "pipeline" { name.rsplit('.').next() } else { name.split('.').next() };
+                let pid: i32 = field.and_then(|p| p.parse().ok()).unwrap_or(0);
                 if !alive(pid) {
                     let _ = fs::remove_file(f.path());
                 }
@@ -363,6 +384,11 @@ pub enum Blocker {
         key: String,
         priority: i32,
     },
+    /// A job of an older task-runner run can start: that run goes first.
+    Pipeline {
+        key: String,
+        pipeline: String,
+    },
     Slots {
         pool: String,
         busy: u32,
@@ -412,6 +438,7 @@ impl Blocker {
             Blocker::Older { .. } => "order",
             Blocker::Reserved { .. } => "reserved",
             Blocker::Priority { .. } => "priority",
+            Blocker::Pipeline { .. } => "pipeline",
             Blocker::Slots { .. } => "slots",
             Blocker::LearnStagger { .. } | Blocker::Settling { .. } => "learning",
             Blocker::Memory { .. } => "memory",
@@ -441,6 +468,17 @@ pub fn reserve(running: &[Entry]) -> (f64, u64) {
         let cpu = if e.paused_by_hand { 0.0 } else { (e.need_cpu - e.live_cpu).max(0.0) };
         (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb))
     })
+}
+
+/// Does `a` belong to an older task-runner run than `b`? Only jobs that are
+/// both in a run, in different runs, are ordered this way.
+pub fn runs_before(a: &Entry, b: &Entry) -> bool {
+    matches!((&a.pipeline, a.pipeline_since, &b.pipeline, b.pipeline_since), (Some(pa), Some(sa), Some(pb), Some(sb)) if pa != pb && sa < sb)
+}
+
+/// The cores running jobs need in all. A job paused by hand needs none.
+pub fn promised_cpu(running: &[Entry]) -> f64 {
+    running.iter().filter(|e| !e.paused_by_hand).map(|e| e.need_cpu).sum()
 }
 
 /// How far running jobs are above their needs right now: the part of the
@@ -498,9 +536,12 @@ pub fn decide(
     // itself: a job that waits for memory cannot use the room it would hold,
     // so newer jobs that fit may start meanwhile. Past `max_backfill` it holds
     // its turn anyway, so a stream of small jobs cannot keep it out forever.
+    // A job of an older run is not held back for one of a newer run: that
+    // run goes second anyway, and the two rules would wait for each other.
     if let Some(r) = older.iter().find(|w| {
         let waited = now - w.queued_at;
-        w.bypassed_since.is_some()
+        !runs_before(me, w)
+            && w.bypassed_since.is_some()
             && waited > lim.max_bypass
             && (waited > lim.max_backfill || room.blockers(m, lim, running, w, now, unknown_starts).is_empty())
     }) {
@@ -523,10 +564,22 @@ pub fn decide(
     }) {
         blockers.push(Blocker::Priority { key: h.key.clone(), priority: h.priority });
     }
+    // A job of an older task-runner run that could start now goes first, so
+    // one run finishes before the next one takes the room: twenty runs that
+    // each move a little finish later than twenty runs in turn. A job of the
+    // older run that cannot start holds nothing back, so no room is wasted.
+    if let Some(o) = waiting.iter().find(|w| {
+        w.ticket != me.ticket
+            && w.priority >= me.priority
+            && runs_before(w, me)
+            && room.blockers(m, lim, running, w, now, unknown_starts).is_empty()
+    }) {
+        blockers.push(Blocker::Pipeline { key: o.key.clone(), pipeline: o.pipeline.clone().unwrap_or_default() });
+    }
     blockers.extend(room.blockers(m, lim, running, me, now, unknown_starts));
     if blockers.is_empty() {
         let cpu = if short(lim, me) {
-            format!("CPU not checked for a job that usually takes {:.1}s", me.est_dur_s.unwrap_or(0.0))
+            format!("CPU {:.1}+{:.1} promised of {:.1} cores (short job)", room.promised_cpu, me.need_cpu, room.cpu_limit)
         } else {
             format!("CPU {:.1}+{:.1}+{:.1} of {:.1} cores", m.cpu_busy, room.res_cpu, me.need_cpu, room.cpu_limit)
         };
@@ -629,6 +682,8 @@ struct Room {
     cpu_limit: f64,
     mem_limit: f64,
     mem_used: u64,
+    /// The cores running jobs need in all, whatever they use right now.
+    promised_cpu: f64,
 }
 
 impl Room {
@@ -637,6 +692,7 @@ impl Room {
         Room {
             res_cpu,
             res_mem,
+            promised_cpu: promised_cpu(running),
             cpu_limit: m.ncpu as f64 * lim.cpu_max_pct / 100.0,
             mem_limit: m.mem_total_kb as f64 * lim.mem_max_pct / 100.0,
             mem_used: m.mem_for_admission(running.iter().map(|e| e.live_mem_kb).sum()),
@@ -691,8 +747,26 @@ impl Room {
                 total_kb: m.mem_total_kb,
             });
         }
+        // A short job is over before the CPU reading shows it, so the reading
+        // does not hold it back. What taskguard has promised its own jobs
+        // does: without that, a task runner with a high concurrency starts
+        // every short job at once and fills every core.
+        if short(lim, job) {
+            let promised = self.promised_cpu + job.need_cpu;
+            if promised > self.cpu_limit + 1e-9 {
+                blockers.push(Blocker::Cpu {
+                    would: promised,
+                    limit: self.cpu_limit,
+                    short: promised - self.cpu_limit,
+                    busy: 0.0,
+                    reserve: self.promised_cpu,
+                    need: job.need_cpu,
+                });
+            }
+            return blockers;
+        }
         let cpu_would = m.cpu_busy + self.res_cpu + job.need_cpu;
-        if !short(lim, job) && cpu_would > self.cpu_limit + 1e-9 {
+        if cpu_would > self.cpu_limit + 1e-9 {
             blockers.push(Blocker::Cpu {
                 would: cpu_would,
                 limit: self.cpu_limit,
@@ -1240,5 +1314,85 @@ mod tests {
         assert_eq!(blockers(decide(&machine(12.0, 27), &LIM, r, std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["memory"]);
         me.est_dur_s = Some(30.0);
         assert_eq!(blockers(decide(&machine(12.0, 8), &LIM, r, std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["cpu"]);
+    }
+
+    #[test]
+    fn short_jobs_wait_when_running_jobs_were_promised_every_core() {
+        // Eleven cores promised on a 12-core machine: one more short job of
+        // two cores would make 13, whatever the CPU reading says.
+        let running: Vec<Entry> = (1..=11).map(|i| job(i, &format!("lint{i}"), 1.0, 1)).collect();
+        let mut me = job(20, "lint", 2.0, 1);
+        me.est_dur_s = Some(0.4);
+        assert_eq!(blockers(decide(&machine(0.0, 8), &LIM, &running, std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["cpu"]);
+        me.need_cpu = 1.0;
+        assert!(blockers(decide(&machine(12.0, 8), &LIM, &running, std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty());
+        // A job paused by hand promises nothing.
+        let mut paused = running.clone();
+        paused[0].paused_by_hand = true;
+        me.need_cpu = 2.0;
+        assert!(blockers(decide(&machine(0.0, 8), &LIM, &paused, std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty());
+    }
+
+    fn in_run(mut e: Entry, pipeline: &str, since: f64) -> Entry {
+        e.pipeline = Some(pipeline.into());
+        e.pipeline_since = Some(since);
+        e
+    }
+
+    #[test]
+    fn a_job_of_an_older_run_that_can_start_goes_first() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        // The older run's job joined the queue later, but its run is older.
+        let newer = in_run(job(2, "b:test", 1.0, 1), "turbo:20", 900.0);
+        let older = in_run(job(3, "a:test", 1.0, 1), "turbo:10", 800.0);
+        let waiting = [newer.clone(), older.clone()];
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &newer, 1000.0, &[])), vec!["pipeline"]);
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &older, 1000.0, &[])).is_empty());
+        // A job of the older run that does not fit holds nothing back.
+        let big = in_run(job(3, "a:build", 1.0, 30), "turbo:10", 800.0);
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &[newer.clone(), big], &newer, 1000.0, &[])).is_empty());
+        // Jobs of the same run, and jobs outside any run, keep the old rules.
+        let sibling = in_run(job(4, "b:lint", 1.0, 1), "turbo:20", 900.0);
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &[newer.clone(), sibling], &newer, 1000.0, &[])).is_empty());
+        let alone = job(5, "alone", 1.0, 1);
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &[alone.clone(), older.clone()], &alone, 1000.0, &[])).is_empty());
+        // A higher priority still beats an older run.
+        let mut urgent = newer.clone();
+        urgent.priority = 1;
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &[urgent.clone(), older], &urgent, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_reservation_does_not_hold_back_a_job_of_an_older_run() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        // A job of the newer run waited long, passed by the older run's jobs.
+        let mut passed = in_run(job(2, "b:test", 1.0, 1), "turbo:20", 900.0);
+        passed.queued_at = 700.0;
+        passed.bypassed_since = Some(750.0);
+        let older = in_run(job(3, "a:test", 1.0, 1), "turbo:10", 800.0);
+        let waiting = [passed.clone(), older.clone()];
+        // The older run's job starts; the passed one steps aside for it.
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &older, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &passed, 1000.0, &[])), vec!["pipeline"]);
+        // A job outside any run is still held back by the reservation.
+        let other = job(4, "other", 1.0, 1);
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &[passed, other.clone()], &other, 1000.0, &[])), vec!["reserved"]);
+    }
+
+    #[test]
+    fn a_run_keeps_its_age_until_its_runner_is_gone() {
+        let dir = std::env::temp_dir().join(format!("tg-pipeline-{}", std::process::id()));
+        let q = Queue::open(&dir).unwrap();
+        let live = std::process::id() as i32;
+        assert_eq!(q.pipeline_since(&format!("turbo:{live}"), live, 100.0), 100.0);
+        assert_eq!(q.pipeline_since(&format!("turbo:{live}"), live, 500.0), 100.0, "a later job keeps the first time");
+        let dead = i32::MAX - 1;
+        q.pipeline_since(&format!("turbo:{dead}"), dead, 200.0);
+        q.reap();
+        assert!(dir.join("pipeline").join(format!("turbo.{live}")).exists());
+        assert!(!dir.join("pipeline").join(format!("turbo.{dead}")).exists(), "a gone runner's file is dropped");
+        fs::remove_dir_all(&dir).ok();
     }
 }

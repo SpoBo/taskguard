@@ -49,10 +49,13 @@ memory held  + memory still promised to running jobs  + this job's memory need  
 - **A first run reserves a cautious guess.** A job with no history counts as
   needing what jobs like it needed in the last 30 days: the 90th percentile of
   their memory peaks and the 75th of the cores they wanted. "Like it" means the
-  same kind and pool first (a `ci` run in DALP's `throttle-suite`), then the
-  same kind, then the same pool, then the same program; 1.5 GB without any
-  (`new_job_mem`). A shell job gets the kind of the heaviest command it runs:
-  `sh -c "git fetch && bun install && bun run ci:local"` is a `ci` run.
+  same command of the same package first (its `package.json` name), so a
+  package that moved to another folder starts from what it used before; its
+  history itself stays with the old folder. Then the same kind and pool (a
+  `ci` run in DALP's `throttle-suite`), then the same kind, then the same
+  pool, then the same program; 1.5 GB without any (`new_job_mem`). A shell
+  job gets the kind of the heaviest command it runs: `sh -c "git fetch && bun
+  install && bun run ci:local"` is a `ci` run.
 - **First runs wait until the one before has settled.** A new first run starts
   only when every first run that is already running has stopped growing: its
   memory has not risen by 10% for 20 seconds, or it has run for 2 minutes.
@@ -66,9 +69,12 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   starts until it eases, whatever the estimates say.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
-- **Short jobs skip the CPU check.** A job that usually ends within 5 seconds
-  is over before the CPU reading could react to it, so holding it back only
-  makes it late. Memory is checked for every job.
+- **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
+  ends within 5 seconds is over before the CPU reading could react to it, so
+  the reading does not hold it back. It still waits while the cores that
+  running jobs were promised, with its own, would pass `cpu_max`. Without this,
+  a task runner with a high concurrency starts every short job at once and
+  fills every core. Memory is checked for every job.
 - **"Promised" is the growth still to come.** A compile that sits at 2 GB
   but peaked at 20 GB last time still has 18 GB to take. Without this, a second
   job is started into space the first one is about to use.
@@ -82,6 +88,13 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   fit yet. This is safe: a job only reaches taskguard when its launcher has
   decided that it may run. Turbo starts a task only after the tasks it depends
   on are done, and `a && b` starts `b` only after `a` ends.
+- **One run at a time.** A job started by a task runner (`turbo`, `nx`,
+  `make`, `moon`, `lage`, `just`) belongs to that runner's run. When several
+  runs wait, a job of the run that queued first goes first, as long as it can
+  start. Twenty pipelines that each move a little all finish late; twenty in
+  turn finish one after the other, and the last one no later. A job of the
+  older run that does not fit holds nothing back, so no room is left idle.
+  Priorities still come first.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing newer starts until it has started.
 - **Backfill, if you ask for it.** A reservation for a job that does not fit
@@ -455,7 +468,9 @@ error: a repo can pin a newer taskguard that knows it, while an older one runs
 from another worktree. `taskguard doctor` lists them. Versions before 0.2.1
 stop with an error instead.
 
-A version only follows the rules it knows. A version before 0.2.0 does not
+A version only follows the rules it knows. A version before 0.4.0 does not
+know runs: its jobs never step aside for an older run. A version before
+0.2.0 does not
 read priorities: its waiting jobs start in ticket order and do not step aside
 for a job with a higher priority. It does not know auto_pause either: its jobs
 are never paused, and its waiting jobs may start while another job is paused.

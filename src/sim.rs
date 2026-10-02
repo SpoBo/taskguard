@@ -50,8 +50,9 @@ struct Outcome {
     /// Seconds until the last job ended.
     finished_at: f64,
     all_ran: bool,
-    /// When each job started, by its place in the scenario.
+    /// When each job started and ended, by its place in the scenario.
     started: Vec<Option<f64>>,
+    ended: Vec<Option<f64>>,
 }
 
 /// The kernel's pressure level as a function of memory in use, like macOS:
@@ -68,6 +69,12 @@ fn pressure(pct: f64) -> f64 {
 }
 
 fn run(s: &Scenario, lim: &Limits) -> Outcome {
+    run_in(s, lim, |_| None)
+}
+
+/// As `run`, with each job in the task-runner run `run_of` gives it: a name
+/// and when that run queued its first job.
+fn run_in(s: &Scenario, lim: &Limits, run_of: impl Fn(usize) -> Option<(String, f64)>) -> Outcome {
     let mut arriving: Vec<Entry> = s
         .jobs
         .iter()
@@ -80,6 +87,8 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
             known: j.known,
             est_dur_s: j.est_dur,
             queued_at: j.arrive,
+            pipeline: run_of(i).map(|r| r.0),
+            pipeline_since: run_of(i).map(|r| r.1),
             ..Default::default()
         })
         .collect();
@@ -87,17 +96,18 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
     let mut running: Vec<(Entry, f64, Job)> = Vec::new();
     let mut starts: Vec<f64> = Vec::new();
     let mut recent: Vec<(f64, u64, u64)> = Vec::new();
-    let mut out = Outcome { started: vec![None; s.jobs.len()], ..Default::default() };
+    let mut out = Outcome { started: vec![None; s.jobs.len()], ended: vec![None; s.jobs.len()], ..Default::default() };
     let mut t = 0.0;
     while t < 3600.0 && (!arriving.is_empty() || !waiting.is_empty() || !running.is_empty()) {
         // Tickets follow arrival, so the queue stays in ticket order.
         let (now_in, later): (Vec<Entry>, Vec<Entry>) = arriving.into_iter().partition(|e| e.queued_at <= t);
         waiting.extend(now_in);
         arriving = later;
-        running.retain(|(_, start, j)| {
+        running.retain(|(e, start, j)| {
             let alive = t - start < j.secs;
             if !alive {
                 out.finished_at = t;
+                out.ended[e.ticket as usize - 1] = Some(t);
             }
             alive
         });
@@ -137,7 +147,9 @@ fn run(s: &Scenario, lim: &Limits) -> Outcome {
                     starts.push(t);
                 }
                 // Every older job that still waits has now been passed.
-                for w in waiting.iter_mut().filter(|w| w.ticket < me.ticket && w.bypassed_since.is_none()) {
+                for w in
+                    waiting.iter_mut().filter(|w| w.ticket < me.ticket && !crate::queue::runs_before(&me, w) && w.bypassed_since.is_none())
+                {
                     w.bypassed_since = Some(t);
                 }
                 out.started[me.ticket as usize - 1] = Some(t);
@@ -341,5 +353,36 @@ mod tests {
         // With one, newer jobs stop at 600 s and it starts once they drain.
         assert!((600.0..600.0 + 90.0).contains(&bounded), "{bounded:.0}s");
         assert!(strict < 120.0 + 90.0, "{strict:.0}s");
+    }
+
+    #[test]
+    fn several_runs_finish_one_after_the_other_instead_of_all_late() {
+        // Four turbo runs of 30 test jobs each (2 cores, 20 s) on 10 cores:
+        // about 3 jobs fit at a time. Each turbo queues a few jobs and adds
+        // more as they end, so the runs' tickets interleave: job i belongs to
+        // run i % 4.
+        let jobs: Vec<Job> = (0..120)
+            .map(|i| Job {
+                peak_kb: 300 * 1024,
+                cores: 2.0,
+                secs: 20.0,
+                known: true,
+                need_kb: 300 * 1024,
+                need_cpu: 2.0,
+                est_dur: Some(20.0),
+                arrive: (i / 4) as f64 + (i % 4) as f64 * 0.01,
+            })
+            .collect();
+        let s = Scenario { name: "four runs at once", jobs, other_mem: Box::new(|_| 8 * GB), other_cpu: Box::new(|_| 2.0) };
+        let finish = |o: &Outcome| -> Vec<f64> { (0..4).map(|r| (0..30).filter_map(|j| o.ended[j * 4 + r]).fold(0.0, f64::max)).collect() };
+        let mixed = run(&s, &LIM);
+        let in_turn = run_in(&s, &LIM, |i| Some((format!("turbo:{}", i % 4), (i % 4) as f64 * 0.01)));
+        assert!(mixed.all_ran && in_turn.all_ran);
+        let (a, b) = (finish(&mixed), finish(&in_turn));
+        eprintln!("{}: each run done at {a:.0?}s without runs, {b:.0?}s with runs", s.name);
+        // The first run finishes far sooner, the last one no later.
+        assert!(b[0] < a[0] * 0.5, "first run: {:.0}s vs {:.0}s", b[0], a[0]);
+        assert!(b[3] <= a[3] + 5.0, "last run: {:.0}s vs {:.0}s", b[3], a[3]);
+        assert!(b.windows(2).all(|w| w[0] < w[1]), "runs finish in order: {b:.0?}");
     }
 }

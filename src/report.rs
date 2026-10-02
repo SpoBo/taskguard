@@ -33,6 +33,7 @@ pub fn blocker_text(b: &Blocker) -> String {
             format!("held back so {key}, waiting {}, can start first", dur(*waited_s))
         }
         Blocker::Priority { key, priority } => format!("{key} has priority {priority} and goes first"),
+        Blocker::Pipeline { key, pipeline } => format!("{key} belongs to an older run ({pipeline}) and goes first"),
         Blocker::Slots { pool, busy, max, holders } => {
             format!("pool {pool}: {busy} of {max} busy ({})", holders.join(", "))
         }
@@ -114,7 +115,7 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         None => (format!("starts when {key} finishes"), None),
     };
     match b {
-        Blocker::Older { key } | Blocker::Reserved { key, .. } | Blocker::Priority { key, .. } => {
+        Blocker::Older { key } | Blocker::Reserved { key, .. } | Blocker::Priority { key, .. } | Blocker::Pipeline { key, .. } => {
             (format!("starts after {key} has started"), None)
         }
         Blocker::Slots { holders, .. } => match holders.first() {
@@ -320,7 +321,7 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
     };
     let failed = |name: &str| blockers.iter().find(|b| b.name() == name).copied();
     let mut out = Vec::new();
-    if let Some(b) = failed("order").or(failed("reserved")).or(failed("priority")) {
+    if let Some(b) = failed("order").or(failed("reserved")).or(failed("priority")).or(failed("pipeline")) {
         out.push((false, format!("order: {}", blocker_text(b))));
     } else {
         out.push((true, "order: no older job is held back for this one".into()));

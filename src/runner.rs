@@ -13,7 +13,7 @@ use crate::sys;
 use anyhow::{Context, Result, bail};
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,6 +93,29 @@ fn held_by_ancestor(q: &Queue) -> bool {
     let procs = sys::list_procs();
     let me = std::process::id() as i32;
     sys::ancestors(me, &procs).iter().skip(1).any(|p| q.run_path(*p).exists())
+}
+
+/// Task runners whose run groups the jobs it starts. A job belongs to the
+/// nearest one above it.
+const LAUNCHERS: &[&str] = &["turbo", "nx", "make", "gmake", "moon", "lage", "just"];
+
+/// The task-runner run this process belongs to, as "turbo:4242", and its pid.
+fn pipeline_of() -> Option<(String, i32)> {
+    let procs = sys::list_procs();
+    let me = std::process::id() as i32;
+    sys::ancestors(me, &procs).into_iter().skip(1).find_map(|p| {
+        let name = sys::proc_name(p);
+        LAUNCHERS.contains(&name.as_str()).then(|| (format!("{name}:{p}"), p))
+    })
+}
+
+/// The `name` of the package the job runs for: the package.json the package
+/// manager names (`npm_package_json`), else the one in the working directory.
+fn package_name(cwd: &Path) -> Option<String> {
+    let path = std::env::var_os("npm_package_json").map(PathBuf::from).unwrap_or_else(|| cwd.join("package.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("name")?.as_str().filter(|n| !n.is_empty()).map(str::to_string)
 }
 
 /// Start the recorder unless one runs already. The recorder holds an flock on
@@ -220,8 +243,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
     // new_job_mem without any. Counting a first run as zero let a burst of new
     // compiles start into a machine that could not hold them, and froze it:
     // each grew to several GB within seconds, faster than the readings showed.
+    let package = package_name(&cwd);
+    let cmdline = o.cmd.join(" ");
     let (est_mem, est_cpu, estimate_from) = if learned.runs == 0 {
-        let est = database.as_ref().and_then(|d| d.estimate(cls.label.as_deref(), &tool, pool.as_deref()).ok().flatten());
+        let same = package.as_deref().map(|p| (p, cmdline.as_str()));
+        let est = database.as_ref().and_then(|d| d.estimate(same, cls.label.as_deref(), &tool, pool.as_deref()).ok().flatten());
         let from = match &est {
             Some(e) if e.mem_kb.is_some() => e.from.clone(),
             _ => "the new_job_mem default".to_string(),
@@ -252,7 +278,6 @@ pub fn run(mut o: Opts) -> Result<i32> {
         real.strip_prefix(&real_checkout).map(|r| r.display().to_string()).unwrap_or(p)
     });
     let me_pid = std::process::id() as i32;
-    let cmdline = o.cmd.join(" ");
     let run_id = database
         .as_ref()
         .and_then(|d| {
@@ -266,6 +291,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 pid: me_pid,
                 script: script.as_deref(),
                 package_json: package_json.as_deref(),
+                package: package.as_deref(),
                 now: o.now,
                 min_cpu,
                 min_mem_kb: min_mem,
@@ -323,6 +349,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let t0 = db::now();
     let mut main_blocker: Option<String> = None;
     let admit_reason: String;
+    if !o.now
+        && let Some((id, pid)) = pipeline_of()
+    {
+        me.pipeline_since = Some(q.pipeline_since(&id, pid, t0));
+        me.pipeline = Some(id);
+    }
     {
         let _g = q.lock()?;
         me.ticket = q.next_ticket()?;
@@ -387,8 +419,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 let forced = started_by_hand || matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
                 if matches!(decision, Decision::Admit { .. }) || forced {
                     // Every older job that is still waiting has now been passed,
-                    // unless it waits because this one has a higher priority.
-                    for w in waiting.iter().filter(|w| w.ticket < me.ticket && w.priority >= me.priority && w.bypassed_since.is_none()) {
+                    // unless it waits because this one has a higher priority
+                    // or belongs to an older run.
+                    for w in waiting.iter().filter(|w| {
+                        w.ticket < me.ticket && w.priority >= me.priority && !queue::runs_before(&me, w) && w.bypassed_since.is_none()
+                    }) {
                         let mut w = w.clone();
                         w.bypassed_since = Some(now);
                         let _ = q.write(&q.wait_path(&w), &w);

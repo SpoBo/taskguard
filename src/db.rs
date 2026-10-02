@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS runs (
   starved_detail TEXT,
   machine_full_frac REAL,
   imported INTEGER NOT NULL DEFAULT 0,
-  paused_s REAL
+  paused_s REAL,
+  package TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -186,6 +187,8 @@ pub struct NewRun<'a> {
     pub pid: i32,
     pub script: Option<&'a str>,
     pub package_json: Option<&'a str>,
+    /// The `name` in that package.json.
+    pub package: Option<&'a str>,
     pub now: bool,
     pub min_cpu: Option<f64>,
     pub min_mem_kb: Option<u64>,
@@ -247,6 +250,14 @@ impl Db {
         if !has_paused {
             conn.execute_batch("ALTER TABLE runs ADD COLUMN paused_s REAL")?;
         }
+        // Databases made before first runs were guessed from the same package:
+        // the package name of each run. The index needs the column, so it is
+        // made here rather than in SCHEMA.
+        let has_package: bool = conn.prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'package'")?.exists([])?;
+        if !has_package {
+            conn.execute_batch("ALTER TABLE runs ADD COLUMN package TEXT")?;
+        }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS runs_package ON runs(package, cmd)")?;
         Ok(Db { conn })
     }
 
@@ -284,8 +295,8 @@ impl Db {
     pub fn insert_run(&self, r: &NewRun) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO runs (ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, now,
-                               min_cpu, min_mem_kb, need_cpu, need_mem_kb)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                               min_cpu, min_mem_kb, need_cpu, need_mem_kb, package)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 r.ns,
                 r.pool,
@@ -301,7 +312,8 @@ impl Db {
                 r.min_cpu,
                 r.min_mem_kb.map(|v| v as i64),
                 r.need_cpu,
-                r.need_mem_kb as i64
+                r.need_mem_kb as i64,
+                r.package
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -387,30 +399,41 @@ impl Db {
     /// kind, then the same pool, then the same program. Memory is the 90th
     /// percentile of their peaks and CPU the 75th of the cores they wanted:
     /// a guess that is too low lets a first run crowd the machine.
-    pub fn estimate(&self, label: Option<&str>, tool: &str, pool: Option<&str>) -> Result<Option<Estimate>> {
+    /// A first guess for a job with no history of its own. `same` is the
+    /// job's package name and command: the same command of the same package
+    /// under another key, as after the package moved to another folder, is
+    /// the closest guess. Its history stays under its old key; only the guess
+    /// borrows from it.
+    pub fn estimate(&self, same: Option<(&str, &str)>, label: Option<&str>, tool: &str, pool: Option<&str>) -> Result<Option<Estimate>> {
         let since = now() - 30.0 * 86400.0;
-        // kind, pool, program, and the words for where the guess comes from
-        type Tier<'a> = (Option<&'a str>, Option<&'a str>, Option<&'a str>, String);
+        // package and command, kind, pool, program, and the words for where the guess comes from
+        type Tier<'a> = (Option<(&'a str, &'a str)>, Option<&'a str>, Option<&'a str>, Option<&'a str>, String);
         let mut tiers: Vec<Tier> = Vec::new();
+        if let Some((pkg, cmd)) = same {
+            tiers.push((Some((pkg, cmd)), None, None, None, format!("runs of {cmd:?} in {pkg}")));
+        }
         if let (Some(l), Some(p)) = (label, pool) {
-            tiers.push((Some(l), Some(p), None, format!("{l} {p} jobs")));
+            tiers.push((None, Some(l), Some(p), None, format!("{l} {p} jobs")));
         }
         if let Some(l) = label {
-            tiers.push((Some(l), None, None, format!("{l} jobs")));
+            tiers.push((None, Some(l), None, None, format!("{l} jobs")));
         }
         if let Some(p) = pool {
-            tiers.push((None, Some(p), None, format!("jobs in {p}")));
+            tiers.push((None, None, Some(p), None, format!("jobs in {p}")));
         }
-        tiers.push((None, None, Some(tool), format!("{tool} jobs")));
-        for (l, p, t, what) in tiers {
+        tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
+        for (same, l, p, t, what) in tiers {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT max(peak_mem_kb), avg(cores_wanted) FROM runs
                  WHERE peak_mem_kb > 0 AND ended_at > ?1
                    AND (?2 IS NULL OR label = ?2) AND (?3 IS NULL OR pool = ?3) AND (?4 IS NULL OR cmd LIKE ?4 || '%')
+                   AND (?5 IS NULL OR (package = ?5 AND cmd = ?6))
                  GROUP BY key",
             )?;
-            let rows: Vec<(i64, Option<f64>)> =
-                stmt.query_map(params![since, l, p, t], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+            let (pkg, cmd) = same.unzip();
+            let rows: Vec<(i64, Option<f64>)> = stmt
+                .query_map(params![since, l, p, t, pkg, cmd], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
             if rows.is_empty() {
                 continue;
             }
@@ -423,7 +446,8 @@ impl Db {
             };
             let mem = pct(rows.iter().map(|r| r.0 as f64).collect(), 0.9).map(|m| m as u64);
             let cpu = pct(rows.iter().filter_map(|r| r.1).collect(), 0.75);
-            return Ok(Some(Estimate { mem_kb: mem, cpu, from: format!("typical of {} {what}", rows.len()) }));
+            let from = if same.is_some() { format!("the {what}") } else { format!("typical of {} {what}", rows.len()) };
+            return Ok(Some(Estimate { mem_kb: mem, cpu, from }));
         }
         Ok(None)
     }
@@ -625,6 +649,19 @@ mod tests {
     }
 
     #[test]
+    fn opens_a_database_from_before_package() {
+        let path = std::env::temp_dir().join(format!("tg-old-pkg-{}.db", std::process::id()));
+        // Today's database without the column, as an older version left it.
+        drop(Db::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP INDEX runs_package; ALTER TABLE runs DROP COLUMN package").unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        assert!(db.conn.prepare("SELECT package FROM runs").is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn opens_a_database_from_before_span_s() {
         let path = std::env::temp_dir().join(format!("tg-old-{}.db", std::process::id()));
         let conn = Connection::open(&path).unwrap();
@@ -677,7 +714,7 @@ mod tests {
     fn a_new_job_is_estimated_from_similar_jobs() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_dir(tmp.path()).unwrap();
-        assert_eq!(db.estimate(Some("typecheck"), "tsc", None).unwrap(), None);
+        assert_eq!(db.estimate(None, Some("typecheck"), "tsc", None).unwrap(), None);
         let add = |key: &str, label: &str, pool: Option<&str>, cmd: &str, mem: u64, cores: f64| {
             let id = db.insert_run(&NewRun { ns: "n", key, label: Some(label), pool, cmd, ..Default::default() }).unwrap();
             db.mark_started(id, now() - 5.0, 0.0, None).unwrap();
@@ -690,16 +727,47 @@ mod tests {
         add("ci-a", "ci", Some("throttle-suite"), "sh -c x", 12_000_000, 9.0);
         add("ci-b", "ci", Some("throttle-suite"), "bun run ci:local", 10_000_000, 8.0);
 
-        let e = db.estimate(Some("typecheck"), "tsc", None).unwrap().unwrap();
+        let e = db.estimate(None, Some("typecheck"), "tsc", None).unwrap().unwrap();
         assert_eq!(e.mem_kb, Some(4200), "the 90th percentile of ten peaks: the highest");
         assert_eq!(e.cpu.map(|c| (c * 10.0).round() / 10.0), Some(1.7), "CPU: the 75th percentile");
         assert_eq!(e.from, "typical of 10 typecheck jobs");
-        let e = db.estimate(Some("ci"), "sh", Some("throttle-suite")).unwrap().unwrap();
+        let e = db.estimate(None, Some("ci"), "sh", Some("throttle-suite")).unwrap().unwrap();
         assert_eq!((e.mem_kb, e.from.as_str()), (Some(12_000_000), "typical of 2 ci throttle-suite jobs"));
-        let e = db.estimate(None, "sh", Some("throttle-suite")).unwrap().unwrap();
+        let e = db.estimate(None, None, "sh", Some("throttle-suite")).unwrap().unwrap();
         assert_eq!(e.from, "typical of 2 jobs in throttle-suite", "without a kind, the pool decides");
-        assert_eq!(db.estimate(None, "tsc", None).unwrap().unwrap().from, "typical of 10 tsc jobs", "then the program");
-        assert_eq!(db.estimate(Some("test"), "vitest", None).unwrap(), None);
+        assert_eq!(db.estimate(None, None, "tsc", None).unwrap().unwrap().from, "typical of 10 tsc jobs", "then the program");
+        assert_eq!(db.estimate(None, Some("test"), "vitest", None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_moved_package_is_guessed_from_its_runs_under_the_old_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        let add = |key: &str, package: &str, cmd: &str, mem: u64, cores: f64| {
+            let id =
+                db.insert_run(&NewRun { ns: "n", key, label: Some("test"), package: Some(package), cmd, ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 5.0, 0.0, None).unwrap();
+            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: mem, cores_wanted: cores, measured: true, ..Default::default() })
+                .unwrap();
+        };
+        // Many small test jobs, and one big one under the package's old folder.
+        for i in 0..10 {
+            add(&format!("other{i}:vitest"), &format!("@x/other{i}"), "vitest run", 300_000, 1.0);
+        }
+        add("packages/dapp/custody:vitest", "@dapp/custody", "vitest run", 4_000_000, 3.5);
+        add("packages/dapp/custody:tsc", "@dapp/custody", "tsc -p .", 2_000_000, 2.0);
+
+        // Its new folder has no history: the guess is its own old runs, not the typical test job.
+        let e = db.estimate(Some(("@dapp/custody", "vitest run")), Some("test"), "vitest", None).unwrap().unwrap();
+        assert_eq!((e.mem_kb, e.cpu), (Some(4_000_000), Some(3.5)));
+        assert_eq!(e.from, r#"the runs of "vitest run" in @dapp/custody"#);
+        // The old key keeps its history: nothing moved.
+        assert_eq!(db.learned("packages/dapp/custody:vitest", 10, 5).unwrap().runs, 1);
+        // Another command, or another package, falls back on the typical job.
+        let e = db.estimate(Some(("@dapp/custody", "vitest run --coverage")), Some("test"), "vitest", None).unwrap().unwrap();
+        assert!(e.from.starts_with("typical of"), "{}", e.from);
+        let e = db.estimate(Some(("@dapp/new", "vitest run")), Some("test"), "vitest", None).unwrap().unwrap();
+        assert!(e.from.starts_with("typical of"), "{}", e.from);
     }
 
     #[test]
