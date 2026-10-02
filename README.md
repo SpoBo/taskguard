@@ -56,10 +56,16 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   pool, then the same program; 1.5 GB without any (`new_job_mem`). A shell
   job gets the kind of the heaviest command it runs: `sh -c "git fetch && bun
   install && bun run ci:local"` is a `ci` run.
-- **First runs wait until the one before has settled.** A new first run starts
-  only when every first run that is already running has stopped growing: its
-  memory has not risen by 10% for 20 seconds, or it has run for 2 minutes.
-  Several new jobs that each grow for minutes can no longer start together.
+- **First runs start in groups, and a group must settle.** At most a group of
+  first runs may still grow at once: one job per free core, and only as many
+  as fit in the free memory at their guess. A first run has settled when its
+  memory has not risen by 10% for 20 seconds, or when it has run for 2
+  minutes; then the next one may start. At most a group of first runs starts
+  per `learn_stagger` seconds. A first run that similar jobs finish within 5
+  seconds (`cpu_min_duration`), such as a lint, is over before it could grow:
+  it neither waits nor counts. Memory is checked for every job. With an empty
+  history, DALP's full `ci` graph took 372 s this way, against 671 s when
+  first runs went one at a time.
 - **A running job's needs follow its peak.** When a job passes its needs, its
   memory need becomes its peak plus 25% and its CPU need what it wants, so what
   it still promises to take keeps up with what it takes. The Queue shows in red

@@ -245,17 +245,17 @@ pub fn run(mut o: Opts) -> Result<i32> {
     // each grew to several GB within seconds, faster than the readings showed.
     let package = package_name(&cwd);
     let cmdline = o.cmd.join(" ");
-    let (est_mem, est_cpu, estimate_from) = if learned.runs == 0 {
+    let (est_mem, est_cpu, est_dur, estimate_from) = if learned.runs == 0 {
         let same = package.as_deref().map(|p| (p, cmdline.as_str()));
         let est = database.as_ref().and_then(|d| d.estimate(same, cls.label.as_deref(), &tool, pool.as_deref()).ok().flatten());
         let from = match &est {
             Some(e) if e.mem_kb.is_some() => e.from.clone(),
             _ => "the new_job_mem default".to_string(),
         };
-        let (m, c) = est.map(|e| (e.mem_kb, e.cpu)).unwrap_or((None, None));
-        (Some(m.unwrap_or(cfg.new_job_mem_kb)), Some(c.unwrap_or(1.0)), Some(from))
+        let (m, c, d) = est.map(|e| (e.mem_kb, e.cpu, e.dur_s)).unwrap_or((None, None, None));
+        (Some(m.unwrap_or(cfg.new_job_mem_kb)), Some(c.unwrap_or(1.0)), d, Some(from))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     let need_cpu = learned.cpu.or(est_cpu).unwrap_or(0.0).min(cpu_cap).max(min_cpu.unwrap_or(0.0));
     let need_mem = learned_mem.or(est_mem).unwrap_or(0).max(min_mem.unwrap_or(0));
@@ -320,7 +320,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
         estimate_from,
         raised_by_min: raised,
         now: o.now,
-        est_dur_s: learned.dur_s,
+        // A first run gets the duration similar jobs took: a guessed-short
+        // one does not hold other first runs back.
+        est_dur_s: learned.dur_s.or(est_dur),
         priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
         pausable: true,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -428,7 +430,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         w.bypassed_since = Some(now);
                         let _ = q.write(&q.wait_path(&w), &w);
                     }
-                    if !me.known {
+                    if !me.known && !queue::short(&limits, &me) {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
                     me.started_at = Some(now);

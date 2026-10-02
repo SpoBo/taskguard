@@ -159,6 +159,9 @@ pub struct GroupReading {
 pub struct Estimate {
     pub mem_kb: Option<u64>,
     pub cpu: Option<f64>,
+    /// The 75th percentile of how long they took: a first run guessed to
+    /// end within seconds does not hold other first runs back.
+    pub dur_s: Option<f64>,
     pub from: String,
 }
 
@@ -424,15 +427,15 @@ impl Db {
         tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
         for (same, l, p, t, what) in tiers {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT max(peak_mem_kb), avg(cores_wanted) FROM runs
+                "SELECT max(peak_mem_kb), avg(cores_wanted), avg(ended_at - started_at - coalesce(paused_s, 0)) FROM runs
                  WHERE peak_mem_kb > 0 AND ended_at > ?1
                    AND (?2 IS NULL OR label = ?2) AND (?3 IS NULL OR pool = ?3) AND (?4 IS NULL OR cmd LIKE ?4 || '%')
                    AND (?5 IS NULL OR (package = ?5 AND cmd = ?6))
                  GROUP BY key",
             )?;
             let (pkg, cmd) = same.unzip();
-            let rows: Vec<(i64, Option<f64>)> = stmt
-                .query_map(params![since, l, p, t, pkg, cmd], |r| Ok((r.get(0)?, r.get(1)?)))?
+            let rows: Vec<(i64, Option<f64>, Option<f64>)> = stmt
+                .query_map(params![since, l, p, t, pkg, cmd], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<std::result::Result<_, _>>()?;
             if rows.is_empty() {
                 continue;
@@ -446,8 +449,9 @@ impl Db {
             };
             let mem = pct(rows.iter().map(|r| r.0 as f64).collect(), 0.9).map(|m| m as u64);
             let cpu = pct(rows.iter().filter_map(|r| r.1).collect(), 0.75);
+            let dur_s = pct(rows.iter().filter_map(|r| r.2).collect(), 0.75);
             let from = if same.is_some() { format!("the {what}") } else { format!("typical of {} {what}", rows.len()) };
-            return Ok(Some(Estimate { mem_kb: mem, cpu, from }));
+            return Ok(Some(Estimate { mem_kb: mem, cpu, dur_s, from }));
         }
         Ok(None)
     }
@@ -731,6 +735,7 @@ mod tests {
         assert_eq!(e.mem_kb, Some(4200), "the 90th percentile of ten peaks: the highest");
         assert_eq!(e.cpu.map(|c| (c * 10.0).round() / 10.0), Some(1.7), "CPU: the 75th percentile");
         assert_eq!(e.from, "typical of 10 typecheck jobs");
+        assert!(e.dur_s.is_some_and(|d| (4.0..6.0).contains(&d)), "the duration they took: {:?}", e.dur_s);
         let e = db.estimate(None, Some("ci"), "sh", Some("throttle-suite")).unwrap().unwrap();
         assert_eq!((e.mem_kb, e.from.as_str()), (Some(12_000_000), "typical of 2 ci throttle-suite jobs"));
         let e = db.estimate(None, None, "sh", Some("throttle-suite")).unwrap().unwrap();

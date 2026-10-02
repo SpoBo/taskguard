@@ -713,24 +713,33 @@ impl Room {
                 blockers.push(Blocker::Slots { pool: job.pool.clone().unwrap_or_default(), busy: holders.len() as u32, max, holders });
             }
         }
-        // Jobs with no history start in small batches, and a batch only starts
-        // once the jobs of the one before have run for `learn_stagger` seconds.
-        // Their needs are estimates until then, and the readings need time to show
-        // what the new jobs really take. A batch is as large as the free room
-        // allows: one job per free core, and as many as fit in the free memory at
-        // this job's estimated need.
-        if job.guessed()
-            && let Some((r, wait_s)) = running.iter().filter_map(|r| r.settling_for(now).map(|w| (r, w))).min_by(|a, b| a.1.total_cmp(&b.1))
-        {
-            blockers.push(Blocker::Settling { key: r.key.clone(), wait_s });
-        }
-        if !job.known && !job.raised_by_min {
-            let recent: Vec<f64> = unknown_starts.iter().copied().filter(|t| now - t < lim.learn_stagger).collect();
+        // Jobs with no history start in small groups. Their needs are guesses
+        // until they have run a while, and the readings need time to show what
+        // they really take. A group is as large as the free room allows: one
+        // job per free core, and as many as fit in the free memory at this
+        // job's guess. Two rules hold it to that size:
+        // - At most a group of first runs may still be growing at once; one
+        //   that has stopped growing (or has ended) makes room for the next.
+        // - At most a group of first runs starts per `learn_stagger` seconds.
+        // A first run guessed to end within `cpu_min_duration` (a lint that
+        // similar jobs finish in a second) is over before it could grow, so it
+        // neither waits nor counts. Memory is still checked for it.
+        if !job.known && !job.raised_by_min && !short(lim, job) {
             let free_cpu = self.cpu_limit - m.cpu_busy - self.res_cpu;
             let free_mem_kb = self.mem_limit - (self.mem_used + self.res_mem) as f64;
             let per_job_kb = job.need_mem_kb.max(512 * 1024) as f64;
-            let batch = free_cpu.min(free_mem_kb / per_job_kb).floor().max(1.0) as usize;
-            if !recent.is_empty() && recent.len() >= batch {
+            let group = free_cpu.min(free_mem_kb / per_job_kb).floor().max(1.0) as usize;
+            if job.guessed() {
+                let growing: Vec<(&Entry, f64)> =
+                    running.iter().filter(|r| !short(lim, r)).filter_map(|r| r.settling_for(now).map(|w| (r, w))).collect();
+                if growing.len() >= group
+                    && let Some((r, wait_s)) = growing.iter().min_by(|a, b| a.1.total_cmp(&b.1))
+                {
+                    blockers.push(Blocker::Settling { key: r.key.clone(), wait_s: *wait_s });
+                }
+            }
+            let recent: Vec<f64> = unknown_starts.iter().copied().filter(|t| now - t < lim.learn_stagger).collect();
+            if !recent.is_empty() && recent.len() >= group {
                 let newest = recent.iter().copied().fold(f64::MIN, f64::max);
                 blockers.push(Blocker::LearnStagger { wait_s: (lim.learn_stagger - (now - newest)).max(0.0) });
             }
@@ -783,7 +792,7 @@ impl Room {
 /// A job that usually ends within a few seconds is over before the CPU
 /// reading could react to it, so holding it back only makes it late. Too
 /// little CPU only slows a job down; memory stays a hard rule for all.
-fn short(lim: &Limits, job: &Entry) -> bool {
+pub fn short(lim: &Limits, job: &Entry) -> bool {
     job.est_dur_s.is_some_and(|d| d < lim.cpu_min_duration)
 }
 
@@ -1140,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn a_first_run_waits_until_running_first_runs_settle() {
+    fn a_first_run_waits_while_a_group_of_first_runs_still_grows() {
         // A first run started at 1000 and still grows; its memory last rose at 1030.
         let mut growing = job(1, "packages/ci:run", 1.0, 2);
         growing.known = false;
@@ -1150,20 +1159,31 @@ mod tests {
         me.known = false;
         let r = std::slice::from_ref(&growing);
         let w = std::slice::from_ref(&me);
-        let d = decide(&machine(1.0, 4), &LIM, r, w, &me, 1040.0, &[]);
+        // With room for many, a group of first runs may grow side by side.
+        assert!(blockers(decide(&machine(1.0, 4), &LIM, r, w, &me, 1040.0, &[])).is_empty());
+        // 10 of 12 cores busy: the group is one job, and that one still grows.
+        let full = machine(10.0, 4);
+        let d = decide(&full, &LIM, r, w, &me, 1040.0, &[]);
         assert_eq!(blockers(d.clone()), vec!["learning"]);
         assert!(
             matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Settling { wait_s, .. } if (*wait_s - 10.0).abs() < 1e-9))
         );
         // Steady for 20 s: it has shown what it takes.
-        assert!(blockers(decide(&machine(1.0, 4), &LIM, r, w, &me, 1051.0, &[])).is_empty());
+        assert!(blockers(decide(&full, &LIM, r, w, &me, 1051.0, &[])).is_empty());
         // Still growing, but past two minutes: it no longer holds new jobs back.
         let mut late = growing.clone();
         late.mem_grew_at = Some(1119.0);
-        assert!(blockers(decide(&machine(1.0, 4), &LIM, std::slice::from_ref(&late), w, &me, 1121.0, &[])).is_empty());
+        assert!(blockers(decide(&full, &LIM, std::slice::from_ref(&late), w, &me, 1121.0, &[])).is_empty());
         // A job with history is never held back by the rule.
         let known = job(3, "old", 1.0, 1);
-        assert!(blockers(decide(&machine(1.0, 4), &LIM, r, std::slice::from_ref(&known), &known, 1040.0, &[])).is_empty());
+        assert!(blockers(decide(&full, &LIM, r, std::slice::from_ref(&known), &known, 1040.0, &[])).is_empty());
+        // A first run guessed to end within seconds neither waits nor counts.
+        let mut lint = me.clone();
+        lint.est_dur_s = Some(1.0);
+        assert!(blockers(decide(&full, &LIM, r, std::slice::from_ref(&lint), &lint, 1040.0, &[])).is_empty());
+        let mut short_growing = growing.clone();
+        short_growing.est_dur_s = Some(1.0);
+        assert!(blockers(decide(&full, &LIM, std::slice::from_ref(&short_growing), w, &me, 1040.0, &[])).is_empty());
     }
 
     #[test]
