@@ -420,12 +420,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &q.unknown_starts());
                 let forced = started_by_hand || matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
                 if matches!(decision, Decision::Admit { .. }) || forced {
-                    // Every older job that is still waiting has now been passed,
-                    // unless it waits because this one has a higher priority
-                    // or belongs to an older run.
-                    for w in waiting.iter().filter(|w| {
-                        w.ticket < me.ticket && w.priority >= me.priority && !queue::runs_before(&me, w) && w.bypassed_since.is_none()
-                    }) {
+                    // Every job ahead in line that is still waiting has now
+                    // been passed.
+                    for w in waiting.iter().filter(|w| w.ahead_of(&me) && w.bypassed_since.is_none()) {
                         let mut w = w.clone();
                         w.bypassed_since = Some(now);
                         let _ = q.write(&q.wait_path(&w), &w);

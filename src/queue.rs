@@ -104,10 +104,32 @@ impl Entry {
 }
 
 impl Entry {
-    /// Is `self` ahead of `other` in line: a higher priority, or the same
-    /// priority and an older ticket.
+    /// When this job's place in line was taken: when its task-runner run
+    /// queued its first job, or for a job outside any run, when it queued.
+    fn line_since(&self) -> f64 {
+        match (&self.pipeline, self.pipeline_since) {
+            (Some(_), Some(since)) => since,
+            _ => self.queued_at,
+        }
+    }
+
+    /// Is `self` ahead of `other` in line? The one order every rule that holds
+    /// a job back for another follows: a higher priority, then the older run
+    /// (a job outside any run counts from when it queued), then the older
+    /// ticket. Every hold points from a job to one behind it in this fixed
+    /// order, so jobs can never wait for each other in a circle.
     pub fn ahead_of(&self, other: &Entry) -> bool {
-        self.priority > other.priority || (self.priority == other.priority && self.ticket < other.ticket)
+        self.line_order(other).is_lt()
+    }
+
+    /// The order behind `ahead_of`, for sorting.
+    pub fn line_order(&self, other: &Entry) -> std::cmp::Ordering {
+        self.priority
+            .cmp(&other.priority)
+            .reverse()
+            .then_with(|| self.line_since().total_cmp(&other.line_since()))
+            .then_with(|| self.ticket.cmp(&other.ticket))
+            .then_with(|| self.pid.cmp(&other.pid))
     }
 }
 
@@ -501,9 +523,9 @@ pub fn decide(
     now: f64,
     unknown_starts: &[f64],
 ) -> Decision {
-    // Jobs ahead in line: a higher priority first, then the oldest.
+    // Jobs ahead in line, first in line first.
     let mut older: Vec<&Entry> = waiting.iter().filter(|w| w.ahead_of(me)).collect();
-    older.sort_by_key(|w| (std::cmp::Reverse(w.priority), w.ticket));
+    older.sort_by(|a, b| a.line_order(b));
 
     // The kernel's own alarm comes first and holds back every job, even when
     // taskguard runs nothing: then the pressure comes from other programs, and
@@ -536,12 +558,12 @@ pub fn decide(
     // itself: a job that waits for memory cannot use the room it would hold,
     // so newer jobs that fit may start meanwhile. Past `max_backfill` it holds
     // its turn anyway, so a stream of small jobs cannot keep it out forever.
-    // A job of an older run is not held back for one of a newer run: that
-    // run goes second anyway, and the two rules would wait for each other.
+    // Only a job ahead in line holds `me` back, so a job of an older run is
+    // never held back for one of a newer run, or for a job that queued after
+    // that run began.
     if let Some(r) = older.iter().find(|w| {
         let waited = now - w.queued_at;
-        !runs_before(me, w)
-            && w.bypassed_since.is_some()
+        w.bypassed_since.is_some()
             && waited > lim.max_bypass
             && (waited > lim.max_backfill || room.blockers(m, lim, running, w, now, unknown_starts).is_empty())
     }) {
@@ -568,12 +590,7 @@ pub fn decide(
     // one run finishes before the next one takes the room: twenty runs that
     // each move a little finish later than twenty runs in turn. A job of the
     // older run that cannot start holds nothing back, so no room is wasted.
-    if let Some(o) = waiting.iter().find(|w| {
-        w.ticket != me.ticket
-            && w.priority >= me.priority
-            && runs_before(w, me)
-            && room.blockers(m, lim, running, w, now, unknown_starts).is_empty()
-    }) {
+    if let Some(o) = older.iter().find(|w| runs_before(w, me) && room.blockers(m, lim, running, w, now, unknown_starts).is_empty()) {
         blockers.push(Blocker::Pipeline { key: o.key.clone(), pipeline: o.pipeline.clone().unwrap_or_default() });
     }
     blockers.extend(room.blockers(m, lim, running, me, now, unknown_starts));
@@ -1399,6 +1416,87 @@ mod tests {
         // A job outside any run is still held back by the reservation.
         let other = job(4, "other", 1.0, 1);
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &[passed, other.clone()], &other, 1000.0, &[])), vec!["reserved"]);
+    }
+
+    /// The circle seen with several DALP gates at once, all three jobs fitting:
+    /// a job outside any run held a job of an older run by its reservation,
+    /// that job held a job of a newer run by the run rule, and the newer run's
+    /// job held the first one by its own reservation. Nothing started.
+    #[test]
+    fn a_reservation_and_an_older_run_never_wait_for_each_other_in_a_circle() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        let mut older_run = in_run(job(4, "a:test", 1.0, 1), "turbo:10", 800.0);
+        older_run.queued_at = 950.0;
+        let mut newer_run = in_run(job(2, "b:test", 1.0, 1), "turbo:20", 900.0);
+        newer_run.queued_at = 905.0;
+        newer_run.bypassed_since = Some(906.0);
+        let mut outside = job(3, "gate", 1.0, 1);
+        outside.queued_at = 910.0;
+        outside.bypassed_since = Some(911.0);
+        let waiting = [older_run.clone(), newer_run.clone(), outside.clone()];
+        let lim = Limits { max_backfill: 1800.0, ..LIM };
+        let m = machine(1.0, 8);
+        // The older run's job is first in line, and starts.
+        assert!(blockers(decide(&m, &lim, r, &waiting, &older_run, 1300.0, &[])).is_empty());
+        // The others wait for jobs ahead of them, never for one behind.
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &newer_run, 1300.0, &[])), vec!["pipeline"]);
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &outside, 1300.0, &[])), vec!["reserved"]);
+    }
+
+    /// Whatever the queue holds, a job is only ever held back for a job ahead
+    /// of it in line, so there is no circle; and when every waiter fits, the
+    /// first in line starts.
+    #[test]
+    fn every_hold_points_to_a_job_ahead_in_line() {
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let lim = Limits { max_backfill: 1800.0, ..LIM };
+        for case in 0..2000 {
+            let running = job(1000, "r", 1.0, 1);
+            let r = std::slice::from_ref(&running);
+            let waiting: Vec<Entry> = (0..2 + next(5))
+                .map(|i| {
+                    let mut e = job(1 + next(50), &format!("j{i}"), 1.0, 1 + next(2) * 29 * next(2));
+                    e.pid = i as i32;
+                    e.queued_at = 900.0 + next(300) as f64;
+                    e.priority = (next(5) == 0) as i32;
+                    if next(2) == 0 {
+                        e.bypassed_since = Some(e.queued_at + 1.0);
+                    }
+                    if next(3) != 0 {
+                        let run = next(3);
+                        e = in_run(e, &format!("turbo:{run}"), 700.0 + run as f64 * 100.0);
+                    }
+                    e
+                })
+                .collect();
+            let m = machine(1.0, 2);
+            let now = 900.0 + next(2400) as f64;
+            for me in &waiting {
+                if let Decision::Wait { blockers } = decide(&m, &lim, r, &waiting, me, now, &[]) {
+                    for b in blockers {
+                        let holder = match b {
+                            Blocker::Older { key }
+                            | Blocker::Reserved { key, .. }
+                            | Blocker::Priority { key, .. }
+                            | Blocker::Pipeline { key, .. } => key,
+                            _ => continue,
+                        };
+                        let holder = waiting.iter().find(|w| w.key == holder).unwrap();
+                        assert!(holder.ahead_of(me), "case {case}: {} holds back {}, which is ahead of it", holder.key, me.key);
+                    }
+                }
+            }
+            let fits: Vec<&Entry> = waiting.iter().filter(|w| w.need_mem_kb == GB).collect();
+            if fits.len() == waiting.len() {
+                let head = waiting.iter().min_by(|a, b| a.line_order(b)).unwrap();
+                assert!(blockers(decide(&m, &lim, r, &waiting, head, now, &[])).is_empty(), "case {case}: the first in line must start");
+            }
+        }
     }
 
     #[test]
