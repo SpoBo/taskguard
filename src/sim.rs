@@ -146,10 +146,8 @@ fn run_in(s: &Scenario, lim: &Limits, run_of: impl Fn(usize) -> Option<(String, 
                 if !me.known {
                     starts.push(t);
                 }
-                // Every older job that still waits has now been passed.
-                for w in
-                    waiting.iter_mut().filter(|w| w.ticket < me.ticket && !crate::queue::runs_before(&me, w) && w.bypassed_since.is_none())
-                {
+                // Every job ahead in line that still waits has now been passed.
+                for w in waiting.iter_mut().filter(|w| w.ahead_of(&me) && w.bypassed_since.is_none()) {
                     w.bypassed_since = Some(t);
                 }
                 out.started[me.ticket as usize - 1] = Some(t);

@@ -102,7 +102,13 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   older run that does not fit holds nothing back, so no room is left idle.
   Priorities still come first.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
-  (`max_bypass`) gets a reservation. Nothing newer starts until it has started.
+  (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
+  has started.
+- **One line, no circles.** Every rule that holds a job back for another
+  follows one fixed order: a higher priority, then the older run (a job outside
+  any run counts from when it queued), then the older ticket. A job only ever
+  waits for a job ahead of it, so jobs cannot wait for each other in a circle
+  while the room they need sits free.
 - **Backfill, if you ask for it.** A reservation for a job that does not fit
   holds room it cannot use: a 29 GB compile that waits for memory keeps a
   0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
