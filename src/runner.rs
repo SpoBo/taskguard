@@ -376,10 +376,15 @@ pub fn run(mut o: Opts) -> Result<i32> {
         let mut last_line = t0;
         let mut span: Option<(String, String, f64)> = None;
         let mut started_by_hand = false;
+        let mut watch = queue::StallWatch::default();
         loop {
             if let Some(s) = sig.any() {
                 cleanup_files(&q, &me);
                 if let Some(d) = &database {
+                    // A job killed while it waits keeps what it waited for.
+                    if let Some((n, detail, from)) = &span {
+                        let _ = d.wait_span(run_id, *from, db::now(), n, detail);
+                    }
                     let _ = d.abandon_run(run_id);
                 }
                 return Ok(128 + s);
@@ -417,7 +422,24 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     w.need_cpu = me.need_cpu;
                     w.need_mem_kb = me.need_mem_kb;
                 }
-                decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &q.unknown_starts());
+                let unknown_starts = q.unknown_starts();
+                decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &unknown_starts);
+                if let Some(w) = watch.step(&m, &limits, &running, &waiting, &me, &decision, now, &unknown_starts) {
+                    let note = queue::Stall {
+                        at: now,
+                        by_pid: me_pid,
+                        by_key: me.key.clone(),
+                        key: w.key.clone(),
+                        pid: w.pid,
+                        version: w.version.clone(),
+                        waited_s: now - w.queued_at,
+                        blocker: w.blocker.clone(),
+                        blocker_since: w.blocker_since,
+                    };
+                    if q.mark_stalled(w, &note).is_ok() {
+                        say(&report::stall_text(&note));
+                    }
+                }
                 let forced = started_by_hand || matches!(o.timeout, Some(t) if t > 0.0 && now - t0 >= t);
                 if matches!(decision, Decision::Admit { .. }) || forced {
                     // Every job ahead in line that is still waiting has now

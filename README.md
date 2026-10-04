@@ -109,6 +109,14 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   any run counts from when it queued), then the older ticket. A job only ever
   waits for a job ahead of it, so jobs cannot wait for each other in a circle
   while the room they need sits free.
+- **No waiting for a job that does not start.** A job ahead in line that may
+  start does so within a tenth of a second. One that could start by these
+  rules but still waits after 10 seconds has an owner that decides by other
+  rules (an older taskguard, see Mixed versions) or not at all (stopped with
+  Ctrl-Z). The job behind it marks it as stalled, says so with what the owner
+  itself reports it waits for, and from then on no job waits for it. It may
+  still start by itself. `taskguard status` shows the mark, and what an owner
+  says when that differs from what it should do.
 - **Backfill, if you ask for it.** A reservation for a job that does not fit
   holds room it cannot use: a 29 GB compile that waits for memory keeps a
   0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
@@ -453,6 +461,7 @@ Everything lives in `~/.cache/taskguard` (or `TASKGUARD_DIR`):
 | Path | What it is |
 | --- | --- |
 | `wait/`, `run/` | One file per waiting or running job, named after its process |
+| `stall/` | One file per stalled waiting job: who saw it, and what its owner said it waited for |
 | `lock` | The queue lock; the kernel releases it when a process dies |
 | `machine` | The shared machine reading |
 | `taskguard.db` | Runs, samples and rollups (SQLite) |
@@ -486,6 +495,14 @@ know runs: its jobs never step aside for an older run. A version before
 read priorities: its waiting jobs start in ticket order and do not step aside
 for a job with a higher priority. It does not know auto_pause either: its jobs
 are never paused, and its waiting jobs may start while another job is paused.
+
+Versions before 0.4.1 keep the line in ticket order; 0.4.1 and later order it
+by the age of a job's run first. With nothing running, an old and a new owner
+can each see the other as the job first in line and wait for it, and nothing
+starts. In versions after 0.4.1 the waiting job behind such a pair marks the
+one that does not start as stalled after 10 seconds and passes it. Two jobs of
+0.4.1 or older can still wait for each other until a job of a newer version
+queues or until one of them is stopped.
 
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each

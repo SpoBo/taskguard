@@ -94,6 +94,11 @@ pub struct Entry {
     /// Older versions leave both out, and their jobs never step aside.
     pub pipeline: Option<String>,
     pub pipeline_since: Option<f64>,
+    /// Another job saw this one able to start for `STALL_S` while it still
+    /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
+    /// from the queue, never written into the entry.
+    #[serde(skip)]
+    pub stalled: bool,
 }
 
 impl Entry {
@@ -188,7 +193,7 @@ pub struct Guard {
 
 impl Queue {
     pub fn open(dir: &Path) -> Result<Queue> {
-        for d in ["wait", "run", "viewers", "nudge", "pipeline"] {
+        for d in ["wait", "run", "viewers", "nudge", "pipeline", "stall"] {
             fs::create_dir_all(dir.join(d)).with_context(|| format!("creating {}", dir.join(d).display()))?;
         }
         Ok(Queue { dir: dir.to_path_buf() })
@@ -225,6 +230,20 @@ impl Queue {
         }
         let _ = fs::write(&path, now.to_string());
         now
+    }
+
+    fn stall_path(&self, e: &Entry) -> PathBuf {
+        self.dir.join("stall").join(format!("{}.{}", e.ticket, e.pid))
+    }
+
+    /// Mark a waiting job as stalled: from now on it holds no job back. The
+    /// mark stays until the job leaves the queue.
+    pub fn mark_stalled(&self, e: &Entry, note: &Stall) -> Result<()> {
+        let path = self.stall_path(e);
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        fs::write(&tmp, serde_json::to_string(note)?)?;
+        fs::rename(&tmp, &path)?;
+        Ok(())
     }
 
     fn nudge_path(&self, pid: i32) -> PathBuf {
@@ -278,7 +297,11 @@ impl Queue {
     }
 
     pub fn waiting(&self) -> Vec<Entry> {
-        self.read_dir("wait").into_iter().map(|(_, e)| e).collect()
+        let mut v: Vec<Entry> = self.read_dir("wait").into_iter().map(|(_, e)| e).collect();
+        for e in &mut v {
+            e.stalled = self.stall_path(e).exists();
+        }
+        v
     }
 
     pub fn running(&self) -> Vec<Entry> {
@@ -313,6 +336,14 @@ impl Queue {
                 }
                 if owner.is_some_and(|pid| !alive(pid)) {
                     let _ = fs::remove_file(&p);
+                }
+            }
+        }
+        // stall/<ticket>.<pid>: the mark goes when the job leaves the queue.
+        if let Ok(rd) = fs::read_dir(self.dir.join("stall")) {
+            for f in rd.filter_map(|e| e.ok()) {
+                if !self.dir.join("wait").join(f.file_name()).exists() {
+                    let _ = fs::remove_file(f.path());
                 }
             }
         }
@@ -532,7 +563,8 @@ pub fn decide(
     unknown_starts: &[f64],
 ) -> Decision {
     // Jobs ahead in line, first in line first.
-    let mut older: Vec<&Entry> = waiting.iter().filter(|w| w.ahead_of(me)).collect();
+    // A stalled job holds nobody back: it does not start whatever we wait.
+    let mut older: Vec<&Entry> = waiting.iter().filter(|w| !w.stalled && w.ahead_of(me)).collect();
     older.sort_by(|a, b| a.line_order(b));
 
     // The kernel's own alarm comes first and holds back every job, even when
@@ -613,6 +645,101 @@ pub fn decide(
     } else {
         Decision::Wait { blockers }
     }
+}
+
+// ----------------------------------------------------------------- stall ----
+
+/// A job ahead in line that may start does so within one poll. One that may
+/// start by these rules, yet still waits this long, has an owner that decides
+/// by other rules or not at all, and holds the queue up for nothing.
+pub const STALL_S: f64 = 10.0;
+
+/// The first job ahead of `me` in line that these rules would start now.
+pub fn startable_ahead<'a>(
+    m: &MachineSample,
+    lim: &Limits,
+    running: &[Entry],
+    waiting: &'a [Entry],
+    me: &Entry,
+    now: f64,
+    unknown_starts: &[f64],
+) -> Option<&'a Entry> {
+    let mut ahead: Vec<&Entry> = waiting.iter().filter(|w| !w.stalled && w.ahead_of(me)).collect();
+    ahead.sort_by(|a, b| a.line_order(b));
+    ahead.into_iter().find(|w| matches!(decide(m, lim, running, waiting, w, now, unknown_starts), Decision::Admit { .. }))
+}
+
+/// Watches, for one waiting job, the job ahead that could start but does not.
+///
+/// Its owner may keep the line in another order: taskguard 0.4.0 and older
+/// order it by ticket, 0.4.1 and later by the age of a job's run. With
+/// nothing running, an old and a new owner can each wait for the other as
+/// the older job, and nothing starts until one of them ends. Or its owner
+/// does not decide at all (stopped with Ctrl-Z). Either way, waiting for it
+/// gains nothing.
+#[derive(Debug, Default)]
+pub struct StallWatch {
+    /// Ticket, pid, and since when it could start.
+    suspect: Option<(u64, i32, f64)>,
+}
+
+impl StallWatch {
+    /// The job to mark as stalled: while `me` is held back for jobs ahead in
+    /// line, the first of them that could start has not, for `STALL_S`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step<'a>(
+        &mut self,
+        m: &MachineSample,
+        lim: &Limits,
+        running: &[Entry],
+        waiting: &'a [Entry],
+        me: &Entry,
+        d: &Decision,
+        now: f64,
+        unknown_starts: &[f64],
+    ) -> Option<&'a Entry> {
+        let held = match d {
+            Decision::Wait { blockers } => blockers.iter().any(|b| {
+                matches!(b, Blocker::Older { .. } | Blocker::Reserved { .. } | Blocker::Priority { .. } | Blocker::Pipeline { .. })
+            }),
+            Decision::Admit { .. } => false,
+        };
+        let Some(w) = held.then(|| startable_ahead(m, lim, running, waiting, me, now, unknown_starts)).flatten() else {
+            self.suspect = None;
+            return None;
+        };
+        match self.suspect {
+            Some((ticket, pid, since)) if ticket == w.ticket && pid == w.pid => {
+                if now - since < STALL_S {
+                    return None;
+                }
+                self.suspect = None;
+                Some(w)
+            }
+            _ => {
+                self.suspect = Some((w.ticket, w.pid, now));
+                None
+            }
+        }
+    }
+}
+
+/// What the job that marked another as stalled saw, in `stall/<ticket>.<pid>`:
+/// the trace a stall leaves behind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Stall {
+    pub at: f64,
+    /// The waiting job that saw it.
+    pub by_pid: i32,
+    pub by_key: String,
+    /// The stalled job, and what its own owner said it waits for.
+    pub key: String,
+    pub pid: i32,
+    pub version: Option<String>,
+    pub waited_s: f64,
+    pub blocker: Option<String>,
+    pub blocker_since: Option<f64>,
 }
 
 // ----------------------------------------------------------------- pause ----
@@ -1536,6 +1663,173 @@ mod tests {
                 assert!(blockers(decide(&m, &lim, r, &waiting, head, now, &[])).is_empty(), "case {case}: the first in line must start");
             }
         }
+    }
+
+    /// How the owner of a waiting job decides.
+    #[derive(Clone, Copy)]
+    enum Owner {
+        /// This version: `decide`, with a `StallWatch` on the jobs ahead.
+        This,
+        /// taskguard 0.4.0 and older, which keep the line in ticket order.
+        /// Only their rule for an empty machine is modelled: these replays
+        /// stop when the first job starts.
+        TicketOrder,
+    }
+
+    /// Owners of waiting jobs poll every 100 ms while nothing runs, and a job
+    /// a watch reports gets marked stalled, as the runner does. Returns the
+    /// first job that starts and after how long, or None within 120 s.
+    fn replay_mixed(m: &MachineSample, mut waiting: Vec<(Entry, Owner)>) -> Option<(String, f64)> {
+        let lim = Limits { max_backfill: 1800.0, ..LIM };
+        let mut watches: Vec<StallWatch> = waiting.iter().map(|_| StallWatch::default()).collect();
+        let mut t = 2000.0;
+        while t < 2120.0 {
+            for i in 0..waiting.len() {
+                let entries: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
+                let (me, owner) = waiting[i].clone();
+                let start = match owner {
+                    Owner::This => {
+                        let d = decide(m, &lim, &[], &entries, &me, t, &[]);
+                        if let Some(s) = watches[i].step(m, &lim, &[], &entries, &me, &d, t, &[]) {
+                            let (ticket, pid) = (s.ticket, s.pid);
+                            waiting.iter_mut().filter(|(e, _)| e.ticket == ticket && e.pid == pid).for_each(|(e, _)| e.stalled = true);
+                        }
+                        matches!(d, Decision::Admit { .. })
+                    }
+                    Owner::TicketOrder => {
+                        !entries.iter().any(|w| w.priority > me.priority || (w.priority == me.priority && w.ticket < me.ticket))
+                    }
+                };
+                if start {
+                    return Some((me.key, t - 2000.0));
+                }
+            }
+            t += 0.1;
+        }
+        None
+    }
+
+    fn queued(ticket: u64, key: &str, queued_at: f64, pid: i32) -> Entry {
+        Entry { pid, queued_at, ..job(ticket, key, 1.0, 1) }
+    }
+
+    /// The stall of 2026-10-04 16:11 on a DALP Mac, with nothing running and
+    /// room to spare. host/ddwf and host/dapi belong to a turbo run that began
+    /// before the others queued, and their owners ran taskguard 0.4.0: by
+    /// ticket they wait for the solhint job. The solhint and dashboard jobs ran
+    /// 0.4.1: by run age they wait for host/ddwf. Nothing started for five
+    /// minutes, until host/ddwf was killed.
+    #[test]
+    fn a_head_whose_owner_keeps_another_order_holds_nobody_up() {
+        let ddwf = in_run(queued(3, "host/ddwf:tsc", 1003.0, 30), "turbo:9", 900.0);
+        let dapi = in_run(queued(5, "host/dapi:oxlint", 1010.0, 50), "turbo:9", 900.0);
+        let solhint = queued(2, "onchain/evm:solhint", 1002.0, 20);
+        let lint = queued(4, "web/dashboard:oxlint", 1003.0, 40);
+        let m = MachineSample::fixed(3.5, 10, 19 * GB, 32 * GB);
+        let waiting = vec![(ddwf, Owner::TicketOrder), (solhint, Owner::This), (lint, Owner::This), (dapi, Owner::TicketOrder)];
+        let (key, after) = replay_mixed(&m, waiting).expect("a job starts");
+        // Both 0.4.0 jobs ahead are passed, one after the other.
+        assert_eq!(key, "onchain/evm:solhint");
+        assert!(after <= 2.0 * STALL_S + 1.0, "started after {after:.1}s");
+    }
+
+    /// The stall of 2026-10-04 15:44 on the same Mac: an 8 GB integration run
+    /// (0.4.1) that did not fit next to 19.7 GB held outside taskguard. Once
+    /// nothing ran it should have started anyway, but by run age it waited
+    /// for host/legacy-graph, and that job's owner (0.4.0) waited for it by
+    /// ticket. Everything else waited behind the two for 24 minutes.
+    #[test]
+    fn an_integration_run_that_does_not_fit_still_starts_when_nothing_runs() {
+        let mut integration = queued(1, "root:run-integration", 937.0, 10);
+        integration.need_mem_kb = 8 * GB;
+        integration.raised_by_min = true;
+        integration.pool = Some("integration".into());
+        integration.pool_key = Some("integration".into());
+        integration.pool_slots = Some(1);
+        let graph = in_run(queued(3, "host/legacy-graph:vitest", 1040.0, 30), "turbo:8", 800.0);
+        let vitest = in_run(queued(4, "host/dapi:vitest", 1041.0, 40), "turbo:8", 800.0);
+        let waiting = vec![
+            (integration, Owner::This),
+            (queued(2, "root:lint-ast-grep", 938.0, 20), Owner::TicketOrder),
+            (graph, Owner::TicketOrder),
+            (vitest, Owner::TicketOrder),
+            (queued(5, "e2e/dapi-testkit:tsc", 1044.0, 50), Owner::This),
+            (queued(6, "e2e/agentic:tsc", 1044.0, 60), Owner::This),
+        ];
+        let m = MachineSample::fixed(2.0, 10, 19 * GB + 7 * GB / 10, 32 * GB);
+        let (key, after) = replay_mixed(&m, waiting).expect("a job starts");
+        assert_eq!(key, "root:run-integration");
+        assert!(after <= 2.0 * STALL_S + 1.0, "started after {after:.1}s");
+    }
+
+    /// A job that cannot fit even with no job of taskguard running (other
+    /// programs hold too much) neither stops jobs that fit nor waits forever:
+    /// they pass it for `max_backfill`, then its reservation drains the queue
+    /// and it starts alone.
+    #[test]
+    fn a_job_that_can_never_fit_neither_blocks_the_queue_nor_waits_forever() {
+        let lim = Limits { max_bypass: 60.0, max_backfill: 300.0, ..LIM };
+        let other = 19 * GB + 7 * GB / 10;
+        let mut head = job(1, "root:run-integration", 1.0, 8);
+        head.queued_at = 0.0;
+        let mut waiting = vec![head];
+        // A compile already runs, so the head cannot start on an empty machine.
+        let mut compile = job(100_000, "compile", 1.0, 2);
+        compile.live_mem_kb = 2 * GB;
+        let mut running: Vec<(Entry, f64)> = vec![(compile, 60.0)];
+        let mut started: Vec<(String, f64)> = Vec::new();
+        let mut t: f64 = 0.0;
+        while t < 1500.0 {
+            running.retain(|(_, end)| *end > t);
+            // A small job every 5 s for 15 minutes; each runs 20 s.
+            if t < 900.0 && t % 5.0 == 0.0 {
+                let mut e = job(2 + t as u64, &format!("lint{t}"), 1.0, 1);
+                e.queued_at = t;
+                waiting.push(e);
+            }
+            let run: Vec<Entry> = running.iter().map(|(e, _)| e.clone()).collect();
+            let m = MachineSample::fixed(run.len() as f64, 10, other + run.iter().map(|e| e.live_mem_kb).sum::<u64>(), 32 * GB);
+            let mut i = 0;
+            while i < waiting.len() {
+                let me = waiting[i].clone();
+                if matches!(decide(&m, &lim, &run, &waiting, &me, t, &[]), Decision::Admit { .. }) {
+                    for w in waiting.iter_mut().filter(|w| w.ahead_of(&me) && w.bypassed_since.is_none()) {
+                        w.bypassed_since = Some(t);
+                    }
+                    let mut e = waiting.remove(i);
+                    e.live_mem_kb = e.need_mem_kb;
+                    started.push((e.key.clone(), t));
+                    running.push((e, t + 20.0));
+                    break;
+                }
+                i += 1;
+            }
+            t += 0.5;
+        }
+        assert!(waiting.is_empty(), "every job ran");
+        let head_at = started.iter().find(|(k, _)| k == "root:run-integration").map(|(_, s)| *s).unwrap();
+        assert!(started.iter().filter(|(_, s)| *s < head_at).count() > 10, "jobs that fit pass it meanwhile");
+        assert!(head_at <= lim.max_backfill + 20.0 + 1.0, "it starts once the reservation drained the queue: {head_at}");
+    }
+
+    #[test]
+    fn a_stall_mark_is_read_with_the_queue_and_goes_with_its_job() {
+        let dir = std::env::temp_dir().join(format!("tg-stall-{}", std::process::id()));
+        let q = Queue::open(&dir).unwrap();
+        let live = std::process::id() as i32;
+        let (a, b) = (queued(1, "a", 1000.0, live), queued(2, "b", 1001.0, live));
+        q.write(&q.wait_path(&a), &a).unwrap();
+        q.write(&q.wait_path(&b), &b).unwrap();
+        q.mark_stalled(&a, &Stall { key: "a".into(), ..Default::default() }).unwrap();
+        assert_eq!(q.waiting().iter().map(|e| e.stalled).collect::<Vec<_>>(), vec![true, false]);
+        // The mark is no part of the entry its owner writes.
+        assert!(!fs::read_to_string(q.wait_path(&a)).unwrap().contains("stalled"));
+        q.reap();
+        assert!(q.waiting()[0].stalled, "kept while the job waits");
+        fs::remove_file(q.wait_path(&a)).unwrap();
+        q.reap();
+        assert_eq!(fs::read_dir(dir.join("stall")).unwrap().count(), 0, "gone with its job");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
