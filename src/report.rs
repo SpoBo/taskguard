@@ -59,6 +59,28 @@ pub fn blocker_text(b: &Blocker) -> String {
     }
 }
 
+/// The warning when a job ahead in line could start but does not.
+pub fn stall_text(s: &crate::queue::Stall) -> String {
+    let owner = match &s.version {
+        Some(v) => format!("taskguard {v}"),
+        None => "a taskguard before 0.1.3".into(),
+    };
+    let says = match (&s.blocker, s.blocker_since) {
+        (Some(b), Some(since)) => format!("its owner says: {b} (for {})", dur(s.at - since)),
+        (Some(b), None) => format!("its owner says: {b}"),
+        (None, _) => "its owner says nothing".into(),
+    };
+    format!(
+        "stalled {} (pid {}, {owner}) - it could start for {:.0}s but still waits, after {} in the queue; {says}. No job waits for it any more \
+         (seen by {}). An owner on another taskguard version may keep the line in another order",
+        s.key,
+        s.pid,
+        crate::queue::STALL_S,
+        dur(s.waited_s),
+        s.by_key
+    )
+}
+
 /// Words for a pressure reading: macOS reports levels (50 warning, 100
 /// critical), Linux the share of time tasks waited on memory.
 pub fn pressure_word(level: f64) -> &'static str {
@@ -487,10 +509,22 @@ pub fn render_status(s: &Snapshot) -> String {
         let e = &w.entry;
         let est = if e.known || e.raised_by_min { "" } else { " (est)" };
         let needs = format!("{:.1} cores, {}{est}", e.need_cpu, gb(e.need_mem_kb));
-        let blocked = match main_blocker(&w.decision) {
+        let mut blocked = match main_blocker(&w.decision) {
             Some(b) => blocker_text(b) + &w.eta_s.map(|t| format!(" ({})", eta_text(t))).unwrap_or_default(),
             None => "nothing - starting now".into(),
         };
+        // The job's owner decides for itself, maybe by the rules of another
+        // version: when it keeps waiting for something these rules do not
+        // see, say what it says.
+        if let (None, Some(own), Some(since)) = (&w.blocked_by, &e.blocker, e.blocker_since)
+            && s.now - since >= 5.0
+        {
+            let v = e.version.as_deref().map(|v| format!("taskguard {v}")).unwrap_or_else(|| "an old taskguard".into());
+            blocked += &format!("; its owner ({v}) says: {own}, for {}", dur(s.now - since));
+        }
+        if e.stalled {
+            blocked += " [stalled: holds no job back]";
+        }
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:<21} {}",
