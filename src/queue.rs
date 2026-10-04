@@ -123,7 +123,15 @@ impl Entry {
     }
 
     /// The order behind `ahead_of`, for sorting.
+    ///
+    /// The same ticket and pid is the same job, whatever its other fields say:
+    /// a job compares its own entry, read back from the wait file, with the
+    /// copy it holds, and a queue time that came back one step off must never
+    /// put a job in line before itself.
     pub fn line_order(&self, other: &Entry) -> std::cmp::Ordering {
+        if self.ticket == other.ticket && self.pid == other.pid {
+            return std::cmp::Ordering::Equal;
+        }
         self.priority
             .cmp(&other.priority)
             .reverse()
@@ -886,6 +894,37 @@ mod tests {
         assert!(!dir.join("run").join(dead.to_string()).exists());
         assert!(dir.join("run").join(live.to_string()).exists(), "a live owner keeps its entry");
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Queue times as a real clock gives them: seconds since 1970 with
+    /// sub-microsecond fractions, where float parsing is least forgiving.
+    fn clock_times() -> impl Iterator<Item = f64> {
+        (0..200_000u64).map(|i| 1_791_125_928.0 + i as f64 * 0.000_123_456_7 + (i % 97) as f64 * 1e-7)
+    }
+
+    #[test]
+    fn an_entry_read_back_is_never_ahead_of_itself() {
+        // A waiter compares its own entry, as another process wrote or read it,
+        // with the copy it holds. A queue time that comes back from JSON one
+        // step off must not put the job in line before itself.
+        for (i, t) in clock_times().enumerate() {
+            let me = Entry { ticket: i as u64, pid: 4242, key: "k".into(), queued_at: t, ..Default::default() };
+            let back: Entry = serde_json::from_str(&serde_json::to_string(&me).unwrap()).unwrap();
+            assert_eq!(back.queued_at.to_bits(), t.to_bits(), "queued_at {t:?} read back as {:?}", back.queued_at);
+            assert!(!back.ahead_of(&me) && !me.ahead_of(&back), "queued_at {t:?} put the job ahead of itself");
+        }
+    }
+
+    #[test]
+    fn a_waiter_is_never_held_back_by_its_own_entry() {
+        // Nothing runs and only this job waits: it starts, whatever its queue
+        // time looks like after a trip through the wait file.
+        for (i, t) in clock_times().step_by(97).enumerate() {
+            let me = Entry { ticket: i as u64, pid: 4242, key: "k".into(), known: true, queued_at: t, ..Default::default() };
+            let on_disk: Entry = serde_json::from_str(&serde_json::to_string(&me).unwrap()).unwrap();
+            let d = decide(&machine(0.0, 1), &LIM, &[], &[on_disk], &me, t + 1.0, &[]);
+            assert!(matches!(d, Decision::Admit { .. }), "queued_at {t:?}: {:?}", blockers(d));
+        }
     }
 
     fn job(ticket: u64, key: &str, cpu: f64, mem_gb: u64) -> Entry {
