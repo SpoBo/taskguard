@@ -119,7 +119,7 @@ pub fn eta_text(eta: f64) -> String {
 }
 
 fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
-    let remaining = |e: &Entry| e.est_dur_s.map(|d| (d - (now - e.started_at.unwrap_or(now))).max(1.0));
+    let remaining = |e: &Entry| e.remaining(now);
     let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<(String, Option<f64>)> {
         let mut rs: Vec<&Entry> = running.iter().collect();
         rs.sort_by(|a, b| remaining(a).unwrap_or(f64::MAX).total_cmp(&remaining(b).unwrap_or(f64::MAX)));
