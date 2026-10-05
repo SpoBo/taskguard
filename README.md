@@ -122,9 +122,15 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
   its turn only while it could start: until it has waited `max_backfill`
   seconds, newer jobs that fit start while it cannot, and nothing newer starts
-  once it fits. After `max_backfill` the reservation holds anyway, so a steady
-  stream of small jobs cannot keep it out. Off by default (`0`); `1800` lets
-  small jobs through for half an hour.
+  once it fits. After `max_backfill`, a newer job that fits still starts if
+  its learned duration says it ends before the reserved job could start
+  anyway: before the running jobs have freed the room it lacks, or, when
+  programs outside taskguard keep it out, before none of them runs (then the
+  first in line starts whatever the readings say). Such a job takes no room
+  the reserved one could use, so a steady stream of small jobs cannot keep it
+  out, and a lint is not held up for half an hour behind a job that waits for
+  two long test runs. A job with no learned duration waits. Off by default
+  (`0`); `1800` lets every job that fits through for half an hour.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. A slot ceiling only stops such jobs from
   running at the same time and breaking each other; CPU and memory are always

@@ -152,7 +152,11 @@ fn run_in(s: &Scenario, lim: &Limits, run_of: impl Fn(usize) -> Option<(String, 
                 }
                 out.started[me.ticket as usize - 1] = Some(t);
                 let job = s.jobs[me.ticket as usize - 1].clone();
-                running.push((me, t, job));
+                // The runner records when a job started, and backfill reads
+                // it to tell how long a job has left. First runs keep none
+                // here, so the settling rule stays out of these scenarios.
+                let started_at = me.est_dur_s.map(|_| t);
+                running.push((Entry { started_at, ..me }, t, job));
                 waiting.remove(i);
             } else {
                 i += 1;
@@ -259,6 +263,27 @@ fn steady_stream() -> Scenario {
     Scenario { name: "small jobs every 2 s keep memory full", jobs, other_mem: Box::new(|_| 4 * GB), other_cpu: Box::new(|_| 1.0) }
 }
 
+/// Two long jobs run for 30 and 40 minutes. A job queues behind them that
+/// does not fit, and 60 small jobs that do arrive over ten minutes.
+/// `by_cpu` says how the head does not fit: by CPU, with programs outside
+/// taskguard so busy that it fits only once nothing of taskguard runs, or by
+/// memory, until the first long job ends.
+fn behind_long_jobs(by_cpu: bool) -> Scenario {
+    let mut jobs = vec![known(2, 0.5, 1800.0, 0.0), known(2, 0.5, 2400.0, 0.0)];
+    jobs.push(if by_cpu { known(2, 3.0, 300.0, 1.0) } else { known(10, 1.0, 300.0, 1.0) });
+    jobs.extend((0..60).map(|i| known(1, 0.5, 30.0, 2.0 + 10.0 * i as f64)));
+    if by_cpu {
+        Scenario {
+            name: "a job that needs 3 cores, others keep 7.5 of 10 busy",
+            jobs,
+            other_mem: Box::new(|_| 8 * GB),
+            other_cpu: Box::new(|_| 7.5),
+        }
+    } else {
+        Scenario { name: "a 10 GB job, others hold 15 GB", jobs, other_mem: Box::new(|_| 15 * GB), other_cpu: Box::new(|_| 1.0) }
+    }
+}
+
 /// The longest any small job (all but the scenario's large ones) waited.
 fn worst_small_wait(s: &Scenario, o: &Outcome) -> f64 {
     s.jobs
@@ -351,6 +376,27 @@ mod tests {
         // With one, newer jobs stop at 600 s and it starts once they drain.
         assert!((600.0..600.0 + 90.0).contains(&bounded), "{bounded:.0}s");
         assert!(strict < 120.0 + 90.0, "{strict:.0}s");
+    }
+
+    #[test]
+    fn past_max_backfill_small_jobs_still_start_while_long_jobs_keep_the_head_out() {
+        for by_cpu in [true, false] {
+            let s = behind_long_jobs(by_cpu);
+            // 0.4.2 held every small job back from 300 s on, until the head
+            // had started and ended: half an hour and more.
+            let lim = Limits { max_backfill: 300.0, ..LIM };
+            let o = run(&s, &lim);
+            assert!(o.all_ran && o.started_under_pressure == 0, "{}", s.name);
+            let strict = run(&s, &LIM);
+            let (head, head_strict) = (o.started[2].unwrap(), strict.started[2].unwrap());
+            let wait = s.jobs[3..].iter().zip(&o.started[3..]).map(|(j, t)| t.unwrap() - j.arrive).fold(0.0, f64::max);
+            eprintln!("{}: head at {head:.0}s ({head_strict:.0}s strict), small jobs wait up to {wait:.0}s", s.name);
+            assert!(wait < 30.0, "{}: small jobs start as they arrive: {wait:.0}s", s.name);
+            // The head starts as soon as the long jobs have made room for it,
+            // as it does when everything newer waits for it.
+            assert!(head <= head_strict + 1.0, "{}: the head starts no later: {head:.0}s vs {head_strict:.0}s", s.name);
+            assert!(head <= if by_cpu { 2400.0 } else { 1800.0 } + 1.0, "{}: {head:.0}s", s.name);
+        }
     }
 
     #[test]

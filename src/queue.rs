@@ -106,6 +106,11 @@ impl Entry {
     pub fn auto_paused(&self) -> bool {
         self.paused_since.is_some() && !self.paused_by_hand
     }
+
+    /// Seconds a running job has left by its learned duration, at least one.
+    pub fn remaining(&self, now: f64) -> Option<f64> {
+        self.est_dur_s.map(|d| (d - (now - self.started_at.unwrap_or(now))).max(1.0))
+    }
 }
 
 impl Entry {
@@ -593,37 +598,36 @@ pub fn decide(
     let room = Room::new(m, lim, running);
 
     let mut blockers = Vec::new();
+    // With backfill on, a job ahead that goes first holds its turn only while
+    // it could start itself: a job that waits for memory cannot use the room
+    // it would hold, so newer jobs that fit may start meanwhile. Past
+    // `max_backfill` only jobs that should end before it could start anyway
+    // still do. They take no room it could use, and a stream of them cannot
+    // keep it out: it starts once the running jobs have made room for it, or
+    // when none runs, which they do not put off.
+    let holds = |w: &Entry| {
+        let theirs = room.blockers(m, lim, running, w, now, unknown_starts);
+        theirs.is_empty()
+            || now - w.queued_at > lim.max_backfill && !me.est_dur_s.zip(soonest_start(&theirs, running, now)).is_some_and(|(d, t)| d <= t)
+    };
     // An older job that newer ones have passed for `max_bypass` goes first.
-    // Within `max_backfill` it holds its turn only while it could start
-    // itself: a job that waits for memory cannot use the room it would hold,
-    // so newer jobs that fit may start meanwhile. Past `max_backfill` it holds
-    // its turn anyway, so a stream of small jobs cannot keep it out forever.
     // Only a job ahead in line holds `me` back, so a job of an older run is
     // never held back for one of a newer run, or for a job that queued after
     // that run began.
-    if let Some(r) = older.iter().find(|w| {
-        let waited = now - w.queued_at;
-        w.bypassed_since.is_some()
-            && waited > lim.max_bypass
-            && (waited > lim.max_backfill || room.blockers(m, lim, running, w, now, unknown_starts).is_empty())
-    }) {
+    if let Some(r) = older
+        .iter()
+        .find(|w| w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass && (lim.max_backfill <= lim.max_bypass || holds(w)))
+    {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
     }
     // A waiting job with a higher priority goes first, unless its own pool is
     // full: then it cannot start anyway, and holding others back gains nothing.
-    // Within `max_backfill` it holds them back only while it could start
-    // itself, as a reservation does.
+    // With backfill on, it holds them back as a reservation does.
     let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
         (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
         _ => false,
     };
-    if let Some(h) = older.iter().find(|w| {
-        w.priority > me.priority
-            && !pool_full(w)
-            && (lim.max_backfill <= 0.0
-                || now - w.queued_at > lim.max_backfill
-                || room.blockers(m, lim, running, w, now, unknown_starts).is_empty())
-    }) {
+    if let Some(h) = older.iter().find(|w| w.priority > me.priority && !pool_full(w) && (lim.max_backfill <= 0.0 || holds(w))) {
         blockers.push(Blocker::Priority { key: h.key.clone(), priority: h.priority });
     }
     // A job of an older task-runner run that could start now goes first, so
@@ -645,6 +649,16 @@ pub fn decide(
     } else {
         Decision::Wait { blockers }
     }
+}
+
+/// In how many seconds a job that `blockers` keep out could start at the
+/// soonest, by the learned durations of the running jobs: once they have
+/// freed what it lacks, or else once none of them runs, as then the first in
+/// line starts whatever the readings say. None when that hangs on a job whose
+/// duration is unknown.
+fn soonest_start(blockers: &[Blocker], running: &[Entry], now: f64) -> Option<f64> {
+    let drained = running.iter().try_fold(0.0, |t: f64, e| Some(t.max(e.remaining(now)?)));
+    blockers.iter().try_fold(0.0, |t: f64, b| Some(t.max(crate::report::start_eta(b, running, now).or(drained)?)))
 }
 
 // ----------------------------------------------------------------- stall ----
@@ -1281,12 +1295,105 @@ mod tests {
         let m = machine(2.0, 21);
         let r = std::slice::from_ref(&running);
         assert!(blockers(decide(&m, &backfill, r, &waiting, &small, 2799.0, &[])).is_empty());
-        // Waiting longer than 1800 s: newer jobs stop, so memory drains until
-        // the head fits.
+        // Waiting longer than 1800 s: a newer job that may not end before the
+        // head could start stops (this one has no learned duration), so memory
+        // drains until the head fits.
         assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &small, 2801.0, &[])), vec!["reserved"]);
         // A window no longer than max_bypass is no window: the old rule.
         let none = Limits { max_backfill: 120.0, ..LIM };
         assert_eq!(blockers(decide(&m, &none, r, &waiting, &small, 1300.0, &[])), vec!["reserved"]);
+    }
+
+    /// The stall of 2026-10-04 on a 32-core Linux box: two long jobs ran,
+    /// and programs outside taskguard (dev stacks, browsers, agents) kept the
+    /// CPU busy. The head of the line needs 7.4 cores and did not fit. Past
+    /// `max_backfill` (300 s) its reservation held back every job behind it,
+    /// small ones that fit included, until the long jobs ended half an hour
+    /// later.
+    fn outside_load() -> (MachineSample, Limits, Vec<Entry>, Entry) {
+        let lim = Limits { max_backfill: 300.0, ..LIM };
+        let running: Vec<Entry> = ["e2e-a", "e2e-b"]
+            .iter()
+            .map(|k| Entry { started_at: Some(0.0), est_dur_s: Some(2400.0), live_cpu: 2.0, live_mem_kb: 2 * GB, ..job(1, k, 2.0, 2) })
+            .collect();
+        let mut head = job(2, "vocab/abi:check-byte-stability", 7.4, 2);
+        head.queued_at = 300.0;
+        head.bypassed_since = Some(310.0);
+        // 25 cores busy outside taskguard, 4 in its jobs: the head would use
+        // 36.4 of 32 cores, and would not fit even with nothing of taskguard
+        // running.
+        (MachineSample::fixed(29.0, 32, 40 * GB, 128 * GB), lim, running, head)
+    }
+
+    #[test]
+    fn a_reserved_job_kept_out_by_other_programs_lets_jobs_that_end_in_time_start() {
+        let (m, lim, running, head) = outside_load();
+        let lint = Entry { est_dur_s: Some(40.0), ..job(3, "web/dashboard:oxlint", 1.0, 1) };
+        let long = Entry { est_dur_s: Some(900.0), ..job(4, "e2e/dapi:test", 1.0, 1) };
+        let waiting = [head.clone(), lint.clone(), long.clone()];
+        // 26 minutes in line, long past max_backfill.
+        let now = 1860.0;
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &head, now, &[])), vec!["cpu"]);
+        // The long jobs end in about 540 s, and nothing taskguard runs ends
+        // sooner that could make room: the head starts then at the soonest,
+        // once nothing runs. A lint ends long before that, so it starts.
+        assert!(blockers(decide(&m, &lim, &running, &waiting, &lint, now, &[])).is_empty());
+        // A job that would still run then waits, so the head is not kept out longer.
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &long, now, &[])), vec!["reserved"]);
+        // So does a job whose duration is unknown.
+        let first = job(5, "new:test", 1.0, 1);
+        assert_eq!(blockers(decide(&m, &lim, &running, &[head.clone(), first.clone()], &first, now, &[])), vec!["reserved"]);
+        // The outside load eases: the head fits, and the lint waits for it.
+        let calm = MachineSample { cpu_busy: 20.0, ..m.clone() };
+        assert!(blockers(decide(&calm, &lim, &running, &waiting, &head, now, &[])).is_empty());
+        assert_eq!(blockers(decide(&calm, &lim, &running, &waiting, &lint, now, &[])), vec!["reserved"]);
+    }
+
+    #[test]
+    fn a_reserved_job_short_of_memory_lets_jobs_that_end_in_time_start() {
+        let (_, lim, running, mut head) = outside_load();
+        let lim = Limits { mem_max_pct: 70.0, ..lim };
+        // Other programs hold 84 GB, the long jobs 4: an 18 GB head would
+        // reach 83% (limit 70%).
+        let m = MachineSample::fixed(8.0, 32, 88 * GB, 128 * GB);
+        head.need_cpu = 2.0;
+        head.need_mem_kb = 18 * GB;
+        let lint = Entry { est_dur_s: Some(40.0), ..job(3, "onchain/evm:solhint", 1.0, 1) };
+        let long = Entry { est_dur_s: Some(900.0), ..job(4, "e2e/dapi:test", 1.0, 1) };
+        let waiting = [head.clone(), lint.clone(), long.clone()];
+        let now = 1860.0;
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &head, now, &[])), vec!["memory"]);
+        assert!(blockers(decide(&m, &lim, &running, &waiting, &lint, now, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &long, now, &[])), vec!["reserved"]);
+        // Other programs free 20 GB: the head fits, and goes first.
+        let calm = MachineSample { mem_used_kb: 68 * GB, ..m.clone() };
+        assert!(blockers(decide(&calm, &lim, &running, &waiting, &head, now, &[])).is_empty());
+        assert_eq!(blockers(decide(&calm, &lim, &running, &waiting, &lint, now, &[])), vec!["reserved"]);
+    }
+
+    #[test]
+    fn past_max_backfill_only_jobs_that_end_before_the_room_frees_pass() {
+        // The head waits for memory the compile holds; the compile ends in
+        // 100 s, and then the head fits. A job that ends sooner leaves that
+        // room free in time; one that does not would take it.
+        let (mut running, head) = blocked_head();
+        running.est_dur_s = Some(2000.0);
+        let quick = Entry { est_dur_s: Some(60.0), ..job(3, "install", 0.2, 1) };
+        let slow = Entry { est_dur_s: Some(600.0), ..job(4, "build", 0.2, 1) };
+        let waiting = [head.clone(), quick.clone(), slow.clone()];
+        let backfill = Limits { max_backfill: 1800.0, ..LIM };
+        let m = machine(2.0, 21);
+        let r = std::slice::from_ref(&running);
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &head, 2900.0, &[])), vec!["memory"]);
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &quick, 2900.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &slow, 2900.0, &[])), vec!["reserved"]);
+        // A higher priority holds its turn the same way.
+        let mut urgent = head.clone();
+        urgent.bypassed_since = None;
+        urgent.priority = 1;
+        let waiting = [urgent, quick.clone(), slow.clone()];
+        assert!(blockers(decide(&m, &backfill, r, &waiting, &quick, 2900.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &slow, 2900.0, &[])), vec!["priority"]);
     }
 
     #[test]
