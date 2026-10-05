@@ -159,6 +159,12 @@ pub fn proc_sample(pid: i32) -> Option<ProcSample> {
     })
 }
 
+/// `proc_sample` for a sweep over every process. The footprint is cheap to
+/// read here, so nothing is reused.
+pub fn proc_sample_with(pid: i32, _now: f64, _footprints: &mut super::Footprints) -> Option<ProcSample> {
+    proc_sample(pid)
+}
+
 pub fn proc_name(pid: i32) -> String {
     let mut buf = [0u8; 256];
     let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };

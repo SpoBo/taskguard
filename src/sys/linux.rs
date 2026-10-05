@@ -93,11 +93,36 @@ fn footprint_kb(pid: i32) -> u64 {
     field(format!("/proc/{pid}/smaps_rollup"), "Pss:").or_else(|| field(format!("/proc/{pid}/status"), "VmRSS:")).unwrap_or(0)
 }
 
+fn page_kb() -> u64 {
+    static K: OnceLock<u64> = OnceLock::new();
+    *K.get_or_init(|| {
+        let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if v > 0 { v as u64 / 1024 } else { 4 }
+    })
+}
+
+/// Field `i` of /proc/<pid>/stat as numbered in proc(5), from `stat_fields`,
+/// which drops the two fields up to the name's end.
+fn stat_num(f: &[String], i: usize) -> u64 {
+    f.get(i - 3).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 pub fn proc_sample(pid: i32) -> Option<ProcSample> {
+    sample_from(pid, &stat_fields(pid)?, footprint_kb(pid))
+}
+
+/// `proc_sample` for a sweep over every process: the footprint comes from
+/// `footprints` while the last full reading still holds.
+pub fn proc_sample_with(pid: i32, now: f64, footprints: &mut super::Footprints) -> Option<ProcSample> {
     let f = stat_fields(pid)?;
-    // Field numbers from proc(5), minus the two before the name's end:
+    // starttime is field 22, rss (in pages) 24.
+    let kb = footprints.get(pid, stat_num(&f, 22), stat_num(&f, 24) * page_kb(), now, || footprint_kb(pid));
+    sample_from(pid, &f, kb)
+}
+
+fn sample_from(pid: i32, f: &[String], footprint_kb: u64) -> Option<ProcSample> {
     // majflt is field 12, utime 14, stime 15.
-    let num = |i: usize| f.get(i - 3).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let num = |i: usize| stat_num(f, i);
     let ticks_ns = (num(14) + num(15)) * 1_000_000_000 / clk_tck();
     // schedstat: time on a CPU, time waiting on a run queue, time slices.
     let (cpu_ns, runnable_ns) = fs::read_to_string(format!("/proc/{pid}/schedstat"))
@@ -107,7 +132,7 @@ pub fn proc_sample(pid: i32) -> Option<ProcSample> {
             Some((it.next()??, it.next()??))
         })
         .unwrap_or((ticks_ns, 0));
-    Some(ProcSample { footprint_kb: footprint_kb(pid), cpu_ns, runnable_ns, pageins: num(12) })
+    Some(ProcSample { footprint_kb, cpu_ns, runnable_ns, pageins: num(12) })
 }
 
 pub fn proc_name(pid: i32) -> String {

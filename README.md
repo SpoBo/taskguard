@@ -352,7 +352,11 @@ text, for scripts and agents.
 The history comes from a small recorder process. The first job starts it, it
 samples the machine and the groups of other programs every 2 seconds, and it
 exits by itself 30 minutes after the last job. Nothing is installed as a
-service.
+service. On Linux it reads the PSS of another program in full every two
+minutes, and sooner when its resident size moves by more than a quarter; in
+between it moves the last reading by the change in resident size. The kernel
+walks every page of a process to add up PSS, so reading it for every process
+every 2 seconds took about half a core on a machine with 1,700 processes.
 
 ## Try it with the demo
 

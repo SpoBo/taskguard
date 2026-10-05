@@ -46,6 +46,65 @@ pub struct CpuTicks {
     pub total: u64,
 }
 
+/// The longest a footprint is reused before it is read again in full.
+pub const FOOTPRINT_REUSE: f64 = 120.0;
+
+/// Footprints of processes outside the queue, kept between two sweeps over
+/// every process on the machine.
+///
+/// On Linux the footprint is PSS, and the kernel adds it up by walking every
+/// page of the process: one sweep over a busy machine costs seconds of CPU,
+/// while the resident size in /proc/<pid>/stat costs next to nothing. So a
+/// sweep reads a process's footprint in full every two minutes, and in
+/// between moves the last full reading by however much the resident size
+/// grew or shrank since. macOS reads the footprint cheaply and keeps nothing.
+#[derive(Default)]
+pub struct Footprints {
+    known: HashMap<i32, Footprint>,
+    /// Full readings taken so far.
+    pub reads: usize,
+}
+
+struct Footprint {
+    /// When the process started, so a reused pid is not taken for the old one.
+    start: u64,
+    kb: u64,
+    rss_kb: u64,
+    due: f64,
+}
+
+impl Footprints {
+    /// The footprint of `pid`, which started at `start` and has `rss_kb`
+    /// resident now. `read` takes the full reading; it runs for a process not
+    /// seen before, once the last full reading is due again, or when the
+    /// resident size moved by more than a quarter since it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn get(&mut self, pid: i32, start: u64, rss_kb: u64, now: f64, read: impl FnOnce() -> u64) -> u64 {
+        let seen = match self.known.get(&pid) {
+            Some(f) if f.start == start => {
+                if now < f.due && rss_kb.abs_diff(f.rss_kb) <= f.rss_kb / 4 {
+                    return (f.kb + rss_kb).saturating_sub(f.rss_kb).min(rss_kb);
+                }
+                true
+            }
+            _ => false,
+        };
+        let kb = read();
+        self.reads += 1;
+        // The first reading of a process is due again after a share of the
+        // usual time that depends on its pid, so the processes found together
+        // when the recorder starts are not all read again in the same sweep.
+        let share = if seen { 1.0 } else { ((pid as u64).wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0 };
+        self.known.insert(pid, Footprint { start, kb, rss_kb, due: now + FOOTPRINT_REUSE * share });
+        kb
+    }
+
+    /// Forget the processes that are gone.
+    pub fn retain(&mut self, alive: impl Fn(i32) -> bool) {
+        self.known.retain(|pid, _| alive(*pid));
+    }
+}
+
 pub fn ncpu() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -115,6 +174,65 @@ mod tests {
     fn ancestors_stop_at_init() {
         let procs = [ProcInfo { pid: 10, ppid: 1 }, ProcInfo { pid: 11, ppid: 10 }, ProcInfo { pid: 12, ppid: 11 }];
         assert_eq!(ancestors(12, &procs), vec![12, 11, 10]);
+    }
+
+    #[test]
+    fn a_footprint_is_moved_with_the_resident_size_until_it_is_due() {
+        let mut f = Footprints::default();
+        assert_eq!(f.get(10, 5, 1000, 0.0, || 600), 600);
+        assert_eq!(f.get(10, 5, 1100, 1.0, || unreachable!()), 700);
+        assert_eq!(f.get(10, 5, 900, 2.0, || unreachable!()), 500);
+        assert_eq!(f.get(10, 5, 1000, FOOTPRINT_REUSE, || 650), 650, "due again");
+        assert_eq!(f.get(10, 5, 1000, FOOTPRINT_REUSE * 2.0 - 1.0, || unreachable!()), 650);
+        assert_eq!(f.reads, 2);
+    }
+
+    #[test]
+    fn a_big_move_or_a_reused_pid_is_read_again() {
+        let mut f = Footprints::default();
+        f.get(10, 5, 1000, 0.0, || 600);
+        assert_eq!(f.get(10, 5, 1300, 1.0, || 900), 900, "grew by more than a quarter");
+        assert_eq!(f.get(10, 6, 1300, 2.0, || 50), 50, "another process with the same pid");
+        f.retain(|_| false);
+        assert_eq!(f.get(10, 6, 1300, 3.0, || 70), 70, "forgotten");
+        assert_eq!(f.reads, 4);
+    }
+
+    #[test]
+    fn the_first_readings_are_due_again_spread_out() {
+        let mut f = Footprints::default();
+        for pid in 1000..1600 {
+            f.get(pid, 0, 1000, 0.0, || 1);
+        }
+        let mut most = 0;
+        for tick in 1..=60 {
+            let before = f.reads;
+            for pid in 1000..1600 {
+                f.get(pid, 0, 1000, tick as f64 * 2.0, || 1);
+            }
+            most = most.max(f.reads - before);
+        }
+        assert_eq!(f.reads, 1200, "each read once more within FOOTPRINT_REUSE");
+        assert!(most <= 30, "{most} full readings in one sweep");
+    }
+
+    /// What keeps the recorder cheap: it samples every process on the machine
+    /// every two seconds, and PSS costs the kernel a walk over every page.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sweep_two_seconds_later_reads_few_footprints_in_full() {
+        let mut f = Footprints::default();
+        let procs = list_procs();
+        let now = crate::db::now();
+        for p in &procs {
+            proc_sample_with(p.pid, now, &mut f);
+        }
+        let first = f.reads;
+        for p in &procs {
+            proc_sample_with(p.pid, now + 2.0, &mut f);
+        }
+        let again = f.reads - first;
+        assert!(again <= first / 10 + 3, "{again} of {first} processes read in full again");
     }
 
     #[test]
