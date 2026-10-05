@@ -409,6 +409,11 @@ pub struct Warning {
 
 /// Every warning since `since`, newest first.
 pub fn warnings(db: &Db, since: f64, cpu_max: f64, mem_max: f64) -> Result<Vec<Warning>> {
+    warnings_with(db, since, cpu_max, mem_max, &trends(db, 10)?)
+}
+
+/// `warnings`, with the `trends` the caller already has.
+pub fn warnings_with(db: &Db, since: f64, cpu_max: f64, mem_max: f64, trends: &[TrendRow]) -> Result<Vec<Warning>> {
     let mut out = Vec::new();
     let adj = adjustments(db, None, since)?;
     let mut s = db
@@ -452,7 +457,7 @@ pub fn warnings(db: &Db, since: f64, cpu_max: f64, mem_max: f64) -> Result<Vec<W
             ],
         });
     }
-    for t in trends(db, 10)? {
+    for t in trends {
         if t.biggest() < 50.0 {
             continue;
         }
@@ -461,13 +466,15 @@ pub fn warnings(db: &Db, since: f64, cpu_max: f64, mem_max: f64) -> Result<Vec<W
             kind: "trend",
             key: t.key.clone(),
             title: format!("growing: {}", t.key),
-            lines: vec![trend_text(&t)],
+            lines: vec![trend_text(t)],
         });
     }
-    // --now runs that pushed the machine over a limit while they ran.
+    // --now runs that pushed the machine over a limit while they ran. CROSS
+    // JOIN keeps runs outside, so each run looks up its own samples by time;
+    // the other way round read every machine sample (0.3 s at 87k samples).
     let mut s = db.conn.prepare_cached(
         "SELECT r.id, r.key, r.started_at, max(m.cpu_busy * 100.0 / m.ncpu), max(m.mem_used_kb * 100.0 / m.mem_total_kb)
-         FROM runs r JOIN machine_samples m ON m.ts BETWEEN r.started_at AND coalesce(r.ended_at, r.started_at)
+         FROM runs r CROSS JOIN machine_samples m ON m.ts BETWEEN r.started_at AND coalesce(r.ended_at, r.started_at)
          WHERE r.now = 1 AND r.started_at >= ?1 GROUP BY r.id",
     )?;
     let rows: Vec<(i64, String, f64, f64, f64)> =

@@ -185,7 +185,27 @@ pub struct App {
     /// The pool whose match patterns the Config view lists, and the row of
     /// that pool to return to.
     pub pool_edit: Option<(String, usize)>,
+    /// Kept open between loads.
+    db: Option<Db>,
+    history: Option<History>,
 }
+
+/// What every load would otherwise read from all past runs again: it only
+/// changes when a run ends or a need is adjusted, and with the clock.
+struct History {
+    /// The newest run end and adjustment when it was read.
+    sig: (Option<f64>, Option<f64>),
+    at: Instant,
+    trends: Vec<TrendRow>,
+    warnings: Vec<Warning>,
+    ns_list: Vec<String>,
+}
+
+/// Read History again after this long, even when no run ended, and not
+/// sooner than HISTORY_MIN_AGE: in a busy build runs end every second, and
+/// reading it takes a few hundred milliseconds.
+const HISTORY_MAX_AGE: Duration = Duration::from_secs(30);
+const HISTORY_MIN_AGE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Click {
@@ -227,11 +247,43 @@ impl App {
             checkout: PathBuf::new(),
             save_to: None,
             pool_edit: None,
+            db: None,
+            history: None,
         }
     }
 
     pub fn load(&mut self) -> Result<()> {
-        let db = Db::open_dir(&self.dir)?;
+        let db = match self.db.take() {
+            Some(db) => db,
+            None => Db::open_dir(&self.dir)?,
+        };
+        let r = self.load_from(&db);
+        self.db = Some(db);
+        r
+    }
+
+    /// The History, read again when a run ended or a need was adjusted, or
+    /// when it got old.
+    fn history(&mut self, db: &Db, now: f64) -> Result<&History> {
+        let sig: (Option<f64>, Option<f64>) =
+            db.conn.query_row("SELECT (SELECT max(ended_at) FROM runs), (SELECT max(ts) FROM adjustments)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        let fresh = self.history.as_ref().is_some_and(|h| {
+            let age = h.at.elapsed();
+            age < HISTORY_MIN_AGE || (h.sig == sig && age < HISTORY_MAX_AGE)
+        });
+        if !fresh {
+            let trends = dash::trends(db, 10)?;
+            let warnings = dash::warnings_with(db, now - 7.0 * 86400.0, self.cfg.cpu_max, self.cfg.mem_max, &trends)?;
+            let mut s = db.conn.prepare_cached("SELECT DISTINCT ns FROM runs WHERE imported = 0 ORDER BY ns")?;
+            let ns_list = s.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+            self.history = Some(History { sig, at: Instant::now(), trends, warnings, ns_list });
+        }
+        Ok(self.history.as_ref().expect("just set"))
+    }
+
+    fn load_from(&mut self, db: &Db) -> Result<()> {
         let now = db::now();
         let span = RANGES[self.range].1;
         let n = self.columns.max(10);
@@ -251,48 +303,50 @@ impl App {
             }
         };
         let from = to - span;
-        let (machine, ncpu, mem_total) = dash::machine_series(&db, from, to, n)?;
-        let mut ns = dash::ns_series(&db, from, to, n, self.cfg.sample_every)?;
-        let ns_list: Vec<String> = {
-            let mut s = db.conn.prepare("SELECT DISTINCT ns FROM runs WHERE imported = 0 ORDER BY ns")?;
-            s.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?
-        };
+        let (machine, ncpu, mem_total) = dash::machine_series(db, from, to, n)?;
+        let mut ns = dash::ns_series(db, from, to, n, self.cfg.sample_every)?;
+        let (ns_filter, text_filter) = (self.ns_filter.clone(), self.text_filter.clone());
+        let history = self.history(db, now)?;
+        let ns_list = history.ns_list.clone();
+        let warnings = history.warnings.clone();
+        let trends: Vec<TrendRow> = history
+            .trends
+            .iter()
+            .filter(|t| ns_filter.as_ref().is_none_or(|f| &t.ns == f) && t.key.contains(&text_filter))
+            .cloned()
+            .collect();
         if let Some(f) = &self.ns_filter {
             ns.retain(|k, _| k == f);
         }
         let cursor_runs = match self.cursor {
-            Some(c) => dash::runs_at(&db, from + (c as f64 + 0.5) * span / n as f64)?,
+            Some(c) => dash::runs_at(db, from + (c as f64 + 0.5) * span / n as f64)?,
             None => Vec::new(),
         };
-        let mut runs = dash::runs(&db, self.ns_filter.as_deref(), &self.text_filter, 500)?;
+        let mut runs = dash::runs(db, self.ns_filter.as_deref(), &self.text_filter, 500)?;
         sort_runs(&mut runs, self.sort, self.reverse);
-        let trends: Vec<TrendRow> = dash::trends(&db, 10)?
-            .into_iter()
-            .filter(|t| self.ns_filter.as_ref().is_none_or(|f| &t.ns == f) && t.key.contains(&self.text_filter))
-            .collect();
         let job = match &self.job_key {
             Some(k) => {
-                let runs = dash::key_runs(&db, k, 30)?;
+                let runs = dash::key_runs(db, k, 30)?;
                 let (min_cpu, min_mem_kb) = db
                     .conn
                     .query_row("SELECT min_cpu, min_mem_kb FROM runs WHERE key = ?1 ORDER BY id DESC LIMIT 1", [k], |r| {
                         Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<i64>>(1)?.map(|v| v as u64)))
                     })
                     .unwrap_or((None, None));
-                let snap = commands::snapshot(&self.dir, &self.cfg, Some(&db)).ok();
+                let snap = commands::queue_snapshot(&self.dir, &self.cfg, Some(db)).ok();
                 let live = snap.and_then(|s| {
                     let running = s.running.into_iter().find(|e| &e.key == k).map(|e| (e, false));
                     running.or_else(|| s.waiting.into_iter().find(|w| &w.entry.key == k).map(|w| (w.entry, true)))
                 });
                 let live = match live {
-                    Some((entry, waiting)) => Some(LiveRun { samples: dash::run_samples(&db, entry.run_id)?, entry, waiting }),
+                    Some((entry, waiting)) => Some(LiveRun { samples: dash::run_samples(db, entry.run_id)?, entry, waiting }),
                     None => None,
                 };
                 if let Some(id) = self.open_run.take() {
                     self.sel = runs.iter().position(|r| r.id == id).unwrap_or(0);
                 }
                 let samples = match (self.view, runs.get(self.sel)) {
-                    (View::Job, Some(r)) => dash::run_samples(&db, r.id)?,
+                    (View::Job, Some(r)) => dash::run_samples(db, r.id)?,
                     _ => Vec::new(),
                 };
                 Some(JobData {
@@ -301,7 +355,7 @@ impl App {
                     key: k.clone(),
                     learned: db.learned(k, self.cfg.hist_keep, self.cfg.boost_runs)?,
                     runs,
-                    adjustments: dash::adjustments(&db, Some(k), 0.0)?,
+                    adjustments: dash::adjustments(db, Some(k), 0.0)?,
                     min_cpu,
                     min_mem_kb,
                 })
@@ -309,27 +363,27 @@ impl App {
             None => None,
         };
         let run_spans = match (self.view, runs.get(self.sel)) {
-            (View::Runs, Some(r)) => dash::wait_spans(&db, r.id)?,
+            (View::Runs, Some(r)) => dash::wait_spans(db, r.id)?,
             _ => Vec::new(),
         };
-        let mut namespaces = dash::namespaces(&db, live_to - span, self.cfg.sample_every)?;
+        let mut namespaces = dash::namespaces(db, live_to - span, self.cfg.sample_every)?;
         sort_ns(&mut namespaces, self.sort, self.reverse);
         self.data = Data {
             now,
             from,
             to,
-            snap: commands::snapshot(&self.dir, &self.cfg, Some(&db)).ok(),
+            snap: commands::queue_snapshot(&self.dir, &self.cfg, Some(db)).ok(),
             machine,
             ncpu,
             mem_total_kb: mem_total,
             ns,
-            groups: dash::group_series(&db, from, to, n, crate::recorder::EVERY)?,
+            groups: dash::group_series(db, from, to, n, crate::recorder::EVERY)?,
             groups_now: db.latest_groups().unwrap_or_default(),
-            waiting: dash::waiting_series(&db, from, to, n)?,
-            markers: dash::markers(&db, from, to)?,
+            waiting: dash::waiting_series(db, from, to, n)?,
+            markers: dash::markers(db, from, to)?,
             runs,
             trends,
-            warnings: dash::warnings(&db, now - 7.0 * 86400.0, self.cfg.cpu_max, self.cfg.mem_max)?,
+            warnings,
             namespaces,
             ns_list,
             recorder: recorder_running(&self.dir),
@@ -1023,7 +1077,12 @@ pub fn run(args: &[String]) -> Result<i32> {
                 last = Instant::now();
             }
             term.draw(|f| views::draw(f, &mut app))?;
-            if event::poll(Duration::from_millis(250))? {
+            // Every event that is already there is handled before the next
+            // load, so a burst of keys or scroll steps costs one load, not one
+            // each.
+            let mut wait = Duration::from_millis(250);
+            while event::poll(wait)? {
+                wait = Duration::ZERO;
                 match event::read()? {
                     Event::Key(k) => {
                         if !app.key(k) {
@@ -1031,6 +1090,10 @@ pub fn run(args: &[String]) -> Result<i32> {
                         }
                         last = Instant::now() - Duration::from_secs(10);
                     }
+                    // The terminal reports every move of the mouse. A move
+                    // changes nothing, so it must not load: a load each made
+                    // the dashboard crawl while the mouse was over it.
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Up(_)) => {}
                     Event::Mouse(m) => {
                         app.mouse(m.kind, m.column, m.row);
                         last = Instant::now() - Duration::from_secs(10);

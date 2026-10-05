@@ -26,6 +26,19 @@ pub fn limits(cfg: &Config) -> Limits {
 
 /// Everything the status screen and the dashboard's Queue view show.
 pub fn snapshot(dir: &Path, cfg: &Config, db: Option<&Db>) -> Result<Snapshot> {
+    let mut s = queue_snapshot(dir, cfg, db)?;
+    if let Some(d) = db {
+        let since = db::now() - 24.0 * 3600.0;
+        if let Ok(w) = dash::warnings(d, since, cfg.cpu_max, cfg.mem_max) {
+            s.warnings = w.iter().map(|w| format!("{} - {}", w.title, w.lines.first().cloned().unwrap_or_default())).collect();
+            s.advice = w.iter().filter(|w| w.kind == "repeated").flat_map(|w| w.lines.iter().skip(1).cloned()).collect();
+        }
+    }
+    Ok(s)
+}
+
+/// `snapshot` without the warnings, which the dashboard reads on its own.
+pub fn queue_snapshot(dir: &Path, cfg: &Config, db: Option<&Db>) -> Result<Snapshot> {
     let q = Queue::open(dir)?;
     let (m, running, waiting, unknown_starts) = {
         let _g = q.lock()?;
@@ -40,11 +53,6 @@ pub fn snapshot(dir: &Path, cfg: &Config, db: Option<&Db>) -> Result<Snapshot> {
     };
     let mut s = Snapshot::build(m, limits(cfg), running, waiting, db::now(), &unknown_starts);
     if let Some(d) = db {
-        let since = db::now() - 24.0 * 3600.0;
-        if let Ok(w) = dash::warnings(d, since, cfg.cpu_max, cfg.mem_max) {
-            s.warnings = w.iter().map(|w| format!("{} - {}", w.title, w.lines.first().cloned().unwrap_or_default())).collect();
-            s.advice = w.iter().filter(|w| w.kind == "repeated").flat_map(|w| w.lines.iter().skip(1).cloned()).collect();
-        }
         s.top_other = d.latest_top_procs().unwrap_or_default();
     }
     Ok(s)
