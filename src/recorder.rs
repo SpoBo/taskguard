@@ -34,6 +34,7 @@ pub fn run() -> Result<()> {
     let (mut last_top, mut last_rollup, mut last_prune) = (0.0, db::now(), 0.0);
     let mut prev_cpu: HashMap<i32, (u64, f64)> = HashMap::new();
     let mut known: HashMap<i32, Known> = HashMap::new();
+    let mut footprints = sys::Footprints::default();
     let mut prev: Option<machine::MachineSample> = machine::read_cache(&dir);
     loop {
         let now = db::now();
@@ -58,7 +59,7 @@ pub fn run() -> Result<()> {
         if with_top {
             last_top = now;
         }
-        let _ = others(&db, &q, &mut prev_cpu, &mut known, now, with_top);
+        let _ = others(&db, &q, &mut prev_cpu, &mut known, &mut footprints, now, with_top);
         if now - last_rollup >= ROLLUP_EVERY {
             last_rollup = now;
             let _ = db.rollup(now, cfg.sample_every);
@@ -102,6 +103,7 @@ fn others(
     q: &Queue,
     prev_cpu: &mut HashMap<i32, (u64, f64)>,
     known: &mut HashMap<i32, Known>,
+    footprints: &mut sys::Footprints,
     now: f64,
     with_top: bool,
 ) -> Result<()> {
@@ -114,6 +116,7 @@ fn others(
     ours.insert(std::process::id() as i32);
     let alive: HashSet<i32> = procs.iter().map(|p| p.pid).collect();
     known.retain(|pid, _| alive.contains(pid));
+    footprints.retain(|pid| alive.contains(&pid));
     let parents: HashMap<i32, i32> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
     let mut own: HashMap<i32, Option<&'static groups::Group>> = HashMap::new();
     for p in &procs {
@@ -135,7 +138,7 @@ fn others(
         if ours.contains(&p.pid) {
             continue;
         }
-        let Some(s) = sys::proc_sample(p.pid) else { continue };
+        let Some(s) = sys::proc_sample_with(p.pid, now, footprints) else { continue };
         let cores = match prev_cpu.get(&p.pid) {
             Some((c, t)) if now > *t => s.cpu_ns.saturating_sub(*c) as f64 / 1e9 / (now - t),
             _ => 0.0,
