@@ -357,11 +357,39 @@ impl Queue {
     }
 
     pub fn waiting(&self) -> Vec<Entry> {
-        let mut v: Vec<Entry> = self.read_dir("wait").into_iter().map(|(_, e)| e).collect();
+        let v: Vec<Entry> = self.read_dir("wait").into_iter().map(|(_, e)| e).collect();
+        self.with_stalled(v)
+    }
+
+    fn with_stalled(&self, mut v: Vec<Entry>) -> Vec<Entry> {
         for e in &mut v {
             e.stalled = self.stall_path(e).exists();
         }
         v
+    }
+
+    /// The names in `run/` and `wait/`, and whether a nudge waits for `pid`.
+    /// Listing a directory opens no file, so a waiting job can afford this
+    /// often; it changes whenever a job joins or leaves the queue.
+    pub fn shape(&self, pid: i32) -> Vec<String> {
+        let mut v: Vec<String> = ["run", "wait"]
+            .iter()
+            .flat_map(|sub| fs::read_dir(self.dir.join(sub)).into_iter().flatten())
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| !n.contains(".tmp"))
+            .collect();
+        v.sort();
+        if self.nudge_path(pid).exists() {
+            v.push("nudge".into());
+        }
+        v
+    }
+
+    /// `reap`, then the running and the waiting jobs, from one read of each
+    /// file.
+    pub fn reap_and_read(&self) -> (Vec<i64>, Vec<Entry>, Vec<Entry>) {
+        let (gone, [wait, run]) = self.reap_kept();
+        (gone, run, self.with_stalled(wait))
     }
 
     pub fn running(&self) -> Vec<Entry> {
@@ -371,10 +399,20 @@ impl Queue {
     /// Drop entries whose owner process is gone. Returns the run ids that
     /// were abandoned, so the caller can close them in the database.
     pub fn reap(&self) -> Vec<i64> {
+        self.reap_kept().0
+    }
+
+    /// `reap`, plus the entries of `wait/` and `run/` that stay.
+    fn reap_kept(&self) -> (Vec<i64>, [Vec<Entry>; 2]) {
         let mut gone = Vec::new();
-        for sub in ["wait", "run"] {
+        let mut kept: [Vec<Entry>; 2] = Default::default();
+        for (i, sub) in ["wait", "run"].into_iter().enumerate() {
+            let mut read: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
             for (p, e) in self.read_dir(sub) {
-                if !alive(e.pid) {
+                read.insert(p.clone());
+                if alive(e.pid) {
+                    kept[i].push(e);
+                } else {
                     // An owner that died while its command was paused cannot
                     // resume it any more: do it here.
                     if e.paused_since.is_some() {
@@ -391,7 +429,10 @@ impl Queue {
             for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
                 let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
                 let owner = name.rsplit('.').next().and_then(|pid| pid.parse::<i32>().ok());
-                if name.contains(".tmp") || fs::read_to_string(&p).is_ok_and(|t| serde_json::from_str::<Entry>(&t).is_ok()) {
+                if read.contains(&p)
+                    || name.contains(".tmp")
+                    || fs::read_to_string(&p).is_ok_and(|t| serde_json::from_str::<Entry>(&t).is_ok())
+                {
                     continue;
                 }
                 if owner.is_some_and(|pid| !alive(pid)) {
@@ -419,7 +460,7 @@ impl Queue {
                 }
             }
         }
-        gone
+        (gone, kept)
     }
 
     pub fn viewers(&self) -> usize {
@@ -2092,6 +2133,36 @@ mod tests {
         let head_at = started.iter().find(|(k, _)| k == "root:run-integration").map(|(_, s)| *s).unwrap();
         assert!(started.iter().filter(|(_, s)| *s < head_at).count() > 10, "jobs that fit pass it meanwhile");
         assert!(head_at <= lim.max_backfill + 20.0 + 1.0, "it starts once the reservation drained the queue: {head_at}");
+    }
+
+    #[test]
+    fn the_shape_changes_when_a_job_joins_or_leaves_not_when_it_rewrites() {
+        let dir = std::env::temp_dir().join(format!("tg-shape-{}", std::process::id()));
+        let q = Queue::open(&dir).unwrap();
+        let live = std::process::id() as i32;
+        let gone = {
+            let mut c = std::process::Command::new("true").spawn().unwrap();
+            let pid = c.id() as i32;
+            c.wait().unwrap();
+            pid
+        };
+        let a = queued(1, "a", 1000.0, live);
+        q.write(&q.wait_path(&a), &a).unwrap();
+        let before = q.shape(live);
+        q.write(&q.wait_path(&a), &Entry { blocker: Some("cpu".into()), ..a.clone() }).unwrap();
+        assert_eq!(q.shape(live), before, "a rewrite is no change");
+        let b = queued(2, "b", 1001.0, gone);
+        q.write(&q.wait_path(&b), &b).unwrap();
+        assert_ne!(q.shape(live), before, "a job joined");
+        q.nudge(live, |n| n.start = true).unwrap();
+        assert!(q.shape(live).contains(&"nudge".to_string()), "a nudge wakes its job");
+
+        // One read gives what reap, running and waiting gave.
+        let (reaped, run, wait) = q.reap_and_read();
+        assert_eq!(reaped, vec![b.run_id]);
+        assert!(run.is_empty());
+        assert_eq!(wait.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["a"]);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

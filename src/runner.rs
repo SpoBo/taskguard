@@ -379,6 +379,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
         let mut span: Option<(String, String, f64)> = None;
         let mut started_by_hand = false;
         let mut watch = queue::StallWatch::default();
+        let check_every = Duration::from_secs_f64(cfg.wait_check_every.clamp(0.01, 10.0));
+        let mut decided_at: Option<f64> = None;
+        let mut last_shape: Vec<String> = Vec::new();
         loop {
             if let Some(s) = sig.any() {
                 cleanup_files(&q, &me);
@@ -392,6 +395,18 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 return Ok(128 + s);
             }
             let now = db::now();
+            // The full decision reads every queue file under the lock. With a
+            // long queue, doing that ten times a second in every waiting job
+            // took a whole core, so between decisions only the names in the
+            // queue are looked at: a job that ends still frees its room at once.
+            let shape = q.shape(me_pid);
+            let timeout_due = o.timeout.is_some_and(|t| now - t0 >= t.abs());
+            if decided_at.is_some_and(|t| now - t < cfg.wait_decide_every) && shape == last_shape && !timeout_due {
+                std::thread::sleep(check_every);
+                continue;
+            }
+            decided_at = Some(now);
+            last_shape = shape;
             let mtime = conf_mtime(&conf_path);
             if mtime != seen_mtime {
                 seen_mtime = mtime;
@@ -403,14 +418,14 @@ pub fn run(mut o: Opts) -> Result<i32> {
             let running;
             {
                 let _g = q.lock()?;
-                for gone in q.reap() {
+                let (gone, run, waiting) = q.reap_and_read();
+                for gone in gone {
                     if let Some(d) = &database {
                         let _ = d.abandon_run(gone);
                     }
                 }
-                running = q.running();
+                running = run;
                 let m = machine::current(&dir, 1.0, running.iter().map(|e| e.live_mem_kb).sum());
-                let waiting = q.waiting();
                 // Keep fields another process may have set (bypassed_since).
                 if let Some(cur) = waiting.iter().find(|w| w.pid == me_pid) {
                     me.bypassed_since = cur.bypassed_since;
@@ -525,7 +540,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 let left = o.timeout.map(|t| if t > 0.0 { t - (now - t0) } else { t + (now - t0) });
                 lines.waiting(&me, now - t0, &decision, &running, now, left);
             }
-            std::thread::sleep(POLL);
+            std::thread::sleep(check_every);
         }
         if let (Some((n, d, from)), Some(dbh)) = (&span, &database) {
             let _ = dbh.wait_span(run_id, *from, db::now(), n, d);
@@ -623,7 +638,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
             // Paused or resumed from outside (kill -STOP, kill -CONT): count it
             // as done by hand, so new jobs may use its room and nothing resumes
             // it behind the back of whoever paused it.
-            match (outside_stopped(child_pid), me.paused_since.is_some()) {
+            // One list of processes for this round: reading /proc is the
+            // cost of a sample on a busy machine.
+            let procs = sys::list_procs();
+            match (outside_stopped(child_pid, &procs), me.paused_since.is_some()) {
                 (Some(true), false) => {
                     pause_cmd(&q, &mut me, now, true);
                     say(&format!("paused {} - stopped from outside taskguard; treated as paused by hand", me.key));
@@ -653,7 +671,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
                 }
             }
-            if let Some(r) = tracker.sample(child_pid, now) {
+            if let Some(r) = tracker.sample(child_pid, now, &procs) {
                 me.live_cpu = r.used;
                 me.live_mem_kb = r.mem_kb;
                 if r.mem_kb > seen_peak_kb + seen_peak_kb / 10 {
@@ -823,9 +841,8 @@ fn auto_pause(q: &Queue, dir: &Path, me: &mut Entry, rules: &queue::PauseRules, 
 
 /// Whether the command's processes are stopped: Some(true) when every live one
 /// is, Some(false) when any runs, None when none can be read.
-fn outside_stopped(child_pid: i32) -> Option<bool> {
-    let procs = sys::list_procs();
-    let states: Vec<bool> = sys::descendants(child_pid, &sys::children_map(&procs)).into_iter().filter_map(sys::proc_stopped).collect();
+fn outside_stopped(child_pid: i32, procs: &[sys::ProcInfo]) -> Option<bool> {
+    let states: Vec<bool> = sys::descendants(child_pid, &sys::children_map(procs)).into_iter().filter_map(sys::proc_stopped).collect();
     (!states.is_empty()).then(|| states.iter().all(|s| *s))
 }
 

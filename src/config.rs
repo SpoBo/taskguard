@@ -26,6 +26,8 @@ pub struct Layer {
     pub mem_max: Option<f64>,
     pub sample_every: Option<f64>,
     pub status_every: Option<u64>,
+    pub wait_check_every: Option<f64>,
+    pub wait_decide_every: Option<f64>,
     pub hist_keep: Option<usize>,
     pub learn_stagger: Option<f64>,
     pub cpu_min_duration: Option<f64>,
@@ -107,6 +109,11 @@ pub struct Config {
     pub mem_max: f64,
     pub sample_every: f64,
     pub status_every: u64,
+    /// A waiting job looks this often whether a job joined or left the queue.
+    pub wait_check_every: f64,
+    /// A waiting job decides again at least this often, also when the queue
+    /// did not change: the machine's load may have.
+    pub wait_decide_every: f64,
     pub hist_keep: usize,
     pub learn_stagger: f64,
     pub cpu_min_duration: f64,
@@ -148,6 +155,8 @@ impl Default for Config {
             mem_max: 85.0,
             sample_every: 2.0,
             status_every: 120,
+            wait_check_every: 0.1,
+            wait_decide_every: 1.0,
             hist_keep: 10,
             learn_stagger: 5.0,
             cpu_min_duration: 5.0,
@@ -188,6 +197,8 @@ impl Default for Config {
             "mem_max",
             "sample_every",
             "status_every",
+            "wait_check_every",
+            "wait_decide_every",
             "hist_keep",
             "learn_stagger",
             "max_bypass",
@@ -546,6 +557,8 @@ impl Config {
         set!(mem_max);
         set!(sample_every);
         set!(status_every);
+        set!(wait_check_every);
+        set!(wait_decide_every);
         set!(hist_keep);
         set!(learn_stagger);
         set!(cpu_min_duration);

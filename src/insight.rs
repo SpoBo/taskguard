@@ -57,10 +57,10 @@ impl Tracker {
         Tracker { last_ts: Some(t), first_ts: Some(t), ..Default::default() }
     }
 
-    /// Read the whole tree under `root` now.
-    pub fn sample(&mut self, root: i32, ts: f64) -> Option<Reading> {
-        let procs = sys::list_procs();
-        let tree = sys::descendants(root, &sys::children_map(&procs));
+    /// Read the whole tree under `root` now, found in `procs`, a list of
+    /// processes the caller just read.
+    pub fn sample(&mut self, root: i32, ts: f64, procs: &[sys::ProcInfo]) -> Option<Reading> {
+        let tree = sys::descendants(root, &sys::children_map(procs));
         let mut cur: HashMap<i32, ProcSample> = HashMap::new();
         for pid in tree {
             if let Some(s) = sys::proc_sample(pid) {

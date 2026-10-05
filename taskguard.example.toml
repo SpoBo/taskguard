@@ -71,6 +71,10 @@ boost_runs = 5        # runs that get +25% memory after a memory-starved run
 # ---------------------------------------------------------------- timing ----
 sample_every = 2      # seconds between measurements of a running job
 status_every = 120    # seconds between "still waiting" lines
+wait_check_every = 0.1   # seconds between a waiting job's cheap look: did a job join or leave?
+wait_decide_every = 1    # a waiting job decides again at least this often; raise both to
+                         # spend less CPU on long queues, lower them to start jobs sooner.
+                         # taskguard 0.5.0 and older reject a file that sets them.
 
 # ------------------------------------------------------------- recorder ----
 recorder_idle_exit = 1800   # the recorder exits after this many idle seconds
