@@ -224,6 +224,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         },
     };
     let pool_key = pool.as_ref().map(|p| if per_checkout { format!("{p}@{}", checkout.display()) } else { p.clone() });
+    let startup = cfg.long_lived(&cls, pool.as_deref());
 
     let database = Db::open_dir(&dir).ok();
     let learned = database.as_ref().and_then(|d| d.learned(&jkey, cfg.hist_keep, cfg.boost_runs).ok()).unwrap_or_default();
@@ -321,8 +322,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
         raised_by_min: raised,
         now: o.now,
         // A first run gets the duration similar jobs took: a guessed-short
-        // one does not hold other first runs back.
-        est_dur_s: learned.dur_s.or(est_dur),
+        // one does not hold other first runs back. A long-lived job runs
+        // until someone stops it, so no one counts on it ending.
+        est_dur_s: learned.dur_s.or(est_dur).filter(|_| startup.is_none()),
         priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
         pausable: true,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -570,6 +572,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let mut last_sample = started;
     let mut last_mem_kb = 0u64;
     let mut seen_peak_kb = 0u64;
+    let long = startup.map(|startup| queue::LongLived { startup, steady_mem_kb: learned.steady_mem_kb });
+    // Seconds paused before a long-lived job left its start-up.
+    let mut paused_before_steady = 0.0;
     let mut int_seen: Option<f64> = None;
     let mut forwarded = [false; 3];
     // wait4 rather than Child::try_wait: it also returns the kernel's own
@@ -655,13 +660,19 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     me.mem_grew_at = Some(now);
                 }
                 seen_peak_kb = seen_peak_kb.max(r.mem_kb);
-                // Past its needs, a job's needs follow its peak, with room to
-                // grow: what it promises to take must keep up with what it takes.
-                if r.mem_kb > me.need_mem_kb {
-                    me.need_mem_kb = r.mem_kb + r.mem_kb / 4;
-                }
-                if r.wanted > me.need_cpu {
-                    me.need_cpu = r.wanted.min(sys::ncpu() as f64);
+                let (peak_cpu, peak_mem) = (me.need_cpu, me.need_mem_kb);
+                me.follow(r.mem_kb, r.wanted, r.wanted_recent, sys::ncpu() as f64, now, long);
+                if me.steady_since == Some(now) {
+                    tracker.steady_from(now, r.mem_kb);
+                    paused_before_steady = me.paused_s;
+                    say(&format!(
+                        "steady {} - start-up over after {}; it now reserves {:.1} cores, {} (start-up: {peak_cpu:.1} cores, {})",
+                        me.key,
+                        report::dur(now - started - me.paused_s),
+                        me.need_cpu,
+                        report::gb(me.need_mem_kb),
+                        report::gb(peak_mem)
+                    ));
                 }
                 last_mem_kb = r.mem_kb;
                 let _ = q.write(&q.run_path(me_pid), &me);
@@ -755,6 +766,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 machine_full_frac: tracker.full_samples as f64 / n,
                 measured,
                 paused_s: me.paused_s,
+                steady: tracker.steady(ended, me.paused_s - paused_before_steady),
             },
         );
     }

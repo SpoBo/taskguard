@@ -482,6 +482,7 @@ pub fn render_status(s: &Snapshot) -> String {
         let tag = match (e.paused_since, e.now) {
             (Some(since), _) => format!(" PAUSED {}{}", dur(s.now - since), if e.paused_by_hand { " by hand" } else { "" }),
             (None, true) => " NOW".into(),
+            (None, false) if e.steady() => " STEADY".into(),
             (None, false) => String::new(),
         };
         let est = if e.known || e.raised_by_min { "" } else { " est" };

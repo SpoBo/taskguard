@@ -264,6 +264,9 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
         ),
         None => println!("pool:       none"),
     }
+    if let Some(s) = cfg.long_lived(&cls, cls.pool.as_ref().map(|p| p.0.as_str())) {
+        println!("long-lived: yes - it holds its start-up peak for {}, then its needs follow what it uses", dur(s));
+    }
     for w in &cls.why {
         println!("  because {w}");
     }
@@ -280,6 +283,13 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
                 if l.mem_boosted { " (+25% after a memory-starved run)" } else { "" },
                 l.dur_s.map(dur).unwrap_or("?".into())
             );
+            if l.steady_cpu.is_some() || l.steady_mem_kb.is_some() {
+                println!(
+                    "after start-up: {} cores, {} memory",
+                    l.steady_cpu.map(|c| format!("{c:.1}")).unwrap_or("?".into()),
+                    l.steady_mem_kb.map(gb).unwrap_or("?".into())
+                );
+            }
         }
     }
     Ok(0)
