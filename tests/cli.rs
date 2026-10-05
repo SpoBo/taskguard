@@ -437,6 +437,32 @@ fn a_job_stopped_from_outside_counts_as_paused_by_hand() {
 }
 
 #[test]
+fn a_long_lived_job_holds_its_peak_only_through_its_start_up() {
+    let e = Env::new("sample_every = 0.2\n[pool.stack]\nlong_lived = true\nstartup = 1\n");
+    // A busy start-up, then it idles.
+    let job = e.spawn(&["--id", "stack", "--", "sh", "-c", "( while :; do :; done ) & p=$!; sleep 1.5; kill $p; touch idle; sleep 4"]);
+    wait_until("the start-up is over", || running_job(&e).is_some_and(|r| r["steady_since"].is_f64()));
+    let r = running_job(&e).unwrap();
+    assert!(r["est_dur_s"].is_null(), "no one counts on it ending: {r}");
+    let status = String::from_utf8_lossy(&e.run(&["status"]).stdout).into_owned();
+    assert!(status.contains("STEADY"), "{status}");
+    wait_for(&e.file("idle"));
+    // It needed a core while it started; over the last 10 s it wants less and less.
+    wait_until("its CPU need follows what it uses", || running_job(&e).is_some_and(|r| r["need_cpu"].as_f64().unwrap() < 0.5));
+    let out = job.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(stderr(&out).contains("[taskguard] steady ") && stderr(&out).contains("start-up over after"), "{}", stderr(&out));
+    let (peak, steady, steady_mem): (f64, f64, i64) = e
+        .db()
+        .query_row("SELECT cores_wanted, steady_cores_wanted, steady_mem_kb FROM runs", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(steady < peak, "the history keeps the start-up peak ({peak:.2}) and the steady state ({steady:.2}) apart");
+    assert!(steady_mem > 0);
+    let explain = String::from_utf8_lossy(&e.run(&["doctor", "--explain", "sh -c x"]).stdout).into_owned();
+    assert!(!explain.contains("long-lived"), "only the stack pool is: {explain}");
+}
+
+#[test]
 fn enabled_false_runs_every_command_straight_through() {
     // A one-slot pool would queue the second job; switched off, nothing queues
     // and nothing is recorded.

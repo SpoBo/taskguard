@@ -104,6 +104,16 @@ retention_rollup_days = 90  # keep one-minute averages this long
 # Take away a built-in pool's ceiling, so only CPU and memory decide:
 # [pool.db]
 # unlimited = true
+#
+# Jobs that run until someone stops them, such as dev stacks: each starts when
+# there is room for its start-up peak and holds that peak for `startup`
+# seconds (300 by default). After that its needs follow what it uses, so an
+# idle stack does not keep the cores it took while it started. A [[job]] rule
+# can set both too; its long_lived wins over its pool's.
+# [pool.stack]
+# max_slots = 4
+# long_lived = true
+# startup = 600
 
 # ---------------------------------------------------------- job rules ----
 # Per-command settings. `match` is a pattern: the command word, then words that

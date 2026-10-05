@@ -138,6 +138,20 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   `per_checkout = false`, so other worktrees are never held up.
   `taskguard --id e2e -j1 ...`, a `[pool.NAME]` section, or the Config view
   of `taskguard top`.
+- **Long-lived jobs** run until someone stops them, such as a dev stack. Mark
+  them with `long_lived = true` in a `[pool.NAME]` or `[[job]]` section. Such
+  a job starts when there is room for its start-up peak, and holds that peak
+  for its start-up (`startup`, 300 seconds by default). Then its needs start
+  again from what it uses: its CPU need is what it wanted over the last 10
+  seconds, up or down, and its memory need what it holds plus 25%, or what
+  its past runs grew to after their start-up when that is more, and it follows
+  its peak from there. A DALP dev stack wants almost every core while it
+  starts and seeds, then idles at a few percent; without this it kept every
+  core for hours. Its history keeps both: the start-up peak, which the next
+  run is admitted against, and what it took after. Past its start-up it
+  counts as load from outside taskguard: no job waits for it to end, and when
+  nothing else runs, the first in line starts whatever the readings say.
+  `auto_pause` leaves it alone. `taskguard status` marks it `STEADY`.
 
 ### What is measured
 
@@ -419,6 +433,11 @@ unlimited = true
 match = "vitest run --project integration"
 min_cpu = 4
 min_mem = "6G"
+
+[pool.stack]           # dev stacks: four at a time, each holding its
+max_slots = 4          # start-up peak for 10 minutes, then what it uses
+long_lived = true
+startup = 600
 ```
 
 The built-in defaults name common JavaScript tools, not the scripts of one
@@ -499,7 +518,11 @@ error: a repo can pin a newer taskguard that knows it, while an older one runs
 from another worktree. `taskguard doctor` lists them. Versions before 0.2.1
 stop with an error instead.
 
-A version only follows the rules it knows. A version before 0.4.0 does not
+A version only follows the rules it knows. A version that does not know
+`long_lived` runs such a job as any other: it holds its start-up peak until it
+ends. Its waiting jobs do read the lower needs of a long-lived job that a newer
+version runs, but they still wait for it to end when nothing else runs.
+A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not
 read priorities: its waiting jobs start in ticket order and do not step aside

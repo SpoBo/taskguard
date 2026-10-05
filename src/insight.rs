@@ -26,6 +26,9 @@ pub struct Tracker {
     pub samples: usize,
     pub full_samples: usize,
     pub pressure_samples: usize,
+    /// When a long-lived job left its start-up, with the CPU totals then.
+    steady: Option<(f64, u64, u64)>,
+    pub steady_peak_mem_kb: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +46,8 @@ pub struct Reading {
     pub wanted: f64,
     pub mem_kb: u64,
     pub pageins_per_s: f64,
+    /// Cores wanted over the last `WINDOW_S`.
+    pub wanted_recent: f64,
 }
 
 impl Tracker {
@@ -82,6 +87,9 @@ impl Tracker {
         }
         self.last = cur;
         self.peak_mem_kb = self.peak_mem_kb.max(mem);
+        if self.steady.is_some() {
+            self.steady_peak_mem_kb = self.steady_peak_mem_kb.max(mem);
+        }
         self.cpu_ns += dcpu;
         self.runnable_ns += drun;
         self.pageins += dpi;
@@ -111,7 +119,24 @@ impl Tracker {
             wanted: (step.cpu + step.run) / step.dt,
             mem_kb: mem,
             pageins_per_s: step.pageins / step.dt,
+            wanted_recent: (c + r) / span.max(1e-3),
         })
+    }
+
+    /// A long-lived job left its start-up at `ts`, holding `mem_kb`.
+    pub fn steady_from(&mut self, ts: f64, mem_kb: u64) {
+        self.steady = Some((ts, self.cpu_ns, self.runnable_ns));
+        self.steady_peak_mem_kb = mem_kb;
+    }
+
+    /// What a long-lived job took after its start-up, which ended `paused_s`
+    /// paused seconds before `end`: the cores it wanted on average, and its
+    /// memory peak. None while it never left its start-up.
+    pub fn steady(&self, end: f64, paused_s: f64) -> Option<(f64, u64)> {
+        let (ts, cpu, run) = self.steady?;
+        let wall = (end - ts - paused_s).max(1e-3);
+        let wanted = (self.cpu_ns + self.runnable_ns).saturating_sub(cpu + run) as f64 / 1e9 / wall;
+        Some((wanted, self.steady_peak_mem_kb))
     }
 
     /// Sustained cores used and wanted. A run shorter than the window is
@@ -339,6 +364,31 @@ mod tests {
         let (used, wanted) = t.sustained(12.0);
         assert!((used - 1.0).abs() < 0.05, "{used}");
         assert!((wanted - 3.0).abs() < 0.05, "{wanted}");
+    }
+
+    #[test]
+    fn a_long_lived_job_keeps_its_start_up_peak_and_its_steady_state_apart() {
+        let mut t = Tracker::starting_at(1000.0);
+        assert_eq!(t.steady(1000.0, 0.0), None, "no steady state while it starts");
+        // Start-up: 10 cores for 20 s, up to 6 GB.
+        let mut cpu = 0.0;
+        for i in 1..=10 {
+            cpu += 20.0;
+            t.add(at(cpu, 0.0, 600 * i), 1000.0 + i as f64 * 2.0);
+        }
+        t.steady_from(1020.0, 3000);
+        // Then 0.5 cores for 100 s, of which 20 s paused, at 3 to 4 GB.
+        for i in 1..=40 {
+            cpu += 1.0;
+            let r = t.add(at(cpu, 0.0, if i == 20 { 4000 } else { 3000 }), 1020.0 + i as f64 * 2.0).unwrap();
+            assert!((r.wanted_recent - 0.5).abs() < 0.01 || i < 5, "the last 10 s: {}", r.wanted_recent);
+        }
+        let (wanted, mem) = t.steady(1120.0, 20.0).unwrap();
+        assert!((wanted - 0.5).abs() < 0.01, "cores wanted after the start-up, paused time left out: {wanted}");
+        assert_eq!(mem, 4000);
+        let (_, peak_wanted) = t.sustained(120.0);
+        assert!(peak_wanted >= 9.9, "the run still learns its start-up peak: {peak_wanted}");
+        assert_eq!(t.peak_mem_kb, 6000);
     }
 
     #[test]

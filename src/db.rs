@@ -57,7 +57,9 @@ CREATE TABLE IF NOT EXISTS runs (
   machine_full_frac REAL,
   imported INTEGER NOT NULL DEFAULT 0,
   paused_s REAL,
-  package TEXT
+  package TEXT,
+  steady_cores_wanted REAL,
+  steady_mem_kb INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -177,6 +179,11 @@ pub struct Learned {
     pub dur_s: Option<f64>,
     /// A recent run was starved of memory, so the memory need gets +25%.
     pub mem_boosted: bool,
+    /// For a long-lived job, what its recent runs took after their start-up
+    /// (`mem_kb` and `cpu` hold the start-up peak): the max of the memory
+    /// peaks and the median of the cores wanted on average. None for others.
+    pub steady_mem_kb: Option<u64>,
+    pub steady_cpu: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -216,6 +223,9 @@ pub struct RunResult {
     pub measured: bool,
     /// Seconds the run was paused for memory; not part of its duration.
     pub paused_s: f64,
+    /// A long-lived job after its start-up: cores wanted on average, and
+    /// the memory peak. None for other jobs.
+    pub steady: Option<(f64, u64)>,
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -261,33 +271,44 @@ impl Db {
             conn.execute_batch("ALTER TABLE runs ADD COLUMN package TEXT")?;
         }
         conn.execute_batch("CREATE INDEX IF NOT EXISTS runs_package ON runs(package, cmd)")?;
+        // Databases made before long-lived jobs: what a run took after its start-up.
+        for (col, kind) in [("steady_cores_wanted", "REAL"), ("steady_mem_kb", "INTEGER")] {
+            let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('runs') WHERE name = '{col}'"))?.exists([])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {col} {kind}"))?;
+            }
+        }
         Ok(Db { conn })
     }
 
     pub fn learned(&self, key: &str, keep: usize, boost_runs: usize) -> Result<Learned> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved FROM runs
-             WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
+            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb, steady_cores_wanted
+             FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC LIMIT ?2",
         )?;
-        // peak memory, cores wanted, duration, starved
-        type Row = (i64, Option<f64>, Option<f64>, Option<String>);
+        // peak memory, cores wanted, duration, starved, and after the start-up: memory peak, cores wanted
+        type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>);
         let rows: Vec<Row> = stmt
-            .query_map(params![key, keep.max(boost_runs) as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .query_map(params![key, keep.max(boost_runs) as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
             .collect::<std::result::Result<_, _>>()?;
         let recent = &rows[..rows.len().min(keep)];
         let mem = recent.iter().map(|r| r.0 as u64).max();
         let mut cpu = median_of(recent.iter().filter_map(|r| r.1).collect());
         // After a run that was starved of CPU, the need is at least what that
         // run wanted, so one starved run is never averaged away by the median.
-        if let Some((_, Some(w), _, Some(st))) = rows.first()
+        if let Some((_, Some(w), _, Some(st), _, _)) = rows.first()
             && (st == "cpu" || st == "slowdown")
         {
             cpu = cpu.map(|c| c.max(*w));
         }
         let dur = median_of(recent.iter().filter_map(|r| r.2).collect());
         let boosted = rows.iter().take(boost_runs).any(|r| r.3.as_deref() == Some("memory"));
-        Ok(Learned { runs: recent.len(), mem_kb: mem, cpu, dur_s: dur, mem_boosted: boosted })
+        let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
+        let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
+        Ok(Learned { runs: recent.len(), mem_kb: mem, cpu, dur_s: dur, mem_boosted: boosted, steady_mem_kb, steady_cpu })
     }
 
     pub fn set_need(&self, run_id: i64, cpu: f64, mem_kb: u64) -> Result<()> {
@@ -338,7 +359,7 @@ impl Db {
         self.conn.execute(
             "UPDATE runs SET ended_at = ?2, exit = ?3, peak_mem_kb = ?4, cores_used = ?5, cores_wanted = ?6,
                 cpu_seconds = ?7, runnable_seconds = ?8, pageins = ?9, starved = ?10, starved_detail = ?11,
-                machine_full_frac = ?12, paused_s = ?13
+                machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15
              WHERE id = ?1",
             params![
                 id,
@@ -353,7 +374,9 @@ impl Db {
                 r.starved,
                 r.starved_detail,
                 r.machine_full_frac,
-                (r.paused_s > 0.0).then_some(r.paused_s)
+                (r.paused_s > 0.0).then_some(r.paused_s),
+                r.steady.filter(|_| r.measured).map(|s| s.0),
+                r.steady.filter(|_| r.measured).map(|s| s.1 as i64)
             ],
         )?;
         Ok(())
@@ -773,6 +796,46 @@ mod tests {
         assert!(e.from.starts_with("typical of"), "{}", e.from);
         let e = db.estimate(Some(("@dapp/new", "vitest run")), Some("test"), "vitest", None).unwrap().unwrap();
         assert!(e.from.starts_with("typical of"), "{}", e.from);
+    }
+
+    #[test]
+    fn a_long_lived_job_learns_its_start_up_peak_and_its_steady_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for (peak, steady) in
+            [((6_000_000, 11.0), (3_000_000, 0.3)), ((5_000_000, 10.0), (4_000_000, 0.5)), ((7_000_000, 12.0), (3_500_000, 0.2))]
+        {
+            let id = db.insert_run(&NewRun { ns: "n", key: "stack", ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 3600.0, 0.0, None).unwrap();
+            let r = RunResult {
+                ended_at: now(),
+                peak_mem_kb: peak.0,
+                cores_wanted: peak.1,
+                measured: true,
+                steady: Some((steady.1, steady.0)),
+                ..Default::default()
+            };
+            db.finish_run(id, &r).unwrap();
+        }
+        let l = db.learned("stack", 10, 5).unwrap();
+        assert_eq!((l.mem_kb, l.cpu), (Some(7_000_000), Some(11.0)), "it is admitted against its start-up peak");
+        assert_eq!((l.steady_mem_kb, l.steady_cpu), (Some(4_000_000), Some(0.3)), "the steady state: max memory, median cores");
+        // An ordinary job has no steady state.
+        run(&db, "k", 1000, 1.0, 10.0, None);
+        let l = db.learned("k", 10, 5).unwrap();
+        assert_eq!((l.steady_mem_kb, l.steady_cpu), (None, None));
+    }
+
+    #[test]
+    fn opens_a_database_from_before_long_lived_jobs() {
+        let path = std::env::temp_dir().join(format!("tg-old-steady-{}.db", std::process::id()));
+        drop(Db::open(&path).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE runs DROP COLUMN steady_cores_wanted; ALTER TABLE runs DROP COLUMN steady_mem_kb").unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        assert!(db.conn.prepare("SELECT steady_cores_wanted, steady_mem_kb FROM runs").is_ok());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

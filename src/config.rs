@@ -66,6 +66,9 @@ pub struct PoolCfg {
     pub per_checkout: Option<bool>,
     #[serde(default, rename = "match")]
     pub patterns: Vec<String>,
+    /// Its jobs run for hours, such as dev stacks: see `Config::long_lived`.
+    pub long_lived: Option<bool>,
+    pub startup: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -78,6 +81,8 @@ pub struct JobRule {
     pub now: Option<bool>,
     pub pool: Option<String>,
     pub priority: Option<i32>,
+    pub long_lived: Option<bool>,
+    pub startup: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +91,12 @@ pub struct Pool {
     pub max_slots: Option<u32>,
     pub per_checkout: bool,
     pub patterns: Vec<String>,
+    pub long_lived: bool,
+    pub startup: Option<u64>,
 }
+
+/// Seconds a long-lived job holds its start-up peak when no `startup` is set.
+pub const STARTUP_S: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -160,6 +170,8 @@ impl Default for Config {
                     max_slots: Some(1),
                     per_checkout: true,
                     patterns: p.iter().map(|s| s.to_string()).collect(),
+                    long_lived: false,
+                    startup: None,
                 })
                 .collect(),
             labels: builtin::LABELS.iter().map(|(n, p)| (n.to_string(), p.iter().map(|s| s.to_string()).collect())).collect(),
@@ -565,6 +577,8 @@ impl Config {
                     _ => base.as_ref().and_then(|b| b.max_slots),
                 },
                 per_checkout: p.per_checkout.or(base.as_ref().map(|b| b.per_checkout)).unwrap_or(true),
+                long_lived: p.long_lived.or(base.as_ref().map(|b| b.long_lived)).unwrap_or(false),
+                startup: p.startup.or(base.as_ref().and_then(|b| b.startup)),
                 patterns: if p.patterns.is_empty() { base.map(|b| b.patterns).unwrap_or_default() } else { p.patterns.clone() },
             };
             match existing {
@@ -638,6 +652,9 @@ pub struct Classified {
     pub min_mem_kb: Option<u64>,
     pub now: bool,
     pub priority: Option<i32>,
+    /// Set by a [[job]] rule; otherwise the job's pool decides.
+    pub long_lived: Option<bool>,
+    pub startup: Option<u64>,
     /// For `doctor --explain`: which rule set what.
     pub why: Vec<String>,
 }
@@ -696,8 +713,28 @@ impl Config {
                 c.pool = Some((p.clone(), found.and_then(|x| x.max_slots), found.map(|x| x.per_checkout).unwrap_or(true)));
                 c.why.push(format!("pool {p} from [[job]] {what:?} in {layer}"));
             }
+            if let Some(v) = rule.long_lived {
+                c.long_lived = Some(v);
+                c.why.push(format!("long_lived = {v} from [[job]] {what:?} in {layer}"));
+            }
+            if let Some(v) = rule.startup {
+                c.startup = Some(v);
+                c.why.push(format!("startup {v}s from [[job]] {what:?} in {layer}"));
+            }
         }
         Ok(c)
+    }
+
+    /// A long-lived job, such as a dev stack, runs until someone stops it. It
+    /// starts when there is room for its start-up peak, and holds that peak
+    /// for its start-up phase. After that its needs follow what it uses, so
+    /// a stack that idles at a few percent does not keep the start-up peak
+    /// of every core for hours. Returns the start-up phase in seconds, or None
+    /// for an ordinary job. A [[job]] rule wins over the job's pool.
+    pub fn long_lived(&self, cls: &Classified, pool: Option<&str>) -> Option<f64> {
+        let pool = pool.and_then(|p| self.pools.iter().find(|x| x.name == p));
+        let on = cls.long_lived.or(pool.map(|p| p.long_lived)).unwrap_or(false);
+        on.then(|| cls.startup.or(pool.and_then(|p| p.startup)).unwrap_or(STARTUP_S) as f64)
     }
 }
 
@@ -884,6 +921,30 @@ mod tests {
         assert_eq!(c.pools.iter().find(|p| p.name == "e2e").unwrap().patterns, vec!["playwright test"]);
         let (_, unknown) = parse_layer(&text).unwrap();
         assert_eq!(unknown, Vec::<String>::new());
+    }
+
+    #[test]
+    fn long_lived_comes_from_the_pool_or_a_job_rule() {
+        let mut c = Config::default();
+        let (layer, unknown) = parse_layer(
+            "[pool.stack]\nmax_slots = 4\nlong_lived = true\nmatch = [\"dev-env up\"]\n\
+             [pool.browser]\nlong_lived = true\nstartup = 60\n\
+             [[job]]\nmatch = \"dev-env up --seed-only\"\nlong_lived = false\n\
+             [[job]]\nmatch = \"storybook-server\"\nlong_lived = true\nstartup = 30\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+        c.apply(&layer, "repo");
+        let long = |c: &Config, cmd: &str, pool: Option<&str>| c.long_lived(&c.classify(&argv(cmd), "k").unwrap(), pool);
+        assert_eq!(long(&c, "dev-env up", Some("stack")), Some(STARTUP_S as f64), "the pool's, with the default start-up");
+        assert_eq!(long(&c, "scenarios", Some("browser")), Some(60.0), "a pool named with --id");
+        assert_eq!(long(&c, "dev-env up --seed-only", Some("stack")), None, "a [[job]] rule wins over its pool");
+        assert_eq!(long(&c, "storybook-server", None), Some(30.0));
+        assert_eq!(long(&c, "tsc -p .", None), None, "ordinary jobs are not");
+        assert_eq!(long(&c, "tsc -p .", Some("db")), None);
+        // A later layer that only changes the ceiling keeps the mode.
+        c.apply(&parse_layer("[pool.stack]\nmax_slots = 2\n").unwrap().0, "user");
+        assert_eq!(long(&c, "dev-env up", Some("stack")), Some(STARTUP_S as f64));
     }
 
     #[test]

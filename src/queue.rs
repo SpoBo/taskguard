@@ -94,6 +94,9 @@ pub struct Entry {
     /// Older versions leave both out, and their jobs never step aside.
     pub pipeline: Option<String>,
     pub pipeline_since: Option<f64>,
+    /// A long-lived job (a dev stack) left its start-up phase then: from
+    /// that moment its needs follow what it uses. Older versions leave it out.
+    pub steady_since: Option<f64>,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -105,6 +108,13 @@ impl Entry {
     /// Paused by auto_pause, not by hand: it resumes before anything new starts.
     pub fn auto_paused(&self) -> bool {
         self.paused_since.is_some() && !self.paused_by_hand
+    }
+
+    /// A long-lived job past its start-up. It runs until someone stops it,
+    /// so the queue treats it as load on the machine, as it does programs
+    /// outside taskguard: no job waits for it to end.
+    pub fn steady(&self) -> bool {
+        self.steady_since.is_some()
     }
 
     /// Seconds a running job has left by its learned duration, at least one.
@@ -172,6 +182,51 @@ impl Entry {
         let grew = self.mem_grew_at.unwrap_or(started);
         let left = (SETTLE_S - (now - grew)).min(SETTLE_MAX_S - (now - started));
         (left > 0.0).then_some(left)
+    }
+}
+
+/// A long-lived job, such as a dev stack: it runs until someone stops it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongLived {
+    /// Seconds after its start that it holds its start-up peak.
+    pub startup: f64,
+    /// The highest memory its past runs took after their start-up: what it
+    /// still grows to once it settles.
+    pub steady_mem_kb: Option<u64>,
+}
+
+impl Entry {
+    /// Move a running job's needs after one reading of it: `mem_kb` and the
+    /// cores it `wanted` in the last interval, and `wanted_recent` over the
+    /// last seconds.
+    ///
+    /// Past its needs, a job's needs follow its peak, with room to grow: what
+    /// it promises to take must keep up with what it takes. A long-lived job
+    /// does so through its start-up only. After that its needs start again
+    /// from what it uses: a dev stack that took every core while it started
+    /// and seeded, and idles at a few percent, must not keep every core for
+    /// hours. Its memory need is what it holds plus a quarter, or what its
+    /// past runs grew to after their start-up when that is more, and follows
+    /// its peak from there: running out of memory kills processes. Its CPU
+    /// need is what it wanted over the last seconds, up or down, because too
+    /// little CPU only makes a job slower, and the machine reading still
+    /// counts what it uses.
+    pub fn follow(&mut self, mem_kb: u64, wanted: f64, wanted_recent: f64, ncpu: f64, now: f64, long: Option<LongLived>) {
+        if let Some(l) = long
+            && self.steady_since.is_none()
+            && now - self.started_at.unwrap_or(now) >= l.startup
+        {
+            self.steady_since = Some(now);
+            self.need_mem_kb = (mem_kb + mem_kb / 4).max(l.steady_mem_kb.unwrap_or(0));
+        }
+        if mem_kb > self.need_mem_kb {
+            self.need_mem_kb = mem_kb + mem_kb / 4;
+        }
+        if self.steady_since.is_some() {
+            self.need_cpu = wanted_recent.min(ncpu);
+        } else if wanted > self.need_cpu {
+            self.need_cpu = wanted.min(ncpu);
+        }
     }
 }
 
@@ -587,10 +642,13 @@ pub fn decide(
 
     // Always make progress: with nothing running, the oldest job starts,
     // whatever the readings say. This is what keeps the queue from deadlocking
-    // on a machine that is busy with work outside taskguard.
-    if running.is_empty() {
+    // on a machine that is busy with work outside taskguard. A long-lived job
+    // past its start-up counts as such work: it may run for hours, and a job
+    // it keeps out would otherwise hold up the whole queue until it is stopped.
+    if running.iter().all(Entry::steady) {
         return match older.first() {
-            None => Decision::Admit { reason: "nothing else is running".into() },
+            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into() },
+            None => Decision::Admit { reason: "nothing else is running but long-lived jobs past their start-up".into() },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
         };
     }
@@ -653,11 +711,11 @@ pub fn decide(
 
 /// In how many seconds a job that `blockers` keep out could start at the
 /// soonest, by the learned durations of the running jobs: once they have
-/// freed what it lacks, or else once none of them runs, as then the first in
-/// line starts whatever the readings say. None when that hangs on a job whose
-/// duration is unknown.
+/// freed what it lacks, or else once none of them runs but long-lived jobs
+/// past their start-up, as then the first in line starts whatever the readings
+/// say. None when that hangs on a job whose duration is unknown.
 fn soonest_start(blockers: &[Blocker], running: &[Entry], now: f64) -> Option<f64> {
-    let drained = running.iter().try_fold(0.0, |t: f64, e| Some(t.max(e.remaining(now)?)));
+    let drained = running.iter().filter(|e| !e.steady()).try_fold(0.0, |t: f64, e| Some(t.max(e.remaining(now)?)));
     blockers.iter().try_fold(0.0, |t: f64, b| Some(t.max(crate::report::start_eta(b, running, now).or(drained)?)))
 }
 
@@ -784,7 +842,8 @@ pub const PAUSE_MAX: f64 = 300.0;
 /// - Memory at or above `pause_at`, or the kernel at critical pressure: pause
 ///   the running job with the lowest priority, newest first. At least one job
 ///   keeps running, --now jobs are never paused, and only one job pauses per
-///   `PAUSE_GAP`.
+///   `PAUSE_GAP`. Nor is a long-lived job past its start-up: a stopped dev
+///   stack stops answering everything that talks to it, and keeps its memory.
 /// - Memory under `resume_at` and no pressure warning: the paused job with the
 ///   highest priority, paused first, resumes after its minimum pause.
 /// - A paused job always resumes when no other job runs, and when auto_pause
@@ -822,7 +881,7 @@ pub fn pause_step(m: &MachineSample, r: &PauseRules, running: &[Entry], now: f64
     }
     let victim = active
         .iter()
-        .filter(|e| e.pausable && !e.now && e.child_pid > 0)
+        .filter(|e| e.pausable && !e.now && !e.steady() && e.child_pid > 0)
         .min_by(|a, b| a.priority.cmp(&b.priority).then(b.started_at.unwrap_or(0.0).total_cmp(&a.started_at.unwrap_or(0.0))))?;
     (victim.pid == me).then_some(true)
 }
@@ -1186,6 +1245,10 @@ mod tests {
         old_version.pausable = false;
         assert_eq!(step(&full, &[old_version, now_job], 2, 1000.0, 0.0), None);
         assert_eq!(step(&full, std::slice::from_ref(&new), 2, 1000.0, 0.0), None);
+        // Nor is a dev stack past its start-up: the job before it pauses instead.
+        let stack = Entry { steady_since: Some(250.0), ..new.clone() };
+        assert_eq!(step(&full, &[old.clone(), stack.clone()], 2, 1000.0, 0.0), None);
+        assert_eq!(step(&full, &[old, stack], 1, 1000.0, 0.0), Some(true));
     }
 
     #[test]
@@ -1394,6 +1457,118 @@ mod tests {
         let waiting = [urgent, quick.clone(), slow.clone()];
         assert!(blockers(decide(&m, &backfill, r, &waiting, &quick, 2900.0, &[])).is_empty());
         assert_eq!(blockers(decide(&m, &backfill, r, &waiting, &slow, 2900.0, &[])), vec!["priority"]);
+    }
+
+    /// A dev stack on a 12-core machine: it wants 11 cores and 6 GB while it
+    /// starts and seeds, then idles at a few percent of a core. It runs until
+    /// someone stops it, so it has no duration to count on.
+    fn stack() -> Entry {
+        job(1, "dalp:stack", 11.0, 6)
+    }
+
+    const STACK: LongLived = LongLived { startup: 300.0, steady_mem_kb: None };
+
+    #[test]
+    fn a_long_lived_job_is_admitted_against_its_start_up_peak() {
+        let me = stack();
+        let other = job(2, "lint", 0.5, 1);
+        let w = std::slice::from_ref(&me);
+        // 4 busy + 0.5 promised + 11 > 12 cores: it waits for room for its peak.
+        assert_eq!(blockers(decide(&machine(4.0, 4), &LIM, std::slice::from_ref(&other), w, &me, 1000.0, &[])), vec!["cpu"]);
+        assert!(blockers(decide(&machine(0.4, 4), &LIM, std::slice::from_ref(&other), w, &me, 1000.0, &[])).is_empty());
+
+        // Started at 1000: through its start-up it holds that peak, even in a lull.
+        let mut s = Entry { started_at: Some(1000.0), ..me };
+        s.follow(2 * GB, 11.0, 11.0, 12.0, 1010.0, Some(STACK));
+        s.follow(3 * GB, 0.2, 0.3, 12.0, 1200.0, Some(STACK));
+        (s.live_cpu, s.live_mem_kb) = (0.2, 3 * GB);
+        assert_eq!((s.need_cpu, s.need_mem_kb, s.steady_since), (11.0, 6 * GB, None));
+        // 0.5 busy + 10.8 still promised to the stack + 3 > 12 cores.
+        let build = job(3, "build", 3.0, 2);
+        let r = std::slice::from_ref(&s);
+        assert_eq!(blockers(decide(&machine(0.5, 4), &LIM, r, std::slice::from_ref(&build), &build, 1200.0, &[])), vec!["cpu"]);
+    }
+
+    #[test]
+    fn after_its_start_up_a_long_lived_job_reserves_what_it_uses() {
+        let mut s = Entry { started_at: Some(1000.0), ..stack() };
+        s.follow(5 * GB, 11.0, 11.0, 12.0, 1100.0, Some(STACK));
+        // 300 s in, its start-up is over. It holds 3 GB and wants 0.3 cores.
+        s.follow(3 * GB, 0.2, 0.3, 12.0, 1300.0, Some(STACK));
+        assert_eq!(s.steady_since, Some(1300.0));
+        assert_eq!((s.need_cpu, s.need_mem_kb), (0.3, 3 * GB + 3 * GB / 4));
+        (s.live_cpu, s.live_mem_kb) = (0.2, 3 * GB);
+        // The build that waited for the start-up peak now starts.
+        let build = job(3, "build", 3.0, 2);
+        let r = std::slice::from_ref(&s);
+        assert!(blockers(decide(&machine(0.5, 4), &LIM, r, std::slice::from_ref(&build), &build, 1300.0, &[])).is_empty());
+
+        // A test run against the stack raises its CPU need, which falls back after.
+        s.follow(3 * GB, 6.0, 4.0, 12.0, 1400.0, Some(STACK));
+        assert_eq!(s.need_cpu, 4.0);
+        s.follow(3 * GB, 0.2, 0.3, 12.0, 1420.0, Some(STACK));
+        assert_eq!(s.need_cpu, 0.3);
+        // Its memory need follows its peak, as for every job, and never falls.
+        s.follow(4 * GB, 0.2, 0.3, 12.0, 1440.0, Some(STACK));
+        s.follow(2 * GB, 0.2, 0.3, 12.0, 1460.0, Some(STACK));
+        assert_eq!(s.need_mem_kb, 5 * GB);
+
+        // What its past runs grew to after their start-up stays reserved.
+        let mut again = Entry { started_at: Some(1000.0), ..stack() };
+        again.follow(3 * GB, 0.2, 0.3, 12.0, 1300.0, Some(LongLived { steady_mem_kb: Some(5 * GB), ..STACK }));
+        assert_eq!(again.need_mem_kb, 5 * GB);
+
+        // An ordinary job keeps its peak needs for its whole run.
+        let mut compile = Entry { started_at: Some(1000.0), ..job(4, "compile", 2.0, 6) };
+        compile.follow(3 * GB, 11.0, 11.0, 12.0, 1010.0, None);
+        compile.follow(3 * GB, 0.2, 0.3, 12.0, 5000.0, None);
+        assert_eq!((compile.need_cpu, compile.need_mem_kb, compile.steady_since), (11.0, 6 * GB, None));
+    }
+
+    /// A reserved job that a stack keeps out: the stack never ends by itself,
+    /// so nothing counts on it to make room. It counts as load from outside
+    /// taskguard: once only stacks run, the first in line starts whatever the
+    /// readings say, and past `max_backfill` a newer job passes only when it
+    /// ends before that.
+    #[test]
+    fn backfill_never_waits_for_a_long_lived_job_to_end() {
+        let backfill = Limits { max_backfill: 1800.0, ..LIM };
+        // Two stacks past their start-up hold 10 GB each, other programs 6.
+        let steady = |pid: i32| Entry {
+            pid,
+            started_at: Some(0.0),
+            steady_since: Some(300.0),
+            live_cpu: 0.3,
+            live_mem_kb: 10 * GB,
+            ..job(1, "dalp:stack", 0.3, 10)
+        };
+        let stacks = [steady(11), steady(12)];
+        let m = machine(2.0, 26);
+        // A 12 GB head would reach 38 GB of 27.2.
+        let (_, head) = blocked_head();
+        let quick = Entry { est_dur_s: Some(60.0), ..job(3, "install", 0.2, 1) };
+        let waiting = [head.clone(), quick.clone()];
+        // Nothing but the stacks runs: the head starts, as when they ran outside taskguard.
+        assert!(blockers(decide(&m, &backfill, &stacks, &waiting, &head, 2900.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &backfill, &stacks, &waiting, &quick, 2900.0, &[])), vec!["order"]);
+
+        // A compile that ends in 100 s runs too. Past max_backfill, the head
+        // starts once the compile is done, and a job that ends before then passes.
+        let mut compile = Entry { started_at: Some(1000.0), est_dur_s: Some(2000.0), ..job(4, "compile", 1.0, 1) };
+        compile.live_mem_kb = GB;
+        let running = [stacks[0].clone(), stacks[1].clone(), compile.clone()];
+        let slow = Entry { est_dur_s: Some(600.0), ..job(5, "build", 0.2, 1) };
+        let waiting = [head.clone(), quick.clone(), slow.clone()];
+        assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &head, 2900.0, &[])), vec!["memory"]);
+        assert!(blockers(decide(&m, &backfill, &running, &waiting, &quick, 2900.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &slow, 2900.0, &[])), vec!["reserved"]);
+
+        // A stack still in its start-up holds the room it may take: nothing
+        // starts into it whatever the readings say, and nobody counts on it ending.
+        let starting = Entry { steady_since: None, ..stacks[0].clone() };
+        let running = [starting, stacks[1].clone()];
+        assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &head, 2900.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &quick, 2900.0, &[])), vec!["reserved"]);
     }
 
     #[test]
