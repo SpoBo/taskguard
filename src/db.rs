@@ -604,6 +604,39 @@ impl Db {
         Ok(())
     }
 
+    /// File runs that older versions put under a wrong namespace under the
+    /// right one (see `key::renamed_namespace`). Returns how many names moved.
+    pub fn fix_namespaces(&self) -> Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT ns, max(cwd) FROM runs WHERE cwd IS NOT NULL GROUP BY ns")?;
+        let names: Vec<(String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+        let mut moved = 0;
+        for (ns, cwd) in names {
+            if let Some(right) = crate::key::renamed_namespace(Path::new(&cwd), &ns) {
+                self.rename_ns(&ns, &right)?;
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Move every run and every minute of load from one namespace to another.
+    /// Both can have load in the same minute; their loads add up.
+    pub fn rename_ns(&self, from: &str, to: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE runs SET ns = ?2 WHERE ns = ?1", params![from, to])?;
+        tx.execute(
+            "INSERT INTO ns_1m (minute, ns, cores_avg, mem_avg_kb)
+             SELECT minute, ?2, cores_avg, mem_avg_kb FROM ns_1m WHERE ns = ?1
+             ON CONFLICT (minute, ns) DO UPDATE SET
+               cores_avg = coalesce(cores_avg, 0) + coalesce(excluded.cores_avg, 0),
+               mem_avg_kb = coalesce(mem_avg_kb, 0) + coalesce(excluded.mem_avg_kb, 0)",
+            params![from, to],
+        )?;
+        tx.execute("DELETE FROM ns_1m WHERE ns = ?1", [from])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn prune(&self, raw_hours: u64, rollup_days: u64) -> Result<()> {
         let raw_cut = now() - raw_hours as f64 * 3600.0;
         let roll_cut = ((now() - rollup_days as f64 * 86400.0) / 60.0) as i64;
@@ -673,6 +706,31 @@ mod tests {
         let mut want: Vec<String> = v0_1_0.iter().chain(added.iter()).map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(required, want);
+    }
+
+    #[test]
+    fn rename_ns_merges_runs_and_minutes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open(&tmp.path().join("t.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "INSERT INTO runs (ns, key, queued_at) VALUES ('01ABC', 'k', 1), ('dalp', 'k', 2), ('shop', 'k', 3);
+                 INSERT INTO ns_1m VALUES (10, '01ABC', 1.5, 100), (11, '01ABC', 2.0, 200), (10, 'dalp', 0.5, 50), (10, 'shop', 9, 9);",
+            )
+            .unwrap();
+        db.rename_ns("01ABC", "dalp").unwrap();
+        let ns: Vec<String> =
+            db.conn.prepare("SELECT ns FROM runs ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(ns, ["dalp", "dalp", "shop"]);
+        let rows: Vec<(i64, String, f64, f64)> = db
+            .conn
+            .prepare("SELECT minute, ns, cores_avg, mem_avg_kb FROM ns_1m ORDER BY minute, ns")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows, [(10, "dalp".into(), 2.0, 150.0), (10, "shop".into(), 9.0, 9.0), (11, "dalp".into(), 2.0, 200.0)]);
     }
 
     #[test]

@@ -67,6 +67,9 @@ pub fn run() -> Result<()> {
         if now - last_prune >= PRUNE_EVERY {
             last_prune = now;
             let _ = db.prune(cfg.retention_raw_hours, cfg.retention_rollup_days);
+            // Hourly, so runs that an older version still files under a
+            // wrong name move too.
+            let _ = db.fix_namespaces();
         }
         let idle_since = q.last_activity().max(started);
         if waiting + running == 0 && q.viewers() == 0 && now - idle_since >= idle_exit {
