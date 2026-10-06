@@ -22,6 +22,8 @@ use std::time::Duration;
 /// Options from the sem-style command line.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Opts {
+    /// --help before the command: show the help of the run form.
+    pub help: bool,
     pub jobs: Option<String>,
     pub id: Option<String>,
     pub ns: Option<String>,
@@ -227,12 +229,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let startup = cfg.long_lived(&cls, pool.as_deref());
 
     let database = Db::open_dir(&dir).ok();
-    let learned = database.as_ref().and_then(|d| d.learned(&jkey, cfg.hist_keep, cfg.boost_runs).ok()).unwrap_or_default();
+    let learned = database.as_ref().and_then(|d| d.learned(&jkey, &cfg.learn()).ok()).unwrap_or_default();
     // A compile with no history of its own falls back on what tsc-queue learned.
     let tool = matcher::effective(&o.cmd).first().map(|c| c.rsplit('/').next().unwrap_or(c).to_string()).unwrap_or_default();
     let learned = match (&database, learned.runs, tool.as_str()) {
         (Some(d), 0, "tsc" | "tsgo") => {
-            d.learned(&format!("tsc-queue:{}", crate::commands::legacy_key(&cwd)), cfg.hist_keep, cfg.boost_runs).unwrap_or(learned)
+            d.learned(&format!("tsc-queue:{}", crate::commands::legacy_key(&cwd)), &cfg.learn()).unwrap_or(learned)
         }
         _ => learned,
     };
@@ -260,6 +262,20 @@ pub fn run(mut o: Opts) -> Result<i32> {
     };
     let need_cpu = learned.cpu.or(est_cpu).unwrap_or(0.0).min(cpu_cap).max(min_cpu.unwrap_or(0.0));
     let need_mem = learned_mem.or(est_mem).unwrap_or(0).max(min_mem.unwrap_or(0));
+    // A job that once took more memory than the limit allows is capped at the
+    // limit, as CPU is: otherwise it could only ever start on an empty machine.
+    let mem_cap = (sys::mem_total_kb() as f64 * cfg.mem_max / 100.0) as u64;
+    let need_mem = if mem_cap > 0 && need_mem > mem_cap && min_mem.is_none_or(|m| m <= mem_cap) {
+        say(&format!(
+            "warning {jkey} - its history says {} of memory, more than mem_max {:.0}% of RAM allows; it reserves {} (see taskguard outliers)",
+            report::gb(need_mem),
+            cfg.mem_max,
+            report::gb(mem_cap)
+        ));
+        mem_cap
+    } else {
+        need_mem
+    };
     let raised = min_cpu.is_some_and(|m| m > learned.cpu.unwrap_or(0.0)) || min_mem.is_some_and(|m| m > learned_mem.unwrap_or(0));
 
     // `bunx` and `npx` set the variable to their own name; that is no script.
@@ -341,6 +357,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
         max_backfill: cfg.max_backfill as f64,
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
+        noise_mem_pct: cfg.noise_mem,
+        noise_cpu: cfg.noise_cpu,
+        outside_admit: cfg.outside_admit,
+        outside_mem_max_pct: cfg.pause_at,
     };
     let mut limits = limits_of(&cfg);
     // A limit changed in the dashboard's Config view reaches jobs that
@@ -504,8 +524,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 main_blocker = Some(n.clone());
             }
             match &decision {
-                Decision::Admit { reason } => {
+                Decision::Admit { reason, early } => {
                     admit_reason = reason.clone();
+                    if let Some(why) = early {
+                        say(&format!("warning {} - started before it fully fits: {why}", me.key));
+                    }
                     break;
                 }
                 _ if started_by_hand => {
@@ -788,6 +811,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
             },
         );
     }
+    if measured && let Some(d) = &database {
+        note_outlier(d, &cfg, &me);
+    }
     cleanup_files(&q, &me);
     let still = q.waiting().len();
     lines.done(&report::Done { key: &jkey, secs: wall, used, wanted, peak_kb: tracker.peak_mem_kb, code, queued: still });
@@ -810,6 +836,24 @@ pub fn run(mut o: Opts) -> Result<i32> {
         );
     }
     Ok(code)
+}
+
+/// When the run that just ended stands far above the job's other runs, say
+/// how much it counts, and record it with the reason.
+fn note_outlier(d: &Db, cfg: &Config, me: &Entry) {
+    let Ok(l) = d.learned(&me.key, &cfg.learn()) else { return };
+    let Some(o) = &l.outliers else { return };
+    let Some(run) = o.runs.iter().find(|r| r.run_id == me.run_id) else { return };
+    let why = o.why(run);
+    let _ = d.adjustment(&me.key, me.run_id, "mem_outlier", Some(o.normal_kb as f64), Some(o.mem_kb as f64), &why);
+    say(&format!(
+        "warning {} - took {} of memory, {:.1}x its usual {}; {why}. The next run reserves {} (taskguard outliers; taskguard prune --outliers)",
+        me.key,
+        report::gb(run.peak_kb),
+        run.peak_kb as f64 / o.normal_kb.max(1) as f64,
+        report::gb(o.normal_kb),
+        report::gb(o.mem_kb)
+    ));
 }
 
 /// Pause or resume this job's command when the pause rules pick it.
@@ -884,7 +928,7 @@ fn after_starved(
     package_json: Option<&str>,
     lines: &Lines,
 ) {
-    let after = d.learned(&me.key, cfg.hist_keep, cfg.boost_runs).unwrap_or_default();
+    let after = d.learned(&me.key, &cfg.learn()).unwrap_or_default();
     let reason = st.evidence.join("; ");
     match st.kind {
         "memory" => {

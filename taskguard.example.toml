@@ -24,7 +24,8 @@
 #   CPU busy     + CPU still promised to running jobs     + its CPU need     fits under cpu_max
 #   memory held  + memory still promised to running jobs  + its memory need  fits under mem_max
 # Needs are learned per command: memory is the highest peak of the last
-# hist_keep runs, CPU the median of the cores it wanted.
+# hist_keep runs (outliers held back, see learning), CPU the median of the
+# cores it wanted. A memory need is capped at mem_max.
 cpu_max = 100         # percent of all cores
 mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
@@ -67,6 +68,20 @@ max_backfill = 0      # until a reserved job has waited this many seconds, newer
                       # before it could start anyway. 0 (or anything up to max_bypass) = never.
                       # taskguard 0.1.6 and older reject a file that sets it.
 boost_runs = 5        # runs that get +25% memory after a memory-starved run
+# A peak more than outlier_ratio times the next peak below it, and outlier_min
+# above it, is an outlier. Outliers count by outlier_weights: the first entry
+# when there is one, the second when there are two, in full past the list. A
+# run that failed never counts. Jobs that usually take under outlier_min have
+# no outliers. See them with taskguard outliers. 0 turns it off.
+outlier_ratio = 2
+outlier_min = "1G"
+outlier_weights = [0, 0.5]
+# A job that falls short by this little starts anyway, with a warning.
+noise_mem = 2         # percent of RAM
+noise_cpu = 0.5       # cores
+# A job that only programs outside taskguard keep out starts anyway, with a
+# warning, while memory stays under pause_at.
+outside_admit = true
 
 # ---------------------------------------------------------------- timing ----
 sample_every = 2      # seconds between measurements of a running job

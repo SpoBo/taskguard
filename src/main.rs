@@ -8,6 +8,7 @@ mod config;
 mod dash;
 mod db;
 mod groups;
+mod help;
 mod insight;
 mod key;
 mod machine;
@@ -24,7 +25,7 @@ mod top;
 use anyhow::{Result, bail};
 use runner::Opts;
 
-const USAGE: &str = "\
+const USAGE_HEAD: &str = "\
 taskguard - a sem that learns what each job needs
 
 usage:
@@ -34,32 +35,28 @@ usage:
   taskguard status [--json]                    what runs, what waits, and why
   taskguard pause JOB | resume JOB             pause or resume a running job (a pid, or its key or part of it)
   taskguard history                            learned needs per command
+  taskguard outliers [PATTERN]                 memory peaks far above a job's other runs, and how much they count
+  taskguard prune PATTERN | --outliers | --undo
+                                               drop runs from the history, or put them back (a dry run without --apply)
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
   taskguard run [options] -- COMMAND           the same as the first form, for a command named like a subcommand
+  taskguard help COMMAND                       more about one command; COMMAND --help shows the same
+  taskguard help --all                         every command in full, in one text (for LLM agents)
 
-options (sem style; the default is to run in the foreground):
-  -j N | +N | -N | N%     slot ceiling for this pool (as in sem); none by default
-  --id NAME               pool name (sem's semaphore id)
-  --ns NAME               namespace for the dashboard (default: the repo name)
-  --st SECS               SECS > 0: run anyway after SECS; SECS < 0: give up (exit 124)
-  --st-exit N             the exit code when --st gives up, instead of 124
-  --key KEY               history key (default: project path + command)
-  --min-cpu N             never start with fewer than N free cores
-  --min-mem SIZE          never start with less than SIZE free (6G, 512M)
-  --priority N            higher starts first (default 0; negative is allowed)
-  --now                   skip the queue, but still measure and learn
-  --bg                    wait for room, then return and let the job run on
-  --fg                    run in the foreground (the default)
-  --pipe                  with --bg: pass stdin to the command
-  -q, --quiet             only print waits longer than the status interval
-  --hints / --no-hints    agent hints on or off for this call
+";
 
+const USAGE_TAIL: &str = "
 settings: ~/.config/taskguard/config.toml, [dir.\"<path>\"] sections in it, and a
 repo .taskguard.toml. See taskguard.example.toml.
 ";
 
-const SUBCOMMANDS: &[&str] = &["top", "status", "pause", "resume", "history", "doctor", "import-history", "version", "help", "__recorder"];
+fn usage() -> String {
+    format!("{USAGE_HEAD}{}{USAGE_TAIL}", help::RUN_OPTIONS)
+}
+
+const SUBCOMMANDS: &[&str] =
+    &["top", "status", "pause", "resume", "history", "outliers", "prune", "doctor", "import-history", "version", "help", "__recorder"];
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     let a = &args[*i];
@@ -118,7 +115,8 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--hints" => o.hints = Some(true),
             "--no-hints" => o.hints = Some(false),
             "--wait" => o.wait = true,
-            _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{USAGE}"),
+            "-h" | "--help" => o.help = true,
+            _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{}", usage()),
             _ => break,
         }
         i += 1;
@@ -143,9 +141,24 @@ fn dispatch(args: &[String]) -> Result<i32> {
     let first = args.first().map(String::as_str).unwrap_or("");
     if SUBCOMMANDS.contains(&first) || matches!(first, "-h" | "--help" | "-V" | "--version" | "") {
         let rest = &args[1.min(args.len())..];
+        if first != "help" && first != "__recorder" && help::asked(rest) {
+            print!("{}", help::text(first).unwrap_or_else(usage));
+            return Ok(0);
+        }
         return match first {
+            "help" if matches!(rest.first().map(String::as_str), Some("--all" | "all")) => {
+                print!("{}", help::all(&usage()));
+                Ok(0)
+            }
+            "help" if !rest.is_empty() => match help::text(if help::asked(rest) { "help" } else { &rest[0] }) {
+                Some(t) => {
+                    print!("{t}");
+                    Ok(0)
+                }
+                None => bail!("no command {:?}; taskguard help lists them", rest[0]),
+            },
             "" | "help" | "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 Ok(if first.is_empty() { 2 } else { 0 })
             }
             "version" | "-V" | "--version" => {
@@ -156,6 +169,8 @@ fn dispatch(args: &[String]) -> Result<i32> {
             "pause" => commands::pause(rest, true),
             "resume" => commands::pause(rest, false),
             "history" => commands::history(),
+            "outliers" => commands::outliers(rest),
+            "prune" => commands::prune(rest),
             "doctor" => commands::doctor(rest),
             "import-history" => commands::import_history(),
             "top" => top::run(rest),
@@ -165,11 +180,15 @@ fn dispatch(args: &[String]) -> Result<i32> {
     }
     let rest = if first == "run" { &args[1..] } else { args };
     let o = parse_opts(rest)?;
+    if o.help {
+        print!("{}", help::text(if o.wait { "wait" } else { "run" }).unwrap_or_default());
+        return Ok(0);
+    }
     if o.wait && o.cmd.is_empty() {
         return runner::wait_pool(o.id.as_deref());
     }
     if o.cmd.is_empty() {
-        bail!("no command given\n\n{USAGE}");
+        bail!("no command given\n\n{}", usage());
     }
     runner::run(o)
 }
@@ -180,6 +199,18 @@ mod tests {
 
     fn v(s: &str) -> Vec<String> {
         matcher::split_shell(s)
+    }
+
+    /// A release must say what changed: the release workflow takes its notes
+    /// from this version's section, and fails without one.
+    #[test]
+    fn the_changelog_has_a_section_for_this_version() {
+        let log = include_str!("../CHANGELOG.md");
+        let version = env!("CARGO_PKG_VERSION");
+        let head = format!("## [{version}] - ");
+        assert!(log.lines().any(|l| l.starts_with(&head)), "CHANGELOG.md has no section \"{head}DATE\"");
+        assert!(log.contains(&format!("\n[{version}]: https://github.com/SpoBo/taskguard/")), "CHANGELOG.md has no link for {version}");
+        assert!(log.contains("## [Unreleased]"), "CHANGELOG.md keeps an Unreleased section for the next release");
     }
 
     #[test]

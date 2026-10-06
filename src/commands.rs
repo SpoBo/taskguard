@@ -1,4 +1,4 @@
-//! The one-shot subcommands: status, history, doctor, import-history, pause, resume.
+//! The one-shot subcommands: status, history, outliers, prune, doctor, import-history, pause, resume.
 
 use crate::config::{self, Config};
 use crate::dash;
@@ -21,6 +21,10 @@ pub fn limits(cfg: &Config) -> Limits {
         max_backfill: cfg.max_backfill as f64,
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
+        noise_mem_pct: cfg.noise_mem,
+        noise_cpu: cfg.noise_cpu,
+        outside_admit: cfg.outside_admit,
+        outside_mem_max_pct: cfg.pause_at,
     }
 }
 
@@ -141,7 +145,7 @@ pub fn history() -> Result<i32> {
     let dir = config::state_dir();
     let db = Db::open_dir(&dir)?;
     let cfg = Config::load(Path::new("/"), Path::new("/")).unwrap_or_default();
-    let rows = dash::history(&db, cfg.hist_keep)?;
+    let rows = dash::history(&db, &cfg.learn())?;
     if rows.is_empty() {
         println!("no runs recorded yet");
         return Ok(0);
@@ -158,6 +162,217 @@ pub fn history() -> Result<i32> {
             r.last_dur_s.map(dur).unwrap_or_else(|| "-".into()),
             r.last_exit.map(|e| e.to_string()).unwrap_or_else(|| "-".into()),
         );
+    }
+    Ok(0)
+}
+
+/// The options of `outliers` and `prune`.
+#[derive(Debug, Default, PartialEq)]
+struct PruneArgs {
+    pattern: Option<String>,
+    older_than_s: Option<f64>,
+    outliers: bool,
+    undo: bool,
+    apply: bool,
+    ratio: Option<f64>,
+    min_kb: Option<u64>,
+}
+
+fn parse_prune(args: &[String]) -> Result<PruneArgs> {
+    let mut p = PruneArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let (name, inline) = match a.split_once('=') {
+            Some((n, v)) if a.starts_with("--") => (n, Some(v.to_string())),
+            _ => (a, None),
+        };
+        let mut value = || -> Result<String> {
+            if let Some(v) = inline.clone() {
+                return Ok(v);
+            }
+            i += 1;
+            args.get(i).cloned().ok_or_else(|| anyhow::anyhow!("{name} needs a value"))
+        };
+        match name {
+            "--older-than" => p.older_than_s = Some(parse_age(&value()?)?),
+            "--ratio" => {
+                let v = value()?;
+                p.ratio = Some(v.parse().map_err(|_| anyhow::anyhow!("--ratio needs a number, such as 1.5"))?);
+            }
+            "--min" => p.min_kb = Some(config::parse_size_kb(&value()?)?),
+            "--outliers" => p.outliers = true,
+            "--undo" => p.undo = true,
+            "--apply" => p.apply = true,
+            _ if a.starts_with('-') => anyhow::bail!("unknown option {a}"),
+            _ if p.pattern.is_none() => p.pattern = Some(a.to_string()),
+            _ => anyhow::bail!("one key pattern only; quote it so the shell leaves the * alone"),
+        }
+        i += 1;
+    }
+    Ok(p)
+}
+
+/// "30d", "12h", "90m", "45s". A bare number is days.
+fn parse_age(s: &str) -> Result<f64> {
+    let t = s.trim();
+    let (num, mult) = match t.chars().last() {
+        Some('d') => (&t[..t.len() - 1], 86400.0),
+        Some('h') => (&t[..t.len() - 1], 3600.0),
+        Some('m') => (&t[..t.len() - 1], 60.0),
+        Some('s') => (&t[..t.len() - 1], 1.0),
+        _ => (t, 86400.0),
+    };
+    let n: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad age {s:?}; use 30d, 12h, 90m or 45s"))?;
+    Ok(n * mult)
+}
+
+/// Settings for this directory, with `--ratio` and `--min` on top.
+fn learn_rules(p: &PruneArgs) -> Result<db::Learn> {
+    let cwd = std::env::current_dir()?;
+    let cfg = Config::load(&cwd, &key::checkout_root(&cwd))?;
+    let mut rules = cfg.learn();
+    if let Some(r) = p.ratio {
+        rules.outlier_ratio = r;
+    }
+    if let Some(m) = p.min_kb {
+        rules.outlier_min_kb = m;
+    }
+    Ok(rules)
+}
+
+/// The outliers of every key that matches `pattern`.
+fn find_all_outliers(db: &Db, pattern: Option<&str>, rules: &db::Learn) -> Result<Vec<(String, db::Outliers)>> {
+    let mut out = Vec::new();
+    for k in db.keys(pattern)? {
+        if let Some(o) = db.learned(&k, rules)?.outliers {
+            out.push((k, o));
+        }
+    }
+    Ok(out)
+}
+
+fn ago(t: f64) -> String {
+    let s = (db::now() - t).max(0.0);
+    if s >= 2.0 * 86400.0 { format!("{:.0}d ago", s / 86400.0) } else { format!("{} ago", dur(s)) }
+}
+
+/// `taskguard outliers [PATTERN] [--ratio R] [--min SIZE]`
+pub fn outliers(args: &[String]) -> Result<i32> {
+    let p = parse_prune(args)?;
+    let rules = learn_rules(&p)?;
+    let db = Db::open_dir(&config::state_dir())?;
+    let found = find_all_outliers(&db, p.pattern.as_deref(), &rules)?;
+    println!(
+        "a peak counts as an outlier when it is more than {}x and {} above the next peak below it (outlier_ratio, outlier_min)",
+        rules.outlier_ratio,
+        gb(rules.outlier_min_kb)
+    );
+    if found.is_empty() {
+        println!("no outliers in the last {} runs of any key", rules.keep);
+        return Ok(0);
+    }
+    println!();
+    println!("{:<52} {:>6} {:>9} {:>9} {:>9} {:>6} {:>9}  why", "key", "run", "ended", "peak", "usual", "x", "next run");
+    for (k, o) in &found {
+        for r in &o.runs {
+            println!(
+                "{:<52} {:>6} {:>9} {:>9} {:>9} {:>6.1} {:>9}  {}",
+                k,
+                r.run_id,
+                ago(r.ended_at),
+                gb(r.peak_kb),
+                gb(o.normal_kb),
+                r.peak_kb as f64 / o.normal_kb.max(1) as f64,
+                gb(o.mem_kb),
+                o.why(r)
+            );
+        }
+    }
+    println!();
+    println!("drop them from the history: taskguard prune --outliers [PATTERN] [--ratio R] (add --apply to do it)");
+    Ok(0)
+}
+
+/// `taskguard prune`: move runs out of the history, or back.
+pub fn prune(args: &[String]) -> Result<i32> {
+    let p = parse_prune(args)?;
+    let db = Db::open_dir(&config::state_dir())?;
+    let now = db::now();
+    let (runs, verb) = if p.undo {
+        (db.pruned(p.pattern.as_deref().unwrap_or("*"))?, "put back")
+    } else if p.outliers {
+        let rules = learn_rules(&p)?;
+        let mut runs = Vec::new();
+        for (k, o) in find_all_outliers(&db, p.pattern.as_deref(), &rules)? {
+            for r in &o.runs {
+                if p.older_than_s.is_some_and(|a| r.ended_at >= now - a) {
+                    continue;
+                }
+                runs.push(db::PrunedRun {
+                    id: r.run_id,
+                    key: k.clone(),
+                    ended_at: Some(r.ended_at),
+                    peak_mem_kb: Some(r.peak_kb),
+                    exit: r.exit,
+                    reason: format!(
+                        "outlier: {}, {:.1}x the usual {} (outlier_ratio {})",
+                        gb(r.peak_kb),
+                        r.peak_kb as f64 / o.normal_kb.max(1) as f64,
+                        gb(o.normal_kb),
+                        rules.outlier_ratio
+                    ),
+                });
+            }
+        }
+        (runs, "prune")
+    } else {
+        let Some(pattern) = p.pattern.as_deref() else {
+            anyhow::bail!(
+                "name the keys to prune: taskguard prune 'packages/api:*' [--older-than 30d], or '*' for all of them; see taskguard history"
+            );
+        };
+        let reason = match p.older_than_s {
+            Some(a) => format!("pruned by hand: older than {}", dur(a)),
+            None => "pruned by hand".into(),
+        };
+        let mut runs = db.runs_of(pattern, p.older_than_s.map(|a| now - a))?;
+        for r in &mut runs {
+            r.reason = reason.clone();
+        }
+        (runs, "prune")
+    };
+    if runs.is_empty() {
+        println!("nothing to {verb}");
+        return Ok(0);
+    }
+    println!("{:<52} {:>6} {:>9} {:>9} {:>5}  reason", "key", "run", "ended", "peak", "exit");
+    for r in &runs {
+        println!(
+            "{:<52} {:>6} {:>9} {:>9} {:>5}  {}",
+            r.key,
+            r.id,
+            r.ended_at.map(ago).unwrap_or_else(|| "-".into()),
+            r.peak_mem_kb.map(gb).unwrap_or_else(|| "-".into()),
+            r.exit.map(|e| e.to_string()).unwrap_or_else(|| "-".into()),
+            r.reason
+        );
+    }
+    let keys = runs.iter().map(|r| r.key.as_str()).collect::<std::collections::BTreeSet<_>>().len();
+    if !p.apply {
+        println!();
+        println!("dry run: would {verb} {} run(s) of {keys} key(s). Run again with --apply to do it.", runs.len());
+        if !p.undo {
+            println!("pruned runs are kept aside; taskguard prune --undo [PATTERN] puts them back");
+        }
+        return Ok(0);
+    }
+    let n = if p.undo { db.restore(&runs)? } else { db.prune_runs(&runs)? };
+    let done = if p.undo { "put back" } else { "pruned" };
+    println!();
+    println!("{done} {n} run(s) of {keys} key(s)");
+    if !p.undo {
+        println!("taskguard prune --undo [PATTERN] --apply puts them back");
     }
     Ok(0)
 }
@@ -279,7 +494,7 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
         println!("  because {w}");
     }
     if let Ok(db) = Db::open_dir(dir) {
-        let l = db.learned(&key, cfg.hist_keep, cfg.boost_runs)?;
+        let l = db.learned(&key, &cfg.learn())?;
         if l.runs == 0 {
             println!("learned:    nothing yet; the first run just runs");
         } else {
@@ -291,6 +506,16 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
                 if l.mem_boosted { " (+25% after a memory-starved run)" } else { "" },
                 l.dur_s.map(dur).unwrap_or("?".into())
             );
+            if let Some(o) = &l.outliers {
+                let top = o.runs.iter().map(|r| r.peak_kb).max().unwrap_or(0);
+                println!(
+                    "outliers:   {} run(s) up to {} where it usually takes {}; {} (taskguard outliers)",
+                    o.runs.len(),
+                    gb(top),
+                    gb(o.normal_kb),
+                    o.why(&o.runs[0])
+                );
+            }
             if l.steady_cpu.is_some() || l.steady_mem_kb.is_some() {
                 println!(
                     "after start-up: {} cores, {} memory",
@@ -406,4 +631,28 @@ pub fn import_history() -> Result<i32> {
 /// The tsc-queue key for a cwd: the project path with `/` and spaces as `_`.
 pub fn legacy_key(cwd: &Path) -> String {
     key::project_path(cwd).replace(['/', ' '], "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn prune_options() {
+        let p = parse_prune(&args("packages/api:* --older-than 30d --apply")).unwrap();
+        assert_eq!(p.pattern.as_deref(), Some("packages/api:*"));
+        assert_eq!(p.older_than_s, Some(30.0 * 86400.0));
+        assert!(p.apply && !p.outliers && !p.undo);
+        let p = parse_prune(&args("--outliers --ratio=1.5 --min 512M")).unwrap();
+        assert_eq!((p.outliers, p.ratio, p.min_kb, p.pattern), (true, Some(1.5), Some(512 * 1024), None));
+        assert_eq!(parse_prune(&args("--older-than 12h")).unwrap().older_than_s, Some(12.0 * 3600.0));
+        assert_eq!(parse_prune(&args("--older-than 7")).unwrap().older_than_s, Some(7.0 * 86400.0), "a bare number is days");
+        assert!(parse_prune(&args("a b")).is_err(), "an unquoted * the shell expanded");
+        assert!(parse_prune(&args("--bogus")).is_err());
+        assert!(parse_prune(&args("--ratio")).is_err());
+    }
 }

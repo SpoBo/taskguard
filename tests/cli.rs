@@ -337,7 +337,8 @@ fn needs_set_by_hand_let_a_job_fit() {
 #[test]
 fn a_waiting_job_follows_a_limit_changed_in_the_config() {
     // At 1% of RAM no job fits while another one runs.
-    let e = Env::new("mem_max = 1\nlearn_stagger = 0\n");
+    // The leeway would let it start: the room it lacks is held by other programs.
+    let e = Env::new("mem_max = 1\nlearn_stagger = 0\noutside_admit = false\nnoise_mem = 0\n");
     // One run first: a job known to be short skips the CPU check, so only
     // memory decides, however busy the test machine is.
     assert!(e.run(&["--", "touch", "started"]).status.success());
@@ -471,4 +472,33 @@ fn enabled_false_runs_every_command_straight_through() {
     assert!(o.status.success(), "{}", stderr(&o));
     assert_eq!(std::fs::read_to_string(e.file("out")).unwrap().trim(), "", "no slot was taken");
     assert!(!e.dir.join("taskguard.db").exists(), "nothing was recorded");
+}
+
+#[test]
+fn every_command_has_help_and_help_all_has_them_all() {
+    let e = Env::new("");
+    let out = |args: &[&str]| {
+        let o = e.cmd(args).output().unwrap();
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    // --help anywhere among a command's options, and help COMMAND, say the same.
+    let h = out(&["outliers", "--ratio", "1.2", "--help"]);
+    assert!(h.starts_with("taskguard outliers"), "{h}");
+    assert_eq!(out(&["help", "outliers"]), h);
+    for cmd in ["top", "status", "pause", "resume", "history", "prune", "doctor", "import-history", "version", "help"] {
+        let h = out(&[cmd, "--help"]);
+        assert!(h.contains(&format!("taskguard {cmd}")), "{cmd}: {h}");
+    }
+    assert!(out(&["run", "--help"]).contains("--min-mem SIZE"));
+    assert!(out(&["--wait", "--help"]).starts_with("taskguard --wait"));
+    // One text for an agent: the overview, then every command in full.
+    let all = out(&["help", "--all"]);
+    for part in ["usage:", "--min-mem SIZE", "taskguard outliers [PATTERN]", "taskguard prune --undo", "taskguard top [--view", "--explain"]
+    {
+        assert!(all.contains(part), "help --all lacks {part:?}");
+    }
+    assert!(!e.cmd(&["help", "nope"]).output().unwrap().status.success());
+    // After the command, --help belongs to the command.
+    assert_eq!(out(&["--now", "--", "sh", "-c", "echo got $1", "x", "--help"]), "got --help\n");
 }

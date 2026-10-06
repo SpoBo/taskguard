@@ -40,6 +40,12 @@ pub struct Layer {
     pub max_bypass: Option<u64>,
     pub max_backfill: Option<u64>,
     pub boost_runs: Option<usize>,
+    pub outlier_ratio: Option<f64>,
+    pub outlier_min: Option<String>,
+    pub outlier_weights: Option<Vec<f64>>,
+    pub noise_mem: Option<f64>,
+    pub noise_cpu: Option<f64>,
+    pub outside_admit: Option<bool>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -129,6 +135,22 @@ pub struct Config {
     pub max_bypass: u64,
     pub max_backfill: u64,
     pub boost_runs: usize,
+    /// A memory peak more than this many times the next one below it is an
+    /// outlier, and counts by `outlier_weights`. At or under 1: no outliers.
+    pub outlier_ratio: f64,
+    /// An outlier is also at least this far above the next peak, and that
+    /// peak is at least this big.
+    pub outlier_min_kb: u64,
+    /// How much outliers count: the first entry when there is one, the second
+    /// when there are two. Past the list they count in full.
+    pub outlier_weights: Vec<f64>,
+    /// A job short of memory by at most this share of RAM starts anyway.
+    pub noise_mem: f64,
+    /// A job short of CPU by at most this many cores starts anyway.
+    pub noise_cpu: f64,
+    /// A job that only programs outside taskguard keep out starts anyway,
+    /// while memory stays under `pause_at`.
+    pub outside_admit: bool,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -169,6 +191,12 @@ impl Default for Config {
             max_bypass: 120,
             max_backfill: 0,
             boost_runs: 5,
+            outlier_ratio: 2.0,
+            outlier_min_kb: 1024 * 1024,
+            outlier_weights: vec![0.0, 0.5],
+            noise_mem: 2.0,
+            noise_cpu: 0.5,
+            outside_admit: true,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -314,6 +342,17 @@ impl Config {
             "hints" => self.hints,
             "auto_pause" => self.auto_pause,
             _ => false,
+        }
+    }
+
+    /// How history turns into needs.
+    pub fn learn(&self) -> crate::db::Learn {
+        crate::db::Learn {
+            keep: self.hist_keep,
+            boost_runs: self.boost_runs,
+            outlier_ratio: self.outlier_ratio,
+            outlier_min_kb: self.outlier_min_kb,
+            outlier_weights: self.outlier_weights.clone(),
         }
     }
 
@@ -576,6 +615,17 @@ impl Config {
         set!(max_bypass);
         set!(max_backfill);
         set!(boost_runs);
+        set!(outlier_ratio);
+        if let Some(v) = &l.outlier_min
+            && let Ok(kb) = parse_size_kb(v)
+        {
+            self.outlier_min_kb = kb;
+            self.origin.insert("outlier_min".into(), name.to_string());
+        }
+        set!(outlier_weights);
+        set!(noise_mem);
+        set!(noise_cpu);
+        set!(outside_admit);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);

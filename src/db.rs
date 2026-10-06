@@ -139,7 +139,54 @@ CREATE TABLE IF NOT EXISTS ns_1m (
   cores_avg REAL, mem_avg_kb REAL,
   PRIMARY KEY (minute, ns)
 );
+CREATE TABLE IF NOT EXISTS pruned_runs (
+  id INTEGER PRIMARY KEY,
+  ns TEXT NOT NULL,
+  pool TEXT,
+  key TEXT NOT NULL,
+  label TEXT,
+  cwd TEXT,
+  cmd TEXT,
+  pid INTEGER,
+  script TEXT,
+  package_json TEXT,
+  queued_at REAL NOT NULL,
+  started_at REAL,
+  ended_at REAL,
+  exit INTEGER,
+  waited_s REAL,
+  main_blocker TEXT,
+  now INTEGER NOT NULL DEFAULT 0,
+  min_cpu REAL,
+  min_mem_kb INTEGER,
+  need_cpu REAL,
+  need_mem_kb INTEGER,
+  peak_mem_kb INTEGER,
+  cores_used REAL,
+  cores_wanted REAL,
+  cpu_seconds REAL,
+  runnable_seconds REAL,
+  pageins INTEGER,
+  starved TEXT,
+  starved_detail TEXT,
+  machine_full_frac REAL,
+  imported INTEGER NOT NULL DEFAULT 0,
+  paused_s REAL,
+  package TEXT,
+  steady_cores_wanted REAL,
+  steady_mem_kb INTEGER,
+  pruned_at REAL NOT NULL,
+  prune_reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
 "#;
+
+/// The columns `prune` moves from `runs` to `pruned_runs` and back. A column
+/// added to `runs` is added to `pruned_runs` and here too, or a prune loses it.
+const RUN_COLUMNS: &str = "id, ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, started_at, ended_at, exit,
+  waited_s, main_blocker, now, min_cpu, min_mem_kb, need_cpu, need_mem_kb, peak_mem_kb, cores_used, cores_wanted, cpu_seconds,
+  runnable_seconds, pageins, starved, starved_detail, machine_full_frac, imported, paused_s, package, steady_cores_wanted,
+  steady_mem_kb";
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -171,8 +218,11 @@ pub struct Estimate {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Learned {
     pub runs: usize,
-    /// Max of the recent peaks. None when no run was ever measured.
+    /// Max of the recent peaks, with outliers held back (see `Outliers`).
+    /// None when no run was ever measured.
     pub mem_kb: Option<u64>,
+    /// The recent memory peaks that stand far above the others.
+    pub outliers: Option<Outliers>,
     /// Median of the recent sustained "cores wanted". None when unknown.
     pub cpu: Option<f64>,
     /// Median duration, for estimated start times.
@@ -184,6 +234,126 @@ pub struct Learned {
     /// peaks and the median of the cores wanted on average. None for others.
     pub steady_mem_kb: Option<u64>,
     pub steady_cpu: Option<f64>,
+}
+
+/// How history turns into needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Learn {
+    /// How many recent runs count.
+    pub keep: usize,
+    /// A memory-starved run among this many recent runs adds 25%.
+    pub boost_runs: usize,
+    /// A peak is an outlier when it is more than this many times the next
+    /// peak below it. At or under 1, there are no outliers.
+    pub outlier_ratio: f64,
+    /// ... and also at least this much above it.
+    pub outlier_min_kb: u64,
+    /// How much the outliers count, by how many there are: the first entry
+    /// for one, the second for two. Past the list they count in full.
+    pub outlier_weights: Vec<f64>,
+}
+
+impl Default for Learn {
+    fn default() -> Self {
+        Learn { keep: 10, boost_runs: 5, outlier_ratio: 2.0, outlier_min_kb: 1024 * 1024, outlier_weights: vec![0.0, 0.5] }
+    }
+}
+
+/// A recent run whose memory peak stands far above the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outlier {
+    pub run_id: i64,
+    pub peak_kb: u64,
+    pub ended_at: f64,
+    pub exit: Option<i64>,
+}
+
+impl Outlier {
+    /// A run that failed or was killed. Its peak never counts: a run that
+    /// goes wrong can take far more memory than the job needs.
+    pub fn failed(&self) -> bool {
+        self.exit.is_some_and(|e| e != 0)
+    }
+}
+
+/// The highest recent peaks when they stand far above the rest: one run that
+/// took 20 GB where the others took 5 GB. A single such run may be a one-off,
+/// so it does not set the memory need at once: it counts by `weight`, which
+/// grows each time it happens again, until it counts in full.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Outliers {
+    pub runs: Vec<Outlier>,
+    /// The highest peak below them.
+    pub normal_kb: u64,
+    /// How much of the step from `normal_kb` to the highest outlier that did
+    /// not fail counts: 0 is none, 1 is all.
+    pub weight: f64,
+    /// The memory need they leave: `normal_kb` plus that share.
+    pub mem_kb: u64,
+}
+
+impl Outliers {
+    /// How many outliers count towards the weight: those that did not fail.
+    pub fn repeats(&self) -> usize {
+        self.runs.iter().filter(|o| !o.failed()).count()
+    }
+
+    /// Why an outlier counts as it does, in words.
+    pub fn why(&self, o: &Outlier) -> String {
+        if o.failed() {
+            return format!("ignored: the run failed (exit {})", o.exit.unwrap_or(-1));
+        }
+        let n = self.repeats();
+        let times = if n == 1 { "once".to_string() } else { format!("{n} times") };
+        match self.weight {
+            w if w <= 0.0 => format!("ignored: seen {times}, maybe a one-off"),
+            w if w >= 1.0 => format!("counts in full: seen {times}"),
+            w => format!("counts {:.0}%: seen {times}", w * 100.0),
+        }
+    }
+}
+
+/// Find the outliers among `runs` (run id, peak, end, exit). The runs sorted
+/// by peak, highest first, are cut at the first step down that is both more
+/// than `outlier_ratio` times and `outlier_min_kb` apart: the runs above the
+/// cut are the outliers. They must be fewer than the runs below it, and at
+/// least two runs must be below it, or the step is just how the job is. The
+/// peak below the cut must also be `outlier_min_kb` or more: a job that is
+/// mostly cache hits of a few MB and now and then a full build of 2 GB has no
+/// outliers, as its full build is not a one-off and holding it back would
+/// let it start into a machine with no room for it.
+pub fn find_outliers(runs: &[Outlier], rules: &Learn) -> Option<Outliers> {
+    if rules.outlier_ratio <= 1.0 || runs.len() < 3 {
+        return None;
+    }
+    let mut by_peak: Vec<&Outlier> = runs.iter().collect();
+    by_peak.sort_by_key(|o| std::cmp::Reverse(o.peak_kb));
+    let n = by_peak.len();
+    let cut = (1..n).take_while(|j| *j < n - j && n - j >= 2).find(|&j| {
+        let (above, below) = (by_peak[j - 1].peak_kb, by_peak[j].peak_kb);
+        above as f64 > below as f64 * rules.outlier_ratio && above - below >= rules.outlier_min_kb && below >= rules.outlier_min_kb
+    })?;
+    let normal_kb = by_peak[cut].peak_kb;
+    let out: Vec<Outlier> = by_peak[..cut].iter().map(|o| (*o).clone()).collect();
+    let healthy = out.iter().filter(|o| !o.failed()).count();
+    let weight = match healthy {
+        0 => 0.0,
+        h => rules.outlier_weights.get(h - 1).copied().unwrap_or(1.0).clamp(0.0, 1.0),
+    };
+    let top = out.iter().filter(|o| !o.failed()).map(|o| o.peak_kb).max().unwrap_or(normal_kb);
+    let mem_kb = normal_kb + ((top - normal_kb) as f64 * weight) as u64;
+    Some(Outliers { runs: out, normal_kb, weight, mem_kb })
+}
+
+/// Runs that `prune` moved out of the history, or would move.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrunedRun {
+    pub id: i64,
+    pub key: String,
+    pub ended_at: Option<f64>,
+    pub peak_mem_kb: Option<u64>,
+    pub exit: Option<i64>,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -281,21 +451,30 @@ impl Db {
         Ok(Db { conn })
     }
 
-    pub fn learned(&self, key: &str, keep: usize, boost_runs: usize) -> Result<Learned> {
+    pub fn learned(&self, key: &str, rules: &Learn) -> Result<Learned> {
+        let (keep, boost_runs) = (rules.keep, rules.boost_runs);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb, steady_cores_wanted
+            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb, steady_cores_wanted,
+                    id, ended_at, exit
              FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC LIMIT ?2",
         )?;
         // peak memory, cores wanted, duration, starved, and after the start-up: memory peak, cores wanted
         type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>);
-        let rows: Vec<Row> = stmt
+        let rows: Vec<(Row, Outlier)> = stmt
             .query_map(params![key, keep.max(boost_runs) as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                let peak: i64 = r.get(0)?;
+                let run = Outlier { run_id: r.get(6)?, peak_kb: peak as u64, ended_at: r.get(7)?, exit: r.get(8)? };
+                Ok(((peak, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), run))
             })?
             .collect::<std::result::Result<_, _>>()?;
+        let (rows, runs): (Vec<Row>, Vec<Outlier>) = rows.into_iter().unzip();
         let recent = &rows[..rows.len().min(keep)];
-        let mem = recent.iter().map(|r| r.0 as u64).max();
+        let outliers = find_outliers(&runs[..recent.len()], rules);
+        let mem = match &outliers {
+            Some(o) => Some(o.mem_kb),
+            None => recent.iter().map(|r| r.0 as u64).max(),
+        };
         let mut cpu = median_of(recent.iter().filter_map(|r| r.1).collect());
         // After a run that was starved of CPU, the need is at least what that
         // run wanted, so one starved run is never averaged away by the median.
@@ -308,7 +487,100 @@ impl Db {
         let boosted = rows.iter().take(boost_runs).any(|r| r.3.as_deref() == Some("memory"));
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
         let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
-        Ok(Learned { runs: recent.len(), mem_kb: mem, cpu, dur_s: dur, mem_boosted: boosted, steady_mem_kb, steady_cpu })
+        Ok(Learned { runs: recent.len(), mem_kb: mem, outliers, cpu, dur_s: dur, mem_boosted: boosted, steady_mem_kb, steady_cpu })
+    }
+
+    /// Every key with finished runs, or those that match `pattern`: a key, or
+    /// a glob with `*` and `?`.
+    pub fn keys(&self, pattern: Option<&str>) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT DISTINCT key FROM runs WHERE ended_at IS NOT NULL AND (?1 IS NULL OR key GLOB ?1) ORDER BY key")?;
+        let keys = stmt.query_map([pattern], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        Ok(keys)
+    }
+
+    /// Finished runs of the keys that match `pattern` that ended before `before`.
+    pub fn runs_of(&self, pattern: &str, before: Option<f64>) -> Result<Vec<PrunedRun>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, key, ended_at, peak_mem_kb, exit FROM runs
+             WHERE key GLOB ?1 AND ended_at IS NOT NULL AND (?2 IS NULL OR ended_at < ?2) ORDER BY key, ended_at",
+        )?;
+        let runs = stmt
+            .query_map(params![pattern, before], |r| {
+                Ok(PrunedRun {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    ended_at: r.get(2)?,
+                    peak_mem_kb: r.get::<_, Option<i64>>(3)?.map(|m| m as u64),
+                    exit: r.get(4)?,
+                    reason: String::new(),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(runs)
+    }
+
+    /// Move runs out of the history into `pruned_runs`, each with its reason.
+    /// Every version stops learning from them, as they are no longer in
+    /// `runs`; `restore` puts them back. Returns how many moved.
+    pub fn prune_runs(&self, runs: &[PrunedRun]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut moved = 0;
+        for r in runs {
+            let n = tx.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO pruned_runs ({RUN_COLUMNS}, pruned_at, prune_reason)
+                     SELECT {RUN_COLUMNS}, ?2, ?3 FROM runs WHERE id = ?1"
+                ),
+                params![r.id, now(), r.reason],
+            )?;
+            if n > 0 {
+                tx.execute("DELETE FROM runs WHERE id = ?1", [r.id])?;
+                moved += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(moved)
+    }
+
+    /// Pruned runs of the keys that match `pattern`.
+    pub fn pruned(&self, pattern: &str) -> Result<Vec<PrunedRun>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, key, ended_at, peak_mem_kb, exit, prune_reason FROM pruned_runs WHERE key GLOB ?1 ORDER BY key, ended_at",
+        )?;
+        let runs = stmt
+            .query_map([pattern], |r| {
+                Ok(PrunedRun {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    ended_at: r.get(2)?,
+                    peak_mem_kb: r.get::<_, Option<i64>>(3)?.map(|m| m as u64),
+                    exit: r.get(4)?,
+                    reason: r.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(runs)
+    }
+
+    /// Put pruned runs back into the history. A run whose id a newer run took
+    /// meanwhile comes back under a new id. Returns how many came back.
+    pub fn restore(&self, runs: &[PrunedRun]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut back = 0;
+        let rest = RUN_COLUMNS.trim_start_matches("id,");
+        for r in runs {
+            let taken: bool = tx.prepare_cached("SELECT 1 FROM runs WHERE id = ?1")?.exists([r.id])?;
+            let cols = if taken { rest } else { RUN_COLUMNS };
+            let n = tx.execute(&format!("INSERT INTO runs ({cols}) SELECT {cols} FROM pruned_runs WHERE id = ?1"), [r.id])?;
+            if n > 0 {
+                tx.execute("DELETE FROM pruned_runs WHERE id = ?1", [r.id])?;
+                back += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(back)
     }
 
     pub fn set_need(&self, run_id: i64, cpu: f64, mem_kb: u64) -> Result<()> {
@@ -702,7 +974,18 @@ mod tests {
             "wait_spans.to_ts",
         ];
         // Tables added later: only versions that know them write to them.
-        let added = ["group_samples.cores", "group_samples.grp", "group_samples.mem_kb", "group_samples.procs", "group_samples.ts"];
+        let added = [
+            "group_samples.cores",
+            "group_samples.grp",
+            "group_samples.mem_kb",
+            "group_samples.procs",
+            "group_samples.ts",
+            "pruned_runs.key",
+            "pruned_runs.ns",
+            "pruned_runs.prune_reason",
+            "pruned_runs.pruned_at",
+            "pruned_runs.queued_at",
+        ];
         let mut want: Vec<String> = v0_1_0.iter().chain(added.iter()).map(|s| s.to_string()).collect();
         want.sort();
         assert_eq!(required, want);
@@ -780,19 +1063,130 @@ mod tests {
     fn learning_uses_max_memory_and_median_cpu() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_dir(tmp.path()).unwrap();
-        assert_eq!(db.learned("k", 10, 5).unwrap(), Learned::default());
+        assert_eq!(db.learned("k", &Learn::default()).unwrap(), Learned::default());
         run(&db, "k", 1000, 1.0, 10.0, None);
         run(&db, "k", 5000, 2.0, 12.0, None);
         run(&db, "k", 3000, 8.0, 11.0, None);
-        let l = db.learned("k", 10, 5).unwrap();
+        let l = db.learned("k", &Learn::default()).unwrap();
         assert_eq!(l.runs, 3);
         assert_eq!(l.mem_kb, Some(5000));
         assert_eq!(l.cpu, Some(2.0), "median, so one spike does not move it");
         assert_eq!(l.dur_s.map(|d| d.round()), Some(11.0));
         assert!(!l.mem_boosted);
         run(&db, "k", 3000, 2.0, 11.0, Some("memory"));
-        assert!(db.learned("k", 10, 5).unwrap().mem_boosted);
+        assert!(db.learned("k", &Learn::default()).unwrap().mem_boosted);
         assert_eq!(db.starved_streak("k").unwrap(), 1);
+    }
+
+    fn run_exit(db: &Db, key: &str, mem: u64, exit: i32) -> i64 {
+        let id = db.insert_run(&NewRun { ns: "n", key, ..Default::default() }).unwrap();
+        db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+        db.finish_run(id, &RunResult { ended_at: now(), exit, peak_mem_kb: mem, cores_wanted: 1.0, measured: true, ..Default::default() })
+            .unwrap();
+        id
+    }
+
+    const GB: u64 = 1024 * 1024;
+
+    #[test]
+    fn one_far_higher_peak_counts_more_each_time_it_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..4 {
+            run_exit(&db, "k", 5 * GB, 0);
+        }
+        let first = run_exit(&db, "k", 11 * GB, 0);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(l.mem_kb, Some(5 * GB), "a one-off does not set the need");
+        let o = l.outliers.unwrap();
+        assert_eq!((o.runs.len(), o.runs[0].run_id, o.normal_kb, o.weight), (1, first, 5 * GB, 0.0));
+        assert_eq!(o.why(&o.runs[0]), "ignored: seen once, maybe a one-off");
+
+        run_exit(&db, "k", 11 * GB, 0);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(l.mem_kb, Some(8 * GB), "the second time it counts half");
+        assert_eq!(l.outliers.as_ref().map(|o| o.why(&o.runs[0])).as_deref(), Some("counts 50%: seen 2 times"));
+
+        run_exit(&db, "k", 11 * GB, 0);
+        assert_eq!(db.learned("k", &Learn::default()).unwrap().mem_kb, Some(11 * GB), "the third time in full");
+
+        let off = Learn { outlier_ratio: 0.0, ..Learn::default() };
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for m in [5, 5, 5, 11] {
+            run_exit(&db, "k", m * GB, 0);
+        }
+        assert_eq!(db.learned("k", &off).unwrap().mem_kb, Some(11 * GB), "outlier_ratio = 0 turns it off");
+    }
+
+    #[test]
+    fn a_failed_run_far_above_the_rest_never_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..3 {
+            run_exit(&db, "k", 5 * GB, 0);
+        }
+        run_exit(&db, "k", 12 * GB, 1);
+        run_exit(&db, "k", 12 * GB, 137);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(l.mem_kb, Some(5 * GB));
+        let o = l.outliers.unwrap();
+        assert_eq!(o.repeats(), 0, "failed runs do not count as a repeat");
+        assert_eq!(o.why(&o.runs[0]), "ignored: the run failed (exit 137)");
+    }
+
+    #[test]
+    fn small_jobs_and_steady_steps_have_no_outliers() {
+        let rules = Learn::default();
+        let runs = |peaks: &[u64]| -> Vec<Outlier> {
+            peaks.iter().enumerate().map(|(i, p)| Outlier { run_id: i as i64, peak_kb: *p, ended_at: i as f64, exit: Some(0) }).collect()
+        };
+        // Cache hits of a few MB and a full build now and then.
+        assert_eq!(find_outliers(&runs(&[10_000, 10_000, 10_000, 10_000, 3 * GB]), &rules), None);
+        // Less than 1 GB above the rest.
+        let low = Learn { outlier_ratio: 1.5, ..Learn::default() };
+        assert_eq!(find_outliers(&runs(&[3 * GB / 2, 3 * GB / 2, 3 * GB / 2, 12 * GB / 5]), &low), None);
+        assert!(find_outliers(&runs(&[3 * GB / 2, 3 * GB / 2, 3 * GB / 2, 3 * GB]), &low).is_some());
+        // Half the runs are high: that is how the job is.
+        assert_eq!(find_outliers(&runs(&[2 * GB, 2 * GB, 9 * GB, 9 * GB]), &rules), None);
+        // Too few runs to tell.
+        assert_eq!(find_outliers(&runs(&[2 * GB, 9 * GB]), &rules), None);
+        // The cut is at the step: two high runs above a lower group.
+        let o = find_outliers(&runs(&[2 * GB, 2 * GB, 2 * GB, 2 * GB, 2 * GB, 9 * GB, 10 * GB]), &rules).unwrap();
+        assert_eq!((o.runs.len(), o.normal_kb, o.mem_kb), (2, 2 * GB, 6 * GB));
+    }
+
+    #[test]
+    fn pruned_runs_leave_the_history_and_come_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..3 {
+            run_exit(&db, "a:tsc", 5 * GB, 0);
+        }
+        let big = run_exit(&db, "a:tsc", 20 * GB, 0);
+        run_exit(&db, "b:tsc", GB, 0);
+        let mut runs = db.runs_of("a:*", None).unwrap();
+        assert_eq!(runs.len(), 4);
+        assert!(db.runs_of("a:*", Some(0.0)).unwrap().is_empty(), "older than: nothing ended before 1970");
+        runs.retain(|r| r.id == big);
+        runs[0].reason = "outlier".into();
+        assert_eq!(db.prune_runs(&runs).unwrap(), 1);
+        assert_eq!(db.learned("a:tsc", &Learn::default()).unwrap().mem_kb, Some(5 * GB));
+        assert_eq!(db.learned("b:tsc", &Learn::default()).unwrap().runs, 1, "other keys stay");
+        let pruned = db.pruned("*").unwrap();
+        assert_eq!((pruned.len(), pruned[0].reason.as_str(), pruned[0].peak_mem_kb), (1, "outlier", Some(20 * GB)));
+
+        assert_eq!(db.restore(&pruned).unwrap(), 1);
+        assert!(db.pruned("*").unwrap().is_empty());
+        assert_eq!(db.learned("a:tsc", &Learn::default()).unwrap().runs, 4);
+
+        // A run whose id was taken meanwhile comes back under a new id.
+        let last = db.runs_of("b:*", None).unwrap();
+        db.prune_runs(&last).unwrap();
+        let newer = run_exit(&db, "c:tsc", GB, 0);
+        assert_eq!(newer, last[0].id, "SQLite hands out the freed id again");
+        assert_eq!(db.restore(&db.pruned("*").unwrap()).unwrap(), 1);
+        assert_eq!((db.runs_of("b:*", None).unwrap().len(), db.runs_of("c:*", None).unwrap().len()), (1, 1));
     }
 
     #[test]
@@ -848,7 +1242,7 @@ mod tests {
         assert_eq!((e.mem_kb, e.cpu), (Some(4_000_000), Some(3.5)));
         assert_eq!(e.from, r#"the runs of "vitest run" in @dapp/custody"#);
         // The old key keeps its history: nothing moved.
-        assert_eq!(db.learned("packages/dapp/custody:vitest", 10, 5).unwrap().runs, 1);
+        assert_eq!(db.learned("packages/dapp/custody:vitest", &Learn::default()).unwrap().runs, 1);
         // Another command, or another package, falls back on the typical job.
         let e = db.estimate(Some(("@dapp/custody", "vitest run --coverage")), Some("test"), "vitest", None).unwrap().unwrap();
         assert!(e.from.starts_with("typical of"), "{}", e.from);
@@ -875,12 +1269,12 @@ mod tests {
             };
             db.finish_run(id, &r).unwrap();
         }
-        let l = db.learned("stack", 10, 5).unwrap();
+        let l = db.learned("stack", &Learn::default()).unwrap();
         assert_eq!((l.mem_kb, l.cpu), (Some(7_000_000), Some(11.0)), "it is admitted against its start-up peak");
         assert_eq!((l.steady_mem_kb, l.steady_cpu), (Some(4_000_000), Some(0.3)), "the steady state: max memory, median cores");
         // An ordinary job has no steady state.
         run(&db, "k", 1000, 1.0, 10.0, None);
-        let l = db.learned("k", 10, 5).unwrap();
+        let l = db.learned("k", &Learn::default()).unwrap();
         assert_eq!((l.steady_mem_kb, l.steady_cpu), (None, None));
     }
 
@@ -903,6 +1297,6 @@ mod tests {
         let id = db.insert_run(&NewRun { ns: "n", key: "k", ..Default::default() }).unwrap();
         db.mark_started(id, now(), 0.0, None).unwrap();
         db.finish_run(id, &RunResult { ended_at: now(), measured: false, ..Default::default() }).unwrap();
-        assert_eq!(db.learned("k", 10, 5).unwrap().runs, 0);
+        assert_eq!(db.learned("k", &Learn::default()).unwrap().runs, 0);
     }
 }

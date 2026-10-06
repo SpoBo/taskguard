@@ -41,11 +41,27 @@ CPU busy     + CPU still promised to running jobs     + this job's CPU need     
 memory held  + memory still promised to running jobs  + this job's memory need  <= mem_max  (85% of RAM)
 ```
 
+A job that misses by only a little, or only because of programs outside
+taskguard, starts anyway with a warning (see "A little short is close enough"
+below).
+
 - **Needs are learned.** Each run is measured, and the result is kept per
   command. The memory need is the highest peak of the last 10 runs, because
   running out of memory kills processes. The CPU need is the median of the
   cores the job *wanted* in its last 10 runs, because too little CPU only
-  makes a job slower.
+  makes a job slower. A memory need never passes `mem_max`: a job that once
+  took more is capped there, and says so.
+- **One wild run does not set the need.** A peak more than `outlier_ratio`
+  (2) times the next peak below it, and at least `outlier_min` (1 GB) above
+  it, is an outlier: a CI run that took 12 GB where it usually takes 4.5 GB.
+  The first time it does not count, the second time it counts half, the third
+  time in full (`outlier_weights`). A run that failed never counts: a run that
+  goes wrong can take far more than the job needs, and on a real machine most
+  outliers were such runs. Jobs whose usual peak is under `outlier_min` have
+  no outliers: there a jump is mostly a full build after cache hits, and
+  holding it back would start the next full build into a full machine. The
+  job's line says when its run was an outlier, `taskguard outliers` lists
+  them, and `taskguard prune` drops runs from the history.
 - **A first run reserves a cautious guess.** A job with no history counts as
   needing what jobs like it needed in the last 30 days: the 90th percentile of
   their memory peaks and the 75th of the cores they wanted. "Like it" means the
@@ -86,6 +102,13 @@ memory held  + memory still promised to running jobs  + this job's memory need  
   job is started into space the first one is about to use.
 - **The machine readings count everything.** Your browser and your editor
   count too, not only jobs that taskguard started.
+- **A little short is close enough.** A job short of memory by at most
+  `noise_mem` (2%) of RAM, or of CPU by at most `noise_cpu` (0.5) cores,
+  starts anyway: readings move by that much from one second to the next.
+  So does a job that only programs outside taskguard keep out, while
+  taskguard's own jobs fit under the limits (`outside_admit`). Memory stays a
+  hard rule at `pause_at` (92%). Each such start prints a warning with what
+  the job lacks and the rule that let it start.
 - **Nothing running means the job starts,** whatever the CPU and memory
   readings say, so the queue cannot deadlock on a wrong reading. Memory
   pressure is the one exception: then the load comes from other programs, and
@@ -179,6 +202,8 @@ grandchild: a JavaScript entry point is a node process that starts the native
 compiler.
 
 ## Install
+
+What changed in each version: [`CHANGELOG.md`](CHANGELOG.md).
 
 Prebuilt binaries for macOS (Apple silicon, Intel) and Linux (x86_64, ARM,
 static) are on the [releases page](https://github.com/SpoBo/taskguard/releases):
@@ -276,6 +301,11 @@ Status lines go to stderr, so the command's own output stays clean:
 default, so an LLM agent does not kill a command that only waits. Set
 `hints = false` per repository or directory. `--hints` and `--no-hints` override
 it for one call.
+
+**For agents:** `taskguard help --all` prints every command with all its
+options in one text. Point an agent at it, or put its output in the agent's
+instructions, so it knows the whole tool at once. `taskguard help COMMAND`, or
+`COMMAND --help`, shows one command.
 
 ### Starved runs
 
@@ -398,9 +428,18 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard status [--json]` | What runs, what waits, and why |
 | `taskguard pause JOB`, `taskguard resume JOB` | Pause or resume a running job by hand. JOB is a pid, a key, or a unique part of a key |
 | `taskguard history` | Learned needs per command |
+| `taskguard outliers [PATTERN] [--ratio R] [--min SIZE]` | Memory peaks far above a job's other runs, and how much each counts. `--ratio 1.5` finds more, `3` fewer |
+| `taskguard prune PATTERN [--older-than 30d]` | Drop the runs of the keys that match from the history. PATTERN is a key from `history`; `*` matches anything (`'packages/api:*'`). Without `--apply` it only shows what it would do |
+| `taskguard prune --outliers [PATTERN] [--ratio R] [--min SIZE]` | Drop the outliers that `outliers` lists, with the same options |
+| `taskguard prune --undo [PATTERN]` | Put pruned runs back |
 | `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
 | `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
 | `taskguard import-history` | Load tsc-queue's memory history |
+| `taskguard help COMMAND`, `taskguard COMMAND --help` | Help for one command: what it does, its options, examples |
+| `taskguard help --all` | Every command in full, in one text, for LLM agents |
+
+`--help` after the command you run belongs to that command:
+`taskguard -- tsc --help` shows tsc's help.
 
 ## Configuration
 
@@ -422,6 +461,8 @@ most used ones:
 cpu_max = 100          # percent of all cores
 mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
+outlier_ratio = 2      # a peak this many times the next one is an outlier; 0 = off
+outside_admit = true   # start jobs that only other programs keep out
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -467,6 +508,14 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   cannot see a Ctrl-Z in the terminal: that stops taskguard itself too.
 - A job with no history reserves an estimate. A first run far bigger than
   similar jobs can still take more than its estimate before it is learned.
+- An outlier that is real growth is learned late: the next run still
+  reserves the usual peak, and only the third high run counts in full. A run
+  that failed is never learned, even when it really needed that memory. Set
+  `outlier_weights = [0.5]` to learn sooner, or `outlier_ratio = 0` to learn
+  every peak at once.
+- A job that starts early on `noise_mem` or `outside_admit` can push memory
+  past `mem_max`, up to `pause_at`. Set `outside_admit = false` and
+  `noise_mem = 0` to keep `mem_max` a hard rule.
 
 ## Moving from tsc-queue
 
@@ -507,6 +556,9 @@ the others write:
 
 - The queue entries and the `machine` file are JSON. Fields are only added,
   never removed, renamed or retyped, and a missing field gets a default.
+- `taskguard prune` moves runs into the table `pruned_runs`, so every
+  version stops learning from them; `prune --undo` moves them back. Without
+  `--apply`, prune only shows what it would do.
 - The database only gains tables and columns. A new column is nullable or has
   a default, so older versions can still insert rows.
 - A job gets the same history key in every version.

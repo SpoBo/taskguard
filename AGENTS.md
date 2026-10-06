@@ -1,5 +1,8 @@
 # Agents
 
+- Changelog: a change that users notice (a command, flag, setting, default,
+  or fix) adds a line under `## [Unreleased]` in `CHANGELOG.md`, in the same
+  commit.
 - Releases: follow `.claude/skills/release/SKILL.md`. It covers the version
   bump, the tag, the release workflow, and moving DALP to the new version.
 - Old and new versions share one state directory, so data formats may only

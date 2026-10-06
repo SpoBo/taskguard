@@ -353,7 +353,7 @@ impl App {
                     samples,
                     live,
                     key: k.clone(),
-                    learned: db.learned(k, self.cfg.hist_keep, self.cfg.boost_runs)?,
+                    learned: db.learned(k, &self.cfg.learn())?,
                     runs,
                     adjustments: dash::adjustments(db, Some(k), 0.0)?,
                     min_cpu,

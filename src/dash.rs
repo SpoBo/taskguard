@@ -555,12 +555,12 @@ pub struct HistoryRow {
     pub last_exit: Option<i64>,
 }
 
-pub fn history(db: &Db, keep: usize) -> Result<Vec<HistoryRow>> {
+pub fn history(db: &Db, rules: &crate::db::Learn) -> Result<Vec<HistoryRow>> {
     let mut s = db.conn.prepare_cached("SELECT DISTINCT key, ns FROM runs WHERE ended_at IS NOT NULL AND peak_mem_kb > 0")?;
     let keys: Vec<(String, String)> = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
     let mut out = Vec::new();
     for (key, ns) in keys {
-        let l = db.learned(&key, keep, 5)?;
+        let l = db.learned(&key, rules)?;
         let total: i64 = db.conn.query_row("SELECT count(*) FROM runs WHERE key = ?1 AND ended_at IS NOT NULL", [&key], |r| r.get(0))?;
         let (last_dur_s, last_exit) = db
             .conn

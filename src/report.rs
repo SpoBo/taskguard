@@ -586,6 +586,10 @@ mod tests {
             max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            noise_mem_pct: 0.0,
+            noise_cpu: 0.0,
+            outside_admit: false,
+            outside_mem_max_pct: 95.0,
         };
         let mut m = MachineSample::fixed(10.0, 10, 23 * GB, 32 * GB);
         m.mem_pressure = Some(50.0);
@@ -608,6 +612,10 @@ mod tests {
             max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            noise_mem_pct: 0.0,
+            noise_cpu: 0.0,
+            outside_admit: false,
+            outside_mem_max_pct: 95.0,
         };
         let m = MachineSample::fixed(7.4, 12, 23 * GB, 32 * GB);
         let api = Entry {

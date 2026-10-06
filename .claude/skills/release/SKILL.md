@@ -14,7 +14,8 @@ publishes them on a GitHub release:
 - `taskguard-x86_64-unknown-linux-musl.tar.gz`
 - `taskguard-aarch64-unknown-linux-musl.tar.gz`
 
-Each file has a `.sha256` file next to it. The same version also goes to
+Each file has a `.sha256` file next to it. The text of the GitHub release is
+the version's section of `CHANGELOG.md`; the workflow fails without one. The same version also goes to
 crates.io (see the last step). Publish there only when the user asks.
 
 ## Before you start
@@ -29,6 +30,12 @@ crates.io (see the last step). Publish there only when the user asks.
    guard this. Never change their pinned values to make them pass. If a change
    cannot keep these formats, it needs a new state directory. Stop and ask
    the user.
+4. Check `CHANGELOG.md`. Everything users notice since the last release must
+   be under `## [Unreleased]`: new commands, flags and settings, changed
+   defaults, fixes. Compare it with
+   `git log --no-merges --format='- %s' vOLD..HEAD`. Add what is missing.
+   Leave out changes users do not see (tests, CI, refactors). Write plain
+   words: what a user can do now, or what works better.
 
 ## Steps
 
@@ -48,7 +55,14 @@ sed -i '' 's/^version = "OLD"/version = "NEW"/' Cargo.toml   # GNU sed: sed -i
 cargo build --release
 grep -A1 'name = "taskguard"' Cargo.lock   # shows NEW
 
-git add Cargo.toml Cargo.lock
+# CHANGELOG.md, by hand:
+# 1. Under the title text, add a new empty "## [Unreleased]" section.
+# 2. Rename the old "## [Unreleased]" to "## [NEW] - YYYY-MM-DD" (today).
+# 3. At the bottom, point the Unreleased link at vNEW...HEAD, and add
+#    "[NEW]: https://github.com/SpoBo/taskguard/compare/vOLD...vNEW" under it.
+cargo test changelog                     # fails when step 2 or 3 is missing
+
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore: release NEW"
 git tag vNEW
 git push origin master vNEW              # only after the user said yes
@@ -60,6 +74,7 @@ Then watch the workflow, and check that all eight files are on the release:
 id=$(gh run list -R SpoBo/taskguard --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')
 gh run watch "$id" -R SpoBo/taskguard --exit-status
 gh release view vNEW -R SpoBo/taskguard --json assets --jq '.assets[].name'
+gh release view vNEW -R SpoBo/taskguard --json body --jq .body   # the changelog section
 ```
 
 To publish on crates.io, ask the user for a token. Pass it in the
@@ -125,7 +140,7 @@ hash for each platform. Change it on a DALP branch, not on `main`.
 4. Check how DALP's pools match a few commands, from the DALP checkout:
    `devenv shell -- taskguard doctor --explain "bun scripts/compile.ts"`.
 5. Commit with a message like `chore(agents): taskguard NEW`. In the body, say
-   in one line what the release fixes. If the PR text names the old version,
+   in one line what the release fixes; the `CHANGELOG.md` section has it. If the PR text names the old version,
    update it.
 
 Do not run whole-repo turbo tasks in DALP to test a release. A full run once

@@ -527,6 +527,14 @@ pub struct Limits {
     pub cpu_min_duration: f64,
     /// Memory pressure (0-100) at which nothing new starts.
     pub pressure_max: f64,
+    /// A job short of memory by at most this share of RAM (0-100) starts.
+    pub noise_mem_pct: f64,
+    /// A job short of CPU by at most this many cores starts.
+    pub noise_cpu: f64,
+    /// A job that only programs outside taskguard keep out starts, while
+    /// memory would stay under `outside_mem_max_pct` of RAM.
+    pub outside_admit: bool,
+    pub outside_mem_max_pct: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -614,8 +622,16 @@ impl Blocker {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
 pub enum Decision {
-    Admit { reason: String },
-    Wait { blockers: Vec<Blocker> },
+    Admit {
+        reason: String,
+        /// Set when the job starts before the limits say it fits: what it
+        /// lacks, and the rule that lets it start anyway.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        early: Option<String>,
+    },
+    Wait {
+        blockers: Vec<Blocker>,
+    },
 }
 
 /// Memory that running jobs have not claimed yet: a job sitting at 2 GB whose
@@ -688,8 +704,8 @@ pub fn decide(
     // it keeps out would otherwise hold up the whole queue until it is stopped.
     if running.iter().all(Entry::steady) {
         return match older.first() {
-            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into() },
-            None => Decision::Admit { reason: "nothing else is running but long-lived jobs past their start-up".into() },
+            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into(), early: None },
+            None => Decision::Admit { reason: "nothing else is running but long-lived jobs past their start-up".into(), early: None },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
         };
     }
@@ -705,7 +721,7 @@ pub fn decide(
     // keep it out: it starts once the running jobs have made room for it, or
     // when none runs, which they do not put off.
     let holds = |w: &Entry| {
-        let theirs = room.blockers(m, lim, running, w, now, unknown_starts);
+        let (theirs, _) = room.left(m, lim, running, w, now, unknown_starts);
         theirs.is_empty()
             || now - w.queued_at > lim.max_backfill && !me.est_dur_s.zip(soonest_start(&theirs, running, now)).is_some_and(|(d, t)| d <= t)
     };
@@ -733,10 +749,11 @@ pub fn decide(
     // one run finishes before the next one takes the room: twenty runs that
     // each move a little finish later than twenty runs in turn. A job of the
     // older run that cannot start holds nothing back, so no room is wasted.
-    if let Some(o) = older.iter().find(|w| runs_before(w, me) && room.blockers(m, lim, running, w, now, unknown_starts).is_empty()) {
+    if let Some(o) = older.iter().find(|w| runs_before(w, me) && room.left(m, lim, running, w, now, unknown_starts).0.is_empty()) {
         blockers.push(Blocker::Pipeline { key: o.key.clone(), pipeline: o.pipeline.clone().unwrap_or_default() });
     }
-    blockers.extend(room.blockers(m, lim, running, me, now, unknown_starts));
+    let (mine, early) = room.left(m, lim, running, me, now, unknown_starts);
+    blockers.extend(mine);
     if blockers.is_empty() {
         let cpu = if short(lim, me) {
             format!("CPU {:.1}+{:.1} promised of {:.1} cores (short job)", room.promised_cpu, me.need_cpu, room.cpu_limit)
@@ -744,7 +761,13 @@ pub fn decide(
             format!("CPU {:.1}+{:.1}+{:.1} of {:.1} cores", m.cpu_busy, room.res_cpu, me.need_cpu, room.cpu_limit)
         };
         let mem_would = room.mem_would(me);
-        Decision::Admit { reason: format!("fits: {cpu}, memory {:.0}% of {:.0}%", pct(mem_would, m.mem_total_kb as f64), lim.mem_max_pct) }
+        let reason = format!(
+            "{}: {cpu}, memory {:.0}% of {:.0}%",
+            if early.is_some() { "nearly fits" } else { "fits" },
+            pct(mem_would, m.mem_total_kb as f64),
+            lim.mem_max_pct
+        );
+        Decision::Admit { reason, early }
     } else {
         Decision::Wait { blockers }
     }
@@ -950,23 +973,107 @@ struct Room {
     mem_used: u64,
     /// The cores running jobs need in all, whatever they use right now.
     promised_cpu: f64,
+    /// What the running jobs hold now.
+    ours_mem: u64,
 }
 
 impl Room {
     fn new(m: &MachineSample, lim: &Limits, running: &[Entry]) -> Room {
         let (res_cpu, res_mem) = reserve(running);
+        let ours_mem = running.iter().map(|e| e.live_mem_kb).sum();
         Room {
             res_cpu,
             res_mem,
             promised_cpu: promised_cpu(running),
             cpu_limit: m.ncpu as f64 * lim.cpu_max_pct / 100.0,
             mem_limit: m.mem_total_kb as f64 * lim.mem_max_pct / 100.0,
-            mem_used: m.mem_for_admission(running.iter().map(|e| e.live_mem_kb).sum()),
+            mem_used: m.mem_for_admission(ours_mem),
+            ours_mem,
         }
     }
 
     fn mem_would(&self, job: &Entry) -> f64 {
         (self.mem_used + self.res_mem + job.need_mem_kb) as f64
+    }
+
+    /// What keeps `job` from starting, after the leeway: a job that falls
+    /// short only by a little, or only because of programs outside taskguard,
+    /// starts anyway. Then the second value says what it lacks and why it
+    /// starts, for the job's warning line.
+    fn left(
+        &self,
+        m: &MachineSample,
+        lim: &Limits,
+        running: &[Entry],
+        job: &Entry,
+        now: f64,
+        unknown_starts: &[f64],
+    ) -> (Vec<Blocker>, Option<String>) {
+        let blockers = self.blockers(m, lim, running, job, now, unknown_starts);
+        match self.early(m, lim, job, &blockers) {
+            Some(why) => (Vec::new(), Some(why)),
+            None => (blockers, None),
+        }
+    }
+
+    /// Why a job that `blockers` keep out may start anyway, when each of them
+    /// is a shortfall of memory or CPU that is either small (`noise_mem`,
+    /// `noise_cpu`) or only there because of programs outside taskguard
+    /// (`outside_admit`). Readings move by a few percent from one second to
+    /// the next, and the room taskguard's own jobs need is what it can count
+    /// on: holding a job back for a browser tab gains little. Memory stays a
+    /// hard rule above `outside_mem_max_pct`, as there the machine swaps.
+    /// A shortfall is measured with every job started before counted in, so
+    /// a run of such starts cannot pile up: the next one falls short by more.
+    fn early(&self, m: &MachineSample, lim: &Limits, job: &Entry, blockers: &[Blocker]) -> Option<String> {
+        if blockers.is_empty() || !blockers.iter().all(|b| matches!(b, Blocker::Memory { .. } | Blocker::Cpu { .. })) {
+            return None;
+        }
+        let total = m.mem_total_kb as f64;
+        let gb = |kb: f64| kb / (1024.0 * 1024.0);
+        let mut why = Vec::new();
+        for b in blockers {
+            match *b {
+                Blocker::Memory { short_kb, .. } => {
+                    let would = self.mem_would(job);
+                    if would > total * lim.outside_mem_max_pct / 100.0 {
+                        return None;
+                    }
+                    let outside = self.mem_used.saturating_sub(self.ours_mem);
+                    let ours = (self.ours_mem + self.res_mem + job.need_mem_kb) as f64;
+                    if short_kb as f64 <= total * lim.noise_mem_pct / 100.0 {
+                        why.push(format!(
+                            "memory short by {:.1} GB, within noise_mem {:.0}% of RAM",
+                            gb(short_kb as f64),
+                            lim.noise_mem_pct
+                        ));
+                    } else if lim.outside_admit && ours <= self.mem_limit {
+                        why.push(format!(
+                            "memory short by {:.1} GB, but only because programs outside taskguard hold {:.1} GB (outside_admit; memory would reach {:.0}%, under {:.0}%)",
+                            gb(short_kb as f64),
+                            gb(outside as f64),
+                            pct(would, total),
+                            lim.outside_mem_max_pct
+                        ));
+                    } else {
+                        return None;
+                    }
+                }
+                Blocker::Cpu { short, busy, .. } => {
+                    if short <= lim.noise_cpu {
+                        why.push(format!("CPU short by {short:.1} cores, within noise_cpu {:.1}", lim.noise_cpu));
+                    } else if lim.outside_admit && busy > 0.0 && self.promised_cpu + job.need_cpu <= self.cpu_limit + 1e-9 {
+                        why.push(format!(
+                            "CPU short by {short:.1} cores, but only because programs outside taskguard keep cores busy (outside_admit)"
+                        ));
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(why.join("; "))
     }
 
     /// What keeps `job` itself from starting now, apart from the jobs ahead
@@ -1079,6 +1186,10 @@ mod tests {
         max_backfill: 0.0,
         cpu_min_duration: 5.0,
         pressure_max: 20.0,
+        noise_mem_pct: 0.0,
+        noise_cpu: 0.0,
+        outside_admit: false,
+        outside_mem_max_pct: 95.0,
     };
 
     /// A running entry exactly as v0.1.2 writes it.
@@ -1209,6 +1320,51 @@ mod tests {
             blockers(decide(&machine(8.0, 12), &LIM, &[running.clone()], std::slice::from_ref(&me), &me, 1000.0, &[])),
             vec!["memory", "cpu"]
         );
+    }
+
+    fn early(d: Decision) -> Option<String> {
+        match d {
+            Decision::Admit { early, .. } => early,
+            Decision::Wait { blockers } => panic!("waits: {:?}", blockers.iter().map(|b| b.name()).collect::<Vec<_>>()),
+        }
+    }
+
+    #[test]
+    fn a_job_that_lacks_a_little_or_only_room_other_programs_hold_starts_anyway() {
+        let lim = Limits { noise_mem_pct: 2.0, noise_cpu: 0.5, outside_admit: true, outside_mem_max_pct: 92.0, ..LIM };
+        let mut running = job(1, "api", 4.0, 18);
+        running.live_cpu = 1.0;
+        running.live_mem_kb = 5 * GB;
+        let run = std::slice::from_ref(&running);
+        let me = job(2, "worker", 2.0, 4);
+        let me_too = std::slice::from_ref(&me);
+        let mem = |kb: u64| MachineSample::fixed(2.0, 12, kb, 32 * GB);
+        // 27.5 GB of the 27.2 GB limit: 0.3 GB short, within 2% of 32 GB.
+        let why = early(decide(&mem(10 * GB + GB / 2), &lim, run, me_too, &me, 1000.0, &[])).unwrap();
+        assert!(why.contains("memory short by 0.3 GB, within noise_mem 2%"), "{why}");
+        // 29 GB: 1.8 GB short, but taskguard's jobs need only 22 GB of it; the
+        // other 7 GB belong to other programs.
+        let why = early(decide(&mem(12 * GB), &lim, run, me_too, &me, 1000.0, &[])).unwrap();
+        assert!(why.contains("only because programs outside taskguard hold 7.0 GB"), "{why}");
+        // 30 GB is past pause_at's 92%: memory stays a hard rule there.
+        assert_eq!(blockers(decide(&mem(13 * GB), &lim, run, me_too, &me, 1000.0, &[])), vec!["memory"]);
+        // Without the leeway the job waits, as before.
+        assert_eq!(blockers(decide(&mem(10 * GB + GB / 2), &LIM, run, me_too, &me, 1000.0, &[])), vec!["memory"]);
+        // When taskguard's own jobs fill the room, outside programs are no excuse.
+        let mut fat = job(1, "api", 4.0, 22);
+        fat.live_mem_kb = 20 * GB;
+        let big = job(2, "worker", 2.0, 6);
+        assert_eq!(
+            blockers(decide(&mem(21 * GB), &lim, std::slice::from_ref(&fat), std::slice::from_ref(&big), &big, 1000.0, &[])),
+            vec!["memory"]
+        );
+        // CPU: 7.4 busy + 3 still to come + 2 = 12.4 of 12 cores, 0.4 short.
+        let cpu = |busy: f64| MachineSample::fixed(busy, 12, 4 * GB, 32 * GB);
+        assert!(early(decide(&cpu(7.4), &lim, run, me_too, &me, 1000.0, &[])).unwrap().contains("within noise_cpu"));
+        // 1 core short, but taskguard has promised only 6 of the 12.
+        assert!(early(decide(&cpu(8.0), &lim, run, me_too, &me, 1000.0, &[])).unwrap().contains("keep cores busy"));
+        // A job that fits starts as before, with no warning.
+        assert_eq!(early(decide(&cpu(1.0), &lim, run, me_too, &me, 1000.0, &[])), None);
     }
 
     #[test]

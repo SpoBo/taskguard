@@ -9,7 +9,7 @@ repository = "https://github.com/SpoBo/taskguard"
 readme = "README.md"
 keywords = ["semaphore", "queue", "monorepo", "turbo", "scheduler"]
 categories = ["command-line-utilities", "development-tools"]
-include = ["/src", "/tests", "/README.md", "/LICENSE", "/taskguard.example.toml"]
+include = ["/src", "/tests", "/README.md", "/CHANGELOG.md", "/LICENSE", "/taskguard.example.toml"]
 
 [profile.release]
 lto = true
