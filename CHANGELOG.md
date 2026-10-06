@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-06
+
 ### Added
 
 - One run that takes far more memory than the job's other runs no longer sets
@@ -209,7 +211,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/SpoBo/taskguard/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/SpoBo/taskguard/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/SpoBo/taskguard/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/SpoBo/taskguard/compare/v0.4.3...v0.4.4
