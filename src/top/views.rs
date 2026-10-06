@@ -1,7 +1,7 @@
 //! Drawing the dashboard's views.
 
 use super::chart::{self, AXIS_W, PALETTE, Stacked, WaitStrip, spark};
-use super::{App, Charts, Click, Input, NS_SORTS, RANGES, RUN_SORTS, SaveTo, VIEWS, View};
+use super::{App, Charts, Click, Input, NS_SORTS, RANGES, RUN_SORTS, SaveTo, TASK_SORTS, VIEWS, View};
 use crate::config::{SETTINGS, SettingKind};
 use crate::dash::{self, Marker};
 use crate::report::{self, chrono_like, datetime, dur, gb};
@@ -28,6 +28,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Queue => queue(f, app, main),
         View::Runs => runs(f, app, main),
         View::Job => job(f, app, main),
+        View::Tasks => tasks(f, app, main),
         View::Trends => trends(f, app, main),
         View::Warnings => warnings(f, app, main),
         View::Namespaces => namespaces(f, app, main),
@@ -35,6 +36,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Help => help(f, main),
     }
     draw_footer(f, app, foot);
+    if app.keys_open {
+        keys_panel(f, app, main);
+    }
 }
 
 fn ns_color(app: &App, ns: &str) -> Color {
@@ -98,6 +102,9 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         Input::Filter(t) => Some(format!("filter keys: {t}▏   Enter apply, Esc cancel")),
         Input::ConfirmKill(pid, key) => Some(format!("send SIGTERM to {key} (pid {pid})? y / n")),
         Input::ConfirmStart(_, key) => Some(format!("start {key} now, whatever the limits say? y / n")),
+        Input::ConfirmPrune { what, .. } => {
+            Some(format!("prune {what} from the history? They move aside; taskguard prune --undo puts them back.  y / n"))
+        }
         Input::EditNeeds(_, key, t) => Some(format!("needs of {key} for this run, as CORES MEMORY: {t}▏   Enter apply, Esc cancel")),
         Input::SaveWhere(_) => Some(format!(
             "save where?  u = your config {} (every repo)   w = this worktree {} (commit it to share)   Esc cancel",
@@ -115,10 +122,34 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(text).style(DIM), area);
         return;
     }
-    // Each item is a key and what it does; a click on it presses the key.
-    let mut items: Vec<(String, &str, Option<KeyCode>)> =
-        vec![("q".into(), "quit", Some(KeyCode::Char('q'))), ("⇧←/→".into(), "tabs", None)];
-    let view_items: Vec<(String, &str, Option<KeyCode>)> = match app.view {
+    // `? keys` first, then the keys of this view that fit. `?` lists them
+    // all. A click on a key presses it.
+    let mut items = vec![("?".to_string(), "keys", Some(KeyCode::Char('?')))];
+    items.extend(view_keys(app));
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (key, what, code) in items {
+        let label = format!("{key} {what}");
+        let w = label.chars().count() as u16;
+        if x + w > area.x + area.width {
+            break;
+        }
+        if let Some(code) = code {
+            app.hits.push((area.y, x, x + w - 1, Click::Key(code)));
+        }
+        x += w + 2;
+        spans.push(Span::styled(key, Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {what}  "), DIM));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// A key, what it does, and the key a click presses.
+type KeyItem = (String, &'static str, Option<KeyCode>);
+
+/// The keys of the view that is open.
+fn view_keys(app: &App) -> Vec<KeyItem> {
+    match app.view {
         View::Overview if app.pick.is_some() => vec![
             ("↑/↓".into(), "select job", None),
             ("Enter".into(), "open run", Some(KeyCode::Enter)),
@@ -155,6 +186,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("s".into(), RUN_SORTS[app.sort % RUN_SORTS.len()], Some(KeyCode::Char('s'))),
             ("r".into(), "reverse", Some(KeyCode::Char('r'))),
             ("/".into(), "filter", Some(KeyCode::Char('/'))),
+            ("n".into(), "namespace", Some(KeyCode::Char('n'))),
         ],
         View::Namespaces => vec![
             ("s".into(), NS_SORTS[app.sort % NS_SORTS.len()], Some(KeyCode::Char('s'))),
@@ -162,8 +194,18 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             ("Enter".into(), "top job", Some(KeyCode::Enter)),
             ("t".into(), "range", Some(KeyCode::Char('t'))),
         ],
+        View::Tasks => vec![
+            ("Enter".into(), "details", Some(KeyCode::Enter)),
+            ("n".into(), "namespace", Some(KeyCode::Char('n'))),
+            ("/".into(), "filter", Some(KeyCode::Char('/'))),
+            ("a".into(), "age", Some(KeyCode::Char('a'))),
+            ("s".into(), TASK_SORTS[app.sort % TASK_SORTS.len()], Some(KeyCode::Char('s'))),
+            ("r".into(), "reverse", Some(KeyCode::Char('r'))),
+            ("x".into(), "prune task", Some(KeyCode::Char('x'))),
+            ("X".into(), "prune all shown", Some(KeyCode::Char('X'))),
+        ],
         View::Trends | View::Warnings => vec![("↑/↓".into(), "select", None), ("Enter".into(), "details", Some(KeyCode::Enter))],
-        View::Job => vec![("Esc".into(), "back", Some(KeyCode::Esc))],
+        View::Job => vec![("Esc".into(), "back", Some(KeyCode::Esc)), ("x".into(), "prune run", Some(KeyCode::Char('x')))],
         View::Config if app.pool_edit.is_some() => {
             let mut v = vec![
                 ("↑/↓".into(), "select", None),
@@ -190,25 +232,60 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
             v
         }
         View::Help => vec![],
-    };
-    items.extend(view_items);
+    }
+}
+
+/// The keys that work in every view.
+fn global_keys(app: &App) -> Vec<KeyItem> {
+    let mut v: Vec<KeyItem> = vec![
+        ("1-9".into(), "open a tab", None),
+        ("Tab ⇧←/→".into(), "next or previous tab", None),
+        ("Esc".into(), "clear the filters, or go back", Some(KeyCode::Esc)),
+    ];
     if app.view != View::Job && app.job_key.is_some() {
-        items.push(("j".into(), "last job", Some(KeyCode::Char('j'))));
+        v.push(("j".into(), "open the last job again", Some(KeyCode::Char('j'))));
     }
-    items.push(("space".into(), if app.paused { "resume" } else { "pause" }, Some(KeyCode::Char(' '))));
-    let mut spans = Vec::new();
-    let mut x = area.x;
-    for (key, what, code) in items {
-        let label = format!("{key} {what}");
-        let w = label.chars().count() as u16;
-        if let Some(code) = code {
-            app.hits.push((area.y, x, x + w - 1, Click::Key(code)));
+    v.push(("space".into(), if app.paused { "resume updates" } else { "pause updates" }, Some(KeyCode::Char(' '))));
+    v.push(("q".into(), "quit", Some(KeyCode::Char('q'))));
+    v.push(("?".into(), "close this list", Some(KeyCode::Char('?'))));
+    v
+}
+
+/// The `?` panel: every key of this view, then the keys of every view. A
+/// click on a row presses its key.
+fn keys_panel(f: &mut Frame, app: &mut App, area: Rect) {
+    let name = VIEWS.iter().find(|(v, _)| *v == app.view).map(|(_, n)| *n).unwrap_or("Job");
+    let mut rows: Vec<Option<KeyItem>> = view_keys(app).into_iter().map(Some).collect();
+    if !rows.is_empty() {
+        rows.push(None);
+    }
+    rows.extend(global_keys(app).into_iter().map(Some));
+    let key_w = rows.iter().flatten().map(|r| r.0.chars().count()).max().unwrap_or(1);
+    let text_w = rows.iter().flatten().map(|r| key_w + 2 + r.1.chars().count()).max().unwrap_or(10);
+    let w = (text_w as u16 + 4).max(30).min(area.width);
+    let h = (rows.len() as u16 + 2).min(area.height);
+    let box_area = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let mut lines = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        match row {
+            Some((key, what, code)) => {
+                let y = box_area.y + 1 + i as u16;
+                if let Some(code) = code
+                    && y < box_area.y + box_area.height - 1
+                {
+                    app.hits.push((y, box_area.x + 1, box_area.x + w - 2, Click::Key(*code)));
+                }
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {key:>key_w$}  "), Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)),
+                    Span::raw(*what),
+                ]));
+            }
+            None => lines.push(Line::raw("")),
         }
-        x += w + 2;
-        spans.push(Span::styled(key, Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!(" {what}  "), DIM));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(ratatui::widgets::Clear, box_area);
+    let block = Block::new().borders(Borders::ALL).title(format!(" keys: {name} ")).title_bottom(" ? or Esc closes ");
+    f.render_widget(Paragraph::new(lines).block(block), box_area);
 }
 
 // -------------------------------------------------------------- overview ----
@@ -1136,6 +1213,76 @@ fn pct_cell(t: Option<(f64, f64, f64)>) -> Cell<'static> {
     }
 }
 
+fn tasks(f: &mut Frame, app: &mut App, area: Rect) {
+    let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).areas(area);
+    let d = &app.data;
+    let rows: Vec<Row> = d
+        .tasks
+        .iter()
+        .map(|t| {
+            let exit = match t.last_exit {
+                Some(0) => Cell::from("0"),
+                Some(e) => Cell::from(e.to_string()).style(Style::default().fg(Color::Red)),
+                None => Cell::from("-"),
+            };
+            Row::new(vec![
+                Cell::from(trunc(&t.key, 60)),
+                Cell::from(format!("██ {}", trunc(&t.ns, 14))).style(Style::default().fg(ns_color(app, &t.ns))),
+                Cell::from(t.runs.to_string()),
+                Cell::from(format!("{} ago", dur((d.now - t.last_end).max(0.0)))),
+                exit,
+                Cell::from(t.mem_kb.map(gb).unwrap_or("-".into())),
+                Cell::from(t.cpu.map(|c| format!("{c:.1}")).unwrap_or("-".into())),
+            ])
+        })
+        .collect();
+    let n = rows.len();
+    let runs: usize = d.tasks.iter().map(|t| t.runs).sum();
+    let filters = app.filter_summary();
+    let title =
+        format!(" {n} of {} tasks, {runs} runs{} ", d.tasks_total, if filters.is_empty() { String::new() } else { format!("; {filters}") });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(24),
+            Constraint::Length(17),
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Length(6),
+        ],
+    )
+    .header(Row::new(vec!["task", "namespace", "runs", "last run", "exit", "memory", "cores"]).style(BOLD))
+    .row_highlight_style(Style::default().bg(Color::DarkGray))
+    .block(Block::new().title(title));
+    render_list(f, app, table, list, 2, n);
+    let text = match (app.data.tasks.get(app.sel), &app.data.task_learned) {
+        (Some(t), Some(l)) => {
+            let mut s = format!(
+                "{}: the next run reserves {} cores and {} of memory",
+                t.key,
+                l.cpu.map(|c| format!("{c:.1}")).unwrap_or("?".into()),
+                l.mem_kb.map(gb).unwrap_or("?".into())
+            );
+            if let Some(o) = &l.outliers {
+                let top = o.runs.iter().map(|r| r.peak_kb).max().unwrap_or(0);
+                s.push_str(&format!(
+                    "; {} outlier run(s) up to {} where it usually takes {}: {}",
+                    o.runs.len(),
+                    gb(top),
+                    gb(o.normal_kb),
+                    o.why(&o.runs[0])
+                ));
+            }
+            s
+        }
+        _ if app.data.tasks_total == 0 => "no tasks yet: a task shows up here after its first run".into(),
+        _ => "no task matches the filters: Esc clears them".into(),
+    };
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }).block(Block::new().borders(Borders::TOP)), detail);
+}
+
 fn trends(f: &mut Frame, app: &mut App, area: Rect) {
     let [list, detail] = Layout::vertical([Constraint::Min(5), Constraint::Length(3)]).areas(area);
     let d = &app.data;
@@ -1260,17 +1407,18 @@ VIEWS
   1 Overview    machine load over time, with taskguard's jobs stacked per namespace
   2 Queue       what runs and what waits, and a Why panel for the selected job
   3 Runs        past runs; the panel below shows why the selected run waited
-  4 Trends      commands whose memory, CPU or duration grows
-  5 Warnings    possibly starved runs, suggested minimums, trend alerts, --now runs over a limit
-  6 Namespaces  load and waits per namespace
-  7 Config      limits, settings and pools: ←/→ change one, Enter on a pool edits its match patterns, n adds a pool;
+  4 Tasks       every task taskguard knows, per namespace: filter them, and prune their history
+  5 Trends      commands whose memory, CPU or duration grows
+  6 Warnings    possibly starved runs, suggested minimums, trend alerts, --now runs over a limit
+  7 Namespaces  load and waits per namespace
+  8 Config      limits, settings and pools: ←/→ change one, Enter on a pool edits its match patterns, n adds a pool;
                 saved in your config or this worktree's .taskguard.toml
-  8 Help        this page
+  9 Help        this page
   Enter on a row opens the job: its learned needs, its history, and the run going on now.
   Esc or Backspace goes back; j opens the last job again.
 
-KEYS
-  q quit   1-8 / Tab / Shift, Option or Cmd + ←/→ views   t / T time range   n next namespace
+KEYS   (? lists the keys of the view you are in)
+  q quit   1-9 / Tab / Shift, Option or Cmd + ←/→ views   t / T time range   n next namespace
   / filter jobs   Esc clear or back   ←/→ time cursor (Overview)   c / m / b charts   o the \"other\" layer
   ↑/↓ select   PgUp/PgDn a page   Enter details   s sort   r reverse   space pause
   Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
@@ -1279,6 +1427,10 @@ KEYS
          p pause or resume a running job by hand (or: taskguard pause JOB / taskguard resume JOB)
          PAUSE: a paused job. Paused for memory (auto_pause, in Config): nothing new starts before it
          resumes. Paused by hand, or with kill -STOP: it stays paused until resumed by hand
+  Tasks: n namespace, / text and a age (not run for 1d, 7d, 30d, 90d) filter the list
+         x prunes every run of the selected task; X prunes every task the filters leave (it needs a filter)
+         pruned runs move aside: taskguard prune --undo --apply puts them back
+  Job: x prunes the selected run
   mouse: click a tab, a key in the bottom line, or a row; the wheel scrolls lists and zooms the Overview
 
 CHART LAYERS (Overview)
@@ -1704,9 +1856,40 @@ mod tests {
         app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x + 1, y);
         assert_eq!(app.view, View::Trends);
         let _ = screen(&mut app, 150, 30);
-        let (y, x, _, _) = *app.hits.iter().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
+        let (y, x, _, _) = *app.hits.iter().find(|h| h.3 == Click::Key(KeyCode::Char('?'))).unwrap();
         app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
-        assert!(app.paused, "a click on 'space pause' pauses");
+        assert!(app.keys_open, "a click on '? keys' opens the list of keys");
+        let _ = screen(&mut app, 150, 30);
+        let (y, x, _, _) = *app.hits.iter().rev().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
+        app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
+        assert!(app.paused && !app.keys_open, "a click on 'space' in the list pauses and closes it");
+    }
+
+    #[test]
+    fn question_mark_lists_every_key_and_the_footer_starts_with_it() {
+        let (_t, mut app) = fixture();
+        for v in VIEWS.iter().map(|(v, _)| *v).chain([View::Job]) {
+            app.view = v;
+            let s = screen(&mut app, 60, 20);
+            let foot = s.lines().last().unwrap();
+            assert!(foot.starts_with("? keys"), "{v:?}: {foot:?}");
+            assert!(foot.chars().count() <= 60, "the footer fits the screen");
+        }
+        app.view = View::Tasks;
+        press(&mut app, KeyCode::Char('?'));
+        let s = screen(&mut app, 150, 40);
+        for k in ["keys: Tasks", "prune all shown", "reverse", "open a tab", "pause updates", "quit", "? or Esc closes"] {
+            assert!(s.contains(k), "the list lacks {k:?}:\n{s}");
+        }
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.keys_open);
+        assert_eq!(app.view, View::Tasks, "Esc only closes the list");
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(!app.keys_open && app.age_filter == 1, "another key closes the list and does its work");
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(!app.keys_open, "? closes it again");
     }
 
     #[test]
@@ -1795,6 +1978,95 @@ mod tests {
     fn app_patterns(file: &std::path::Path) -> Vec<String> {
         let doc: toml::Table = std::fs::read_to_string(file).unwrap().parse().unwrap();
         doc["pool"]["e2e"]["match"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect()
+    }
+
+    /// Finished runs of `key` in `ns`, ended `ago` seconds ago. The dashboard
+    /// reads them at the next load, not 10 seconds later.
+    fn add_runs(app: &mut App, ns: &str, key: &str, n: usize, ago: f64) {
+        app.history = None;
+        let db = Db::open_dir(&app.dir).unwrap();
+        for _ in 0..n {
+            let id = db.insert_run(&NewRun { ns, key, ..Default::default() }).unwrap();
+            db.mark_started(id, now() - ago - 10.0, 0.0, None).unwrap();
+            let r = RunResult { ended_at: now() - ago, peak_mem_kb: 1 << 20, cores_wanted: 1.0, measured: true, ..Default::default() };
+            db.finish_run(id, &r).unwrap();
+        }
+    }
+
+    fn task_keys(app: &App) -> Vec<&str> {
+        app.data.tasks.iter().map(|t| t.key.as_str()).collect()
+    }
+
+    #[test]
+    fn the_tasks_view_lists_filters_and_prunes_tasks() {
+        let (_t, mut app) = fixture();
+        add_runs(&mut app, "shop", "web:tsc", 3, 40.0 * 86400.0);
+        add_runs(&mut app, "shop", "web:vitest", 2, 60.0);
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.view, View::Tasks);
+        app.load().unwrap();
+        assert_eq!(task_keys(&app), vec!["packages/api:vitest_run", "web:vitest", "web:tsc"], "newest run first");
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("3 of 3 tasks, 6 runs"), "{s}");
+        assert!(s.contains("web:tsc") && s.contains("shop"), "{s}");
+
+        // a: only tasks that did not run for a day, then 7 and 30 days.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('a'));
+        }
+        app.load().unwrap();
+        assert_eq!(task_keys(&app), vec!["web:tsc"]);
+        assert!(screen(&mut app, 150, 30).contains("not run for 30d"));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.age_filter, 0, "Esc clears the filters");
+
+        // X needs a filter: it would otherwise prune the whole history.
+        app.load().unwrap();
+        press(&mut app, KeyCode::Char('X'));
+        assert!(app.message.as_deref().unwrap_or("").contains("set one first"), "{:?}", app.message);
+        assert_eq!(app.input, Input::None);
+
+        // With a filter, X prunes every task it leaves, after a y.
+        app.text_filter = "web:".into();
+        app.load().unwrap();
+        press(&mut app, KeyCode::Char('X'));
+        assert!(screen(&mut app, 200, 30).contains("prune all 5 runs of the 2 tasks shown (key contains \"web:\")"));
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.input, Input::None, "n says no");
+        app.load().unwrap();
+        assert_eq!(app.data.tasks.len(), 2);
+        press(&mut app, KeyCode::Char('X'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.message.as_deref().unwrap_or("").starts_with("pruned 5 run(s)"), "{:?}", app.message);
+        assert!(app.data.tasks.is_empty());
+        let db = Db::open_dir(&app.dir).unwrap();
+        assert_eq!(db.pruned("*").unwrap().len(), 5, "the runs are kept aside for --undo");
+
+        // x prunes the selected task only.
+        app.text_filter.clear();
+        app.load().unwrap();
+        assert_eq!(task_keys(&app), vec!["packages/api:vitest_run"]);
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.data.tasks.is_empty());
+        assert!(screen(&mut app, 150, 30).contains("no tasks yet"));
+    }
+
+    #[test]
+    fn x_in_a_job_prunes_the_selected_run() {
+        let (_t, mut app) = fixture();
+        add_runs(&mut app, "dalp", "packages/api:vitest_run", 2, 60.0);
+        app.load().unwrap();
+        app.open_job("packages/api:vitest_run".into());
+        app.load().unwrap();
+        let runs = |app: &App| app.data.job.as_ref().unwrap().runs.len();
+        assert_eq!(runs(&app), 3);
+        let id = app.data.job.as_ref().unwrap().runs[app.sel].id;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(&app.input, Input::ConfirmPrune { run: Some(r), .. } if *r == id), "{:?}", app.input);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(runs(&app), 2);
+        assert!(app.data.job.as_ref().unwrap().runs.iter().all(|r| r.id != id));
     }
 
     #[test]

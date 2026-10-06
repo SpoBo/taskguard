@@ -542,7 +542,7 @@ pub fn render_status(s: &Snapshot) -> String {
     }
     if let Some(first) = s.warnings.first() {
         let _ = writeln!(o);
-        let _ = writeln!(o, "WARNINGS ({})  {first}   (all of them: taskguard top, view 5)", s.warnings.len());
+        let _ = writeln!(o, "WARNINGS ({})  {first}   (all of them: taskguard top, view 6)", s.warnings.len());
     }
     o
 }

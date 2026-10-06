@@ -5,7 +5,7 @@ mod views;
 
 use crate::commands;
 use crate::config::{self, Config, SETTINGS};
-use crate::dash::{self, Bucket, Marker, NsRow, RunRow, TrendRow, Warning};
+use crate::dash::{self, Bucket, Marker, NsRow, RunRow, TaskRow, TrendRow, Warning};
 use crate::db::{self, Db};
 use crate::key;
 use crate::queue::Queue;
@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// The age filter of the Tasks view: tasks whose last run ended longer ago.
+pub const AGES: [(&str, f64); 5] = [("any", 0.0), ("1d", 86400.0), ("7d", 7.0 * 86400.0), ("30d", 30.0 * 86400.0), ("90d", 90.0 * 86400.0)];
+
 pub const RANGES: [(&str, f64); 6] = [("5m", 300.0), ("15m", 900.0), ("1h", 3600.0), ("6h", 21600.0), ("24h", 86400.0), ("7d", 604800.0)];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +28,7 @@ pub enum View {
     Queue,
     Runs,
     Job,
+    Tasks,
     Trends,
     Warnings,
     Namespaces,
@@ -33,10 +37,11 @@ pub enum View {
 }
 
 /// The tabs, in order. The Job view is no tab: Enter on a row opens it.
-pub const VIEWS: [(View, &str); 8] = [
+pub const VIEWS: [(View, &str); 9] = [
     (View::Overview, "Overview"),
     (View::Queue, "Queue"),
     (View::Runs, "Runs"),
+    (View::Tasks, "Tasks"),
     (View::Trends, "Trends"),
     (View::Warnings, "Warnings"),
     (View::Namespaces, "Namespaces"),
@@ -57,6 +62,13 @@ pub enum Input {
     Filter(String),
     ConfirmKill(i32, String),
     ConfirmStart(i32, String),
+    /// Prune runs from the history: every run of these keys, or the one run
+    /// with this id. The text says what, for the question.
+    ConfirmPrune {
+        keys: Vec<String>,
+        run: Option<i64>,
+        what: String,
+    },
     /// Needs for a job, typed as "CORES MEMORY", for example "2 4G".
     EditNeeds(i32, String, String),
     /// Where to save a Config change, asked before the first one. Holds the
@@ -108,6 +120,11 @@ pub struct Data {
     pub markers: Vec<(f64, Marker)>,
     pub runs: Vec<RunRow>,
     pub trends: Vec<TrendRow>,
+    /// The Tasks view: the tasks the filters leave, how many there are in
+    /// all, and what the selected one learned.
+    pub tasks: Vec<TaskRow>,
+    pub tasks_total: usize,
+    pub task_learned: Option<db::Learned>,
     pub warnings: Vec<Warning>,
     pub namespaces: Vec<NsRow>,
     pub ns_list: Vec<String>,
@@ -148,6 +165,8 @@ pub struct App {
     pub range: usize,
     pub ns_filter: Option<String>,
     pub text_filter: String,
+    /// Index in AGES: the Tasks view shows only tasks not run for that long.
+    pub age_filter: usize,
     pub charts: Charts,
     pub show_other: bool,
     pub cursor: Option<usize>,
@@ -169,6 +188,8 @@ pub struct App {
     pub open_run: Option<i64>,
     pub job_key: Option<String>,
     pub input: Input,
+    /// The `?` panel with every key is open.
+    pub keys_open: bool,
     pub columns: usize,
     pub data: Data,
     pub message: Option<String>,
@@ -197,6 +218,7 @@ struct History {
     sig: (Option<f64>, Option<f64>),
     at: Instant,
     trends: Vec<TrendRow>,
+    tasks: Vec<TaskRow>,
     warnings: Vec<Warning>,
     ns_list: Vec<String>,
 }
@@ -224,6 +246,7 @@ impl App {
             range: 2,
             ns_filter: None,
             text_filter: String::new(),
+            age_filter: 0,
             charts: Charts::Both,
             show_other: true,
             cursor: None,
@@ -238,6 +261,7 @@ impl App {
             open_run: None,
             job_key: None,
             input: Input::None,
+            keys_open: false,
             columns: 100,
             data: Data::default(),
             message: None,
@@ -278,7 +302,8 @@ impl App {
             let warnings = dash::warnings_with(db, now - 7.0 * 86400.0, self.cfg.cpu_max, self.cfg.mem_max, &trends)?;
             let mut s = db.conn.prepare_cached("SELECT DISTINCT ns FROM runs WHERE imported = 0 ORDER BY ns")?;
             let ns_list = s.query_map([], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
-            self.history = Some(History { sig, at: Instant::now(), trends, warnings, ns_list });
+            let tasks = dash::tasks(db)?;
+            self.history = Some(History { sig, at: Instant::now(), trends, tasks, warnings, ns_list });
         }
         Ok(self.history.as_ref().expect("just set"))
     }
@@ -306,6 +331,8 @@ impl App {
         let (machine, ncpu, mem_total) = dash::machine_series(db, from, to, n)?;
         let mut ns = dash::ns_series(db, from, to, n, self.cfg.sample_every)?;
         let (ns_filter, text_filter) = (self.ns_filter.clone(), self.text_filter.clone());
+        let (older_than, sort, reverse, view, rules) =
+            (AGES[self.age_filter % AGES.len()].1, self.sort, self.reverse, self.view, self.cfg.learn());
         let history = self.history(db, now)?;
         let ns_list = history.ns_list.clone();
         let warnings = history.warnings.clone();
@@ -315,6 +342,19 @@ impl App {
             .filter(|t| ns_filter.as_ref().is_none_or(|f| &t.ns == f) && t.key.contains(&text_filter))
             .cloned()
             .collect();
+        let tasks_total = history.tasks.len();
+        let mut tasks: Vec<TaskRow> = history
+            .tasks
+            .iter()
+            .filter(|t| ns_filter.as_ref().is_none_or(|f| &t.ns == f) && t.key.contains(&text_filter))
+            .filter(|t| older_than <= 0.0 || now - t.last_end > older_than)
+            .cloned()
+            .collect();
+        sort_tasks(&mut tasks, sort, reverse);
+        let task_learned = match (view, tasks.get(self.sel)) {
+            (View::Tasks, Some(t)) => Some(db.learned(&t.key, &rules)?),
+            _ => None,
+        };
         if let Some(f) = &self.ns_filter {
             ns.retain(|k, _| k == f);
         }
@@ -383,6 +423,9 @@ impl App {
             markers: dash::markers(db, from, to)?,
             runs,
             trends,
+            tasks,
+            tasks_total,
+            task_learned,
             warnings,
             namespaces,
             ns_list,
@@ -400,6 +443,7 @@ impl App {
             View::Queue => self.data.snap.as_ref().map(|s| s.waiting.len() + s.running.len()).unwrap_or(0),
             View::Runs => self.data.runs.len(),
             View::Trends => self.data.trends.len(),
+            View::Tasks => self.data.tasks.len(),
             View::Warnings => self.data.warnings.len(),
             View::Namespaces => self.data.namespaces.len(),
             View::Job => self.data.job.as_ref().map(|j| j.runs.len()).unwrap_or(0),
@@ -523,6 +567,7 @@ impl App {
         match self.view {
             View::Runs => self.data.runs.get(self.sel).map(|r| r.key.clone()),
             View::Trends => self.data.trends.get(self.sel).map(|t| t.key.clone()),
+            View::Tasks => self.data.tasks.get(self.sel).map(|t| t.key.clone()),
             View::Warnings => self.data.warnings.get(self.sel).map(|w| w.key.clone()),
             View::Queue => self.queue_row(self.sel).map(|(e, _)| e.key.clone()),
             View::Namespaces => {
@@ -580,8 +625,89 @@ impl App {
                     Err(e) => e,
                 });
             }
+            Input::ConfirmPrune { keys, run, what } => self.prune(&keys, run, &what),
             Input::None | Input::Filter(_) | Input::SaveWhere(_) | Input::AddPattern(_) | Input::NewPool(_) => {}
         }
+    }
+
+    /// Ask before pruning: `x` prunes the selected task in the Tasks view, or
+    /// the selected run in the Job view; `X` every task the filters leave.
+    fn ask_prune(&mut self, all: bool) {
+        match self.view {
+            View::Tasks if all => {
+                let ages = AGES[self.age_filter % AGES.len()];
+                if self.ns_filter.is_none() && self.text_filter.is_empty() && ages.1 <= 0.0 {
+                    self.message = Some("X prunes every task the filters leave: set one first (n namespace, / text, a age)".into());
+                    return;
+                }
+                let keys: Vec<String> = self.data.tasks.iter().map(|t| t.key.clone()).collect();
+                if keys.is_empty() {
+                    self.message = Some("no task matches the filters".into());
+                    return;
+                }
+                let runs: usize = self.data.tasks.iter().map(|t| t.runs).sum();
+                let what = format!("all {runs} runs of the {} tasks shown ({})", keys.len(), self.filter_summary());
+                self.input = Input::ConfirmPrune { keys, run: None, what };
+            }
+            View::Tasks => match self.data.tasks.get(self.sel) {
+                Some(t) => {
+                    let what = format!("all {} runs of {}", t.runs, t.key);
+                    self.input = Input::ConfirmPrune { keys: vec![t.key.clone()], run: None, what };
+                }
+                None => self.message = Some("no task selected".into()),
+            },
+            View::Job if !all => match self.data.job.as_ref().and_then(|j| j.runs.get(self.sel).map(|r| (j.key.clone(), r))) {
+                Some((key, r)) => {
+                    let what = format!(
+                        "run {} of {key} ({} ago, {})",
+                        r.id,
+                        crate::report::dur(self.data.now - r.ended_at),
+                        r.peak_mem_kb.map(crate::report::gb).unwrap_or("-".into())
+                    );
+                    self.input = Input::ConfirmPrune { keys: vec![key], run: Some(r.id), what };
+                }
+                None => self.message = Some("no run selected".into()),
+            },
+            _ => {
+                self.message =
+                    Some("x prunes the selected task in Tasks (view 4), or the selected run in a job; X every task shown in Tasks".into())
+            }
+        }
+    }
+
+    /// The filters that are set, in words.
+    pub fn filter_summary(&self) -> String {
+        let mut v = Vec::new();
+        if let Some(ns) = &self.ns_filter {
+            v.push(format!("namespace {ns}"));
+        }
+        if !self.text_filter.is_empty() {
+            v.push(format!("key contains {:?}", self.text_filter));
+        }
+        let age = AGES[self.age_filter % AGES.len()];
+        if age.1 > 0.0 {
+            v.push(format!("not run for {}", age.0));
+        }
+        v.join(", ")
+    }
+
+    /// Move runs aside, as `taskguard prune` does, and read the history again.
+    fn prune(&mut self, keys: &[String], run: Option<i64>, what: &str) {
+        let result = (|| -> Result<usize> {
+            let db = Db::open_dir(&self.dir)?;
+            let mut runs = db.runs_of_keys(keys, &format!("pruned in taskguard top: {what}"))?;
+            if let Some(id) = run {
+                runs.retain(|r| r.id == id);
+            }
+            db.prune_runs(&runs)
+        })();
+        self.message = Some(match result {
+            Ok(n) => format!("pruned {n} run(s); taskguard prune --undo --apply puts them back"),
+            Err(e) => format!("could not prune: {e}"),
+        });
+        self.history = None;
+        let _ = self.load();
+        self.sel = self.sel.min(self.list_len().saturating_sub(1));
     }
 
     /// Is the dashboard inside a git checkout, so it has a worktree to save in?
@@ -722,7 +848,7 @@ impl App {
                 }
                 return true;
             }
-            Input::ConfirmKill(..) | Input::ConfirmStart(..) => {
+            Input::ConfirmKill(..) | Input::ConfirmStart(..) | Input::ConfirmPrune { .. } => {
                 let input = std::mem::replace(&mut self.input, Input::None);
                 if let KeyCode::Char('y') = k.code {
                     self.apply_input(input);
@@ -783,6 +909,15 @@ impl App {
             return false;
         }
         self.message = None;
+        // `?` opens the list of keys. Any key closes it; ? and Esc only close
+        // it, every other key also does what it does.
+        if std::mem::take(&mut self.keys_open) && matches!(k.code, KeyCode::Char('?') | KeyCode::Esc) {
+            return true;
+        }
+        if k.code == KeyCode::Char('?') {
+            self.keys_open = true;
+            return true;
+        }
         // Cmd+arrows (when the terminal reports Cmd), Option+arrows and
         // Shift+arrows move between tabs. Option+arrows arrive as Alt+b and
         // Alt+f in terminals that send them as words.
@@ -811,7 +946,7 @@ impl App {
         }
         match k.code {
             KeyCode::Char('q') => return false,
-            KeyCode::Char(c @ '1'..='8') => {
+            KeyCode::Char(c @ '1'..='9') => {
                 let i = (c as u8 - b'1') as usize;
                 self.set_view(VIEWS[i].0);
             }
@@ -832,9 +967,15 @@ impl App {
             }
             KeyCode::Char('/') => self.input = Input::Filter(self.text_filter.clone()),
             KeyCode::Esc => {
-                if self.ns_filter.is_some() || !self.text_filter.is_empty() || self.cursor.is_some() || self.window_end.is_some() {
+                if self.ns_filter.is_some()
+                    || !self.text_filter.is_empty()
+                    || self.age_filter != 0
+                    || self.cursor.is_some()
+                    || self.window_end.is_some()
+                {
                     self.ns_filter = None;
                     self.text_filter.clear();
+                    self.age_filter = 0;
                     self.cursor = None;
                     self.window_end = None;
                 } else {
@@ -846,6 +987,12 @@ impl App {
             KeyCode::Char('m') => self.charts = Charts::Mem,
             KeyCode::Char('b') => self.charts = Charts::Both,
             KeyCode::Char('o') => self.show_other = !self.show_other,
+            KeyCode::Char('a') if self.view == View::Tasks => {
+                self.age_filter = (self.age_filter + 1) % AGES.len();
+                self.sel = 0;
+            }
+            KeyCode::Char('x') => self.ask_prune(false),
+            KeyCode::Char('X') => self.ask_prune(true),
             KeyCode::Char('s') => self.sort += 1,
             KeyCode::Char('r') => self.reverse = !self.reverse,
             KeyCode::Char(' ') => self.paused = !self.paused,
@@ -972,6 +1119,21 @@ fn sort_runs(v: &mut [RunRow], col: usize, rev: bool) {
     }
 }
 
+pub const TASK_SORTS: [&str; 5] = ["last run", "runs", "memory", "cores", "name"];
+
+fn sort_tasks(v: &mut [TaskRow], col: usize, rev: bool) {
+    match col % 5 {
+        1 => v.sort_by_key(|t| std::cmp::Reverse(t.runs)),
+        2 => v.sort_by_key(|t| std::cmp::Reverse(t.mem_kb)),
+        3 => v.sort_by(|a, b| b.cpu.unwrap_or(0.0).total_cmp(&a.cpu.unwrap_or(0.0))),
+        4 => v.sort_by(|a, b| a.key.cmp(&b.key)),
+        _ => v.sort_by(|a, b| b.last_end.total_cmp(&a.last_end)),
+    }
+    if rev {
+        v.reverse();
+    }
+}
+
 pub const RUN_SORTS: [&str; 5] = ["newest", "waited", "duration", "cores", "memory"];
 pub const NS_SORTS: [&str; 4] = ["CPU-hours", "GB-hours", "runs", "wait"];
 
@@ -1037,6 +1199,7 @@ pub fn run(args: &[String]) -> Result<i32> {
         app.range = i;
     }
     app.job_key = arg("--job");
+    app.keys_open = args.iter().any(|a| a == "--keys");
     if app.view == View::Job && app.job_key.is_none() {
         anyhow::bail!("--view job needs --job KEY");
     }

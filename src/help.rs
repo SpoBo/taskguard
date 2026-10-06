@@ -47,18 +47,21 @@ while a batch of jobs is still busy.
 ";
 
 const TOP: &str = "\
-taskguard top [--view NAME] [--range RANGE] [--job KEY] [--print [--width N] [--height N]]
+taskguard top [--view NAME] [--range RANGE] [--job KEY] [--print [--width N] [--height N] [--keys]]
 
-The dashboard: the machine, the queue, past runs, trends and warnings. Press ?
-inside it for its keys.
+The dashboard: the machine, the queue, past runs, every known task, trends
+and warnings. Inside it, ? lists the keys of the view you are in. In the
+Tasks view (tab 4), filter tasks and prune their history: x one task, X every
+task shown.
 
 options:
-  --view NAME     open on a view: overview, queue, runs, trends, warnings,
-                  namespaces, config, help, or job (with --job)
+  --view NAME     open on a view: overview, queue, runs, tasks, trends,
+                  warnings, namespaces, config, help, or job (with --job)
   --queue         the same as --view queue
   --range RANGE   the time range of the charts: 5m, 15m, 1h, 6h, 24h or 7d
   --job KEY       the job view for this history key
   --print         print one frame as plain text and exit, for scripts and agents
+  --keys          with --print: show the list of keys that ? opens
   --width N       with --print: the frame width (default: the terminal, at least 100)
   --height N      with --print: the frame height (default: the terminal, at least 30)
 ";

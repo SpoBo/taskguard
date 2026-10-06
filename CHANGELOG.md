@@ -34,9 +34,20 @@ and the versions follow [semver](https://semver.org).
   `taskguard help --all` prints every command in full in one text, for LLM
   agents.
 - `doctor --explain` shows a command's outliers.
+- `taskguard top` has a Tasks view (tab 4): every task taskguard knows, with
+  its namespace, runs, last run and learned needs. Filter by namespace (`n`),
+  text (`/`) and age (`a`: not run for 1, 7, 30 or 90 days). `x` prunes every
+  run of the selected task, `X` every task the filters leave. In a job's view,
+  `x` prunes the selected run. Both ask first, and `taskguard prune --undo`
+  puts the runs back.
 
 ### Changed
 
+- In `taskguard top`, `?` lists every key of the view you are in, and the keys
+  of every view. The bottom line starts with `? keys` and shows only the keys
+  of the view that fit, so it no longer runs off the screen.
+- The tabs of `taskguard top` after Runs move one up: Trends is 5, Warnings 6,
+  Namespaces 7, Config 8, Help 9.
 - A memory need never passes `mem_max`, as a CPU need never passes `cpu_max`.
   A job that once took more is capped there, and says so. Before, it could
   only start on an empty machine.

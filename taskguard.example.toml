@@ -38,7 +38,7 @@ pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 wa
 # growing, and macOS or Linux can compress it or move it to swap. Nothing new
 # starts while a job is paused. It resumes (SIGCONT) when memory is under
 # resume_at, or when no other job runs. Its paused time is not counted as run
-# time. Change it with ←/→ in taskguard top, view 7.
+# time. Change it with ←/→ in taskguard top, view 8.
 auto_pause = false
 pause_at = 92         # percent of RAM in use; the kernel's critical pressure also counts
 resume_at = 80        # percent of RAM in use; kept at least 2 under pause_at

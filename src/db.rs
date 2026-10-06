@@ -521,6 +521,30 @@ impl Db {
         Ok(runs)
     }
 
+    /// Finished runs of exactly these keys, each with `reason`.
+    pub fn runs_of_keys(&self, keys: &[String], reason: &str) -> Result<Vec<PrunedRun>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, key, ended_at, peak_mem_kb, exit FROM runs WHERE key = ?1 AND ended_at IS NOT NULL ORDER BY ended_at",
+        )?;
+        let mut out = Vec::new();
+        for k in keys {
+            let runs = stmt.query_map([k], |r| {
+                Ok(PrunedRun {
+                    id: r.get(0)?,
+                    key: r.get(1)?,
+                    ended_at: r.get(2)?,
+                    peak_mem_kb: r.get::<_, Option<i64>>(3)?.map(|m| m as u64),
+                    exit: r.get(4)?,
+                    reason: reason.to_string(),
+                })
+            })?;
+            for r in runs {
+                out.push(r?);
+            }
+        }
+        Ok(out)
+    }
+
     /// Move runs out of the history into `pruned_runs`, each with its reason.
     /// Every version stops learning from them, as they are no longer in
     /// `runs`; `restore` puts them back. Returns how many moved.
