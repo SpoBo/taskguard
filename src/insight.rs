@@ -47,7 +47,10 @@ pub struct Reading {
     pub mem_kb: u64,
     pub pageins_per_s: f64,
     /// Cores wanted over the last `WINDOW_S`.
+    #[allow(dead_code)]
     pub wanted_recent: f64,
+    /// CPU cores used over the last `WINDOW_S`, excluding runnable wait.
+    pub used_recent: f64,
 }
 
 impl Tracker {
@@ -120,6 +123,7 @@ impl Tracker {
             mem_kb: mem,
             pageins_per_s: step.pageins / step.dt,
             wanted_recent: (c + r) / span.max(1e-3),
+            used_recent: c / span.max(1e-3),
         })
     }
 

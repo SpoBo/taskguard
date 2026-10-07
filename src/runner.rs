@@ -241,7 +241,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let learned_mem = learned.mem_kb.map(|m| if learned.mem_boosted { (m as f64 * 1.25) as u64 } else { m });
     // A job that once wanted more cores than the machine has is capped at the
     // limit; otherwise it could only ever start on an empty machine.
-    let cpu_cap = sys::ncpu() as f64 * cfg.cpu_max / 100.0;
+    let cpu_cap = (sys::ncpu() as f64 * cfg.cpu_max / 100.0).min(sys::ncpu() as f64);
     // A job with no history still reserves room: what similar jobs needed, or
     // new_job_mem without any. Counting a first run as zero let a burst of new
     // compiles start into a machine that could not hold them, and froze it:
@@ -702,7 +702,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 seen_peak_kb = seen_peak_kb.max(r.mem_kb);
                 let (peak_cpu, peak_mem) = (me.need_cpu, me.need_mem_kb);
-                me.follow(r.mem_kb, r.wanted, r.wanted_recent, sys::ncpu() as f64, now, long);
+                me.follow(r.mem_kb, r.wanted, r.used_recent, sys::ncpu() as f64, now, long);
                 if me.steady_since == Some(now) {
                     tracker.steady_from(now, r.mem_kb);
                     paused_before_steady = me.paused_s;

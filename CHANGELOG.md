@@ -10,6 +10,12 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- Steady long-lived jobs reserve recent CPU use plus a margin instead of
+  runnable wait, and current memory plus 25% instead of a historical floor.
+  Historical CPU needs are clamped to the host's logical core count.
+
 ## [0.7.0] - 2026-10-06
 
 ### Added
