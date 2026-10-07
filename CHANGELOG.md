@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-07
+
 ### Fixed
 
 - Steady long-lived jobs reserve recent CPU use plus a margin instead of
@@ -217,7 +219,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/SpoBo/taskguard/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/SpoBo/taskguard/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/SpoBo/taskguard/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/SpoBo/taskguard/compare/v0.4.4...v0.5.0
