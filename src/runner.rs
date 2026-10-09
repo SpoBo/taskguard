@@ -383,6 +383,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         admit_reason = "queue skipped on request".into();
     } else {
         let mut announced = false;
+        let mut advised = false;
         let mut last_line = t0;
         let mut span: Option<(String, String, f64)> = None;
         let mut started_by_hand = false;
@@ -424,6 +425,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
             }
             let decision;
             let running;
+            let advice;
             {
                 let _g = q.lock()?;
                 let (gone, run, waiting) = q.reap_and_read();
@@ -449,6 +451,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 let unknown_starts = q.unknown_starts();
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &unknown_starts);
+                advice = report::cpu_advice(&m, &limits, &me, &decision, &running, &waiting, now);
                 if let Some(w) = watch.step(&m, &limits, &running, &waiting, &me, &decision, now, &unknown_starts) {
                     let note = queue::Stall {
                         at: now,
@@ -525,7 +528,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     break;
                 }
                 _ if started_by_hand => {
-                    admit_reason = "started by hand from the dashboard".into();
+                    admit_reason = "started by hand (taskguard start, or g in taskguard top)".into();
                     break;
                 }
                 _ if forced => {
@@ -551,10 +554,17 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 announced = true;
                 lines.queued(&me, learned.runs, o.timeout);
             }
-            if now - last_line >= cfg.status_every as f64 {
+            // A job that cannot fit says so once it is clear, and again with
+            // each status line, with what an agent can do about it.
+            let status_due = now - last_line >= cfg.status_every as f64;
+            if status_due {
                 last_line = now;
                 let left = o.timeout.map(|t| if t > 0.0 { t - (now - t0) } else { t + (now - t0) });
                 lines.waiting(&me, now - t0, &decision, &running, now, left);
+            }
+            if !advice.is_empty() && (status_due || !advised) {
+                advised = true;
+                lines.advice(&advice);
             }
             std::thread::sleep(check_every);
         }

@@ -318,6 +318,22 @@ Status lines go to stderr, so the command's own output stays clean:
 [taskguard] done web:build - 7s, used 4.4 cores sustained (wanted 4.8), 1.2 GB peak, exit 0 (0 still queued)
 ```
 
+A job that CPU keeps out and that cannot fit now, because its need is above
+the whole limit or it has waited past `max_bypass`, also prints advice:
+
+```
+[taskguard] advice web:typecheck needs 30.0 cores; the limit is 27.0 cores (cpu_max 150% of 18 cores), so it never fully fits
+[taskguard] advice the room is held by web:lint 15.0 cores, about 4m00s left; web:lint-css 15.0 cores, about 6m10s left
+[taskguard] advice it has waited 1m00s; 46 jobs wait behind it
+[taskguard] advice it starts by itself on 15.0 cores (partial_fit 50% of its need) once that much is free and the machine is near its recent low
+[taskguard] advice to start it now anyway: taskguard start 4242. It then runs on the cores it gets, slower, and no check holds it back, memory included
+[taskguard] advice to change the outcome: raise cpu_max, lower partial_fit, or if its need comes from old runs, check taskguard history and run taskguard prune 'web:typecheck' --apply
+```
+
+It prints once when it applies and again with each status line, with hints
+off too: an agent only sees this output, and this is how it learns to get the
+job going.
+
 **Agent hints** ("this is not a hang", "starts when X finishes") are on by
 default, so an LLM agent does not kill a command that only waits. Set
 `hints = false` per repository or directory. `--hints` and `--no-hints` override
@@ -454,6 +470,7 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard top` | The dashboard |
 | `taskguard status [--json]` | What runs, what waits, and why |
 | `taskguard pause JOB`, `taskguard resume JOB` | Pause or resume a running job by hand. JOB is a pid, a key, or a unique part of a key |
+| `taskguard start JOB` | Start a waiting job now, whatever the limits say, as `g` in `taskguard top` does. JOB is a pid, a ticket, a key, or a unique part of a key |
 | `taskguard history` | Learned needs per command |
 | `taskguard outliers [PATTERN] [--ratio R] [--min SIZE]` | Memory peaks far above a job's other runs, and how much each counts. `--ratio 1.5` finds more, `3` fewer |
 | `taskguard prune PATTERN [--older-than 30d]` | Drop the runs of the keys that match from the history. PATTERN is a key from `history`; `*` matches anything (`'packages/api:*'`). Without `--apply` it only shows what it would do |

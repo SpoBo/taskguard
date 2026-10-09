@@ -34,6 +34,7 @@ usage:
   taskguard top                                the dashboard
   taskguard status [--json]                    what runs, what waits, and why
   taskguard pause JOB | resume JOB             pause or resume a running job (a pid, or its key or part of it)
+  taskguard start JOB                          start a waiting job now, whatever the limits say
   taskguard history                            learned needs per command
   taskguard outliers [PATTERN]                 memory peaks far above a job's other runs, and how much they count
   taskguard prune PATTERN | --outliers | --undo
@@ -55,8 +56,21 @@ fn usage() -> String {
     format!("{USAGE_HEAD}{}{USAGE_TAIL}", help::RUN_OPTIONS)
 }
 
-const SUBCOMMANDS: &[&str] =
-    &["top", "status", "pause", "resume", "history", "outliers", "prune", "doctor", "import-history", "version", "help", "__recorder"];
+const SUBCOMMANDS: &[&str] = &[
+    "top",
+    "status",
+    "pause",
+    "resume",
+    "start",
+    "history",
+    "outliers",
+    "prune",
+    "doctor",
+    "import-history",
+    "version",
+    "help",
+    "__recorder",
+];
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     let a = &args[*i];
@@ -168,6 +182,7 @@ fn dispatch(args: &[String]) -> Result<i32> {
             "status" => commands::status(rest.iter().any(|a| a == "--json")),
             "pause" => commands::pause(rest, true),
             "resume" => commands::pause(rest, false),
+            "start" => commands::start(rest),
             "history" => commands::history(),
             "outliers" => commands::outliers(rest),
             "prune" => commands::prune(rest),

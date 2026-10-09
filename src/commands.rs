@@ -1,4 +1,4 @@
-//! The one-shot subcommands: status, history, outliers, prune, doctor, import-history, pause, resume.
+//! The one-shot subcommands: status, history, outliers, prune, doctor, import-history, pause, resume, start.
 
 use crate::config::{self, Config};
 use crate::dash;
@@ -125,6 +125,50 @@ pub fn pause(args: &[String], pause: bool) -> Result<i32> {
         }
     }
     eprintln!("taskguard: {} did not {verb} within 10 s; is its process stuck?", e.key);
+    Ok(1)
+}
+
+/// `taskguard start JOB`: start a waiting job now, whatever the limits say,
+/// as `g` in the dashboard does. JOB is a pid, a ticket, a key, or a unique
+/// part of a key. The job's own process starts itself; this waits until it
+/// has.
+pub fn start(args: &[String]) -> Result<i32> {
+    let Some(target) = args.first() else { anyhow::bail!("usage: taskguard start JOB (a pid, a ticket, a key, or part of a key)") };
+    let q = Queue::open(&config::state_dir())?;
+    let waiting = {
+        let _g = q.lock()?;
+        q.reap();
+        q.waiting()
+    };
+    let number = target.parse::<i64>().ok();
+    let exact: Vec<&crate::queue::Entry> =
+        waiting.iter().filter(|e| number.is_some_and(|n| n == e.pid as i64 || n == e.ticket as i64) || &e.key == target).collect();
+    let found = if exact.is_empty() { waiting.iter().filter(|e| e.key.contains(target.as_str())).collect() } else { exact };
+    let e = match found.as_slice() {
+        [e] => *e,
+        [] => {
+            let keys: Vec<String> = waiting.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect();
+            anyhow::bail!("no waiting job matches {target:?}; waiting: {}", if keys.is_empty() { "none".into() } else { keys.join(", ") })
+        }
+        many => anyhow::bail!(
+            "{target:?} matches {} jobs: {}; give the pid",
+            many.len(),
+            many.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if e.version.is_none() {
+        anyhow::bail!("{} runs an older taskguard (before 0.1.3); it cannot be started from here", e.key);
+    }
+    q.nudge(e.pid, |n| n.start = true)?;
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !q.waiting().iter().any(|w| w.pid == e.pid) {
+            println!("started {} (pid {}); it runs on the cores it gets, and no limit holds it back, memory included", e.key, e.pid);
+            return Ok(0);
+        }
+    }
+    eprintln!("taskguard: {} did not start within 10 s; is its process stuck?", e.key);
     Ok(1)
 }
 

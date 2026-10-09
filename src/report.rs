@@ -165,6 +165,71 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
     }
 }
 
+/// Advice for a job that CPU keeps out and that cannot fit now: its need is
+/// above the whole CPU limit, or it has waited past `max_bypass`. Agents run
+/// most commands and only see the wait output, so it says what the job
+/// needs, what holds the room and for how long, whom the job holds back, how
+/// to start it anyway and what that costs, and which settings change the
+/// outcome. Empty for any other job.
+pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, running: &[Entry], waiting: &[Entry], now: f64) -> Vec<String> {
+    let Decision::Wait { blockers } = d else { return Vec::new() };
+    if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) {
+        return Vec::new();
+    }
+    let limit = m.ncpu as f64 * lim.cpu_max_pct / 100.0;
+    let never = e.need_cpu > limit + 1e-9;
+    let waited = now - e.queued_at;
+    if !never && waited <= lim.max_bypass {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    out.push(format!(
+        "{} needs {:.1} cores; the limit is {limit:.1} cores (cpu_max {:.0}% of {} cores){}",
+        e.key,
+        e.need_cpu,
+        lim.cpu_max_pct,
+        m.ncpu,
+        if never { ", so it never fully fits" } else { "" }
+    ));
+    let mut holders: Vec<&Entry> = running.iter().filter(|r| !r.paused_by_hand).collect();
+    holders.sort_by(|a, b| b.need_cpu.total_cmp(&a.need_cpu));
+    let held: Vec<String> = holders
+        .iter()
+        .take(3)
+        .map(|r| match r.remaining(now) {
+            Some(left) => format!("{} {:.1} cores, about {} left", r.key, r.need_cpu, dur(left)),
+            None => format!("{} {:.1} cores, time left unknown", r.key, r.need_cpu),
+        })
+        .collect();
+    let ours: f64 = running.iter().map(|r| r.live_cpu).sum();
+    let outside = (m.cpu_busy - ours).max(0.0);
+    out.push(match held.is_empty() {
+        true => format!("the room is held by programs outside taskguard: {outside:.1} cores busy"),
+        false if holders.len() > 3 => format!("the room is held by {} and {} more jobs", held.join("; "), holders.len() - 3),
+        false => format!("the room is held by {}", held.join("; ")),
+    });
+    let behind = waiting.iter().filter(|w| e.ahead_of(w)).count();
+    out.push(format!("it has waited {}; {behind} jobs wait behind it", dur(waited)));
+    out.push(if lim.partial_fit > 0.0 {
+        format!(
+            "it starts by itself on {:.1} cores (partial_fit {:.0}% of its need) once that much is free and the machine is near its recent low",
+            lim.partial_fit * e.need_cpu,
+            lim.partial_fit * 100.0
+        )
+    } else {
+        "partial_fit is 0, so it waits until it fully fits or no other job runs".into()
+    });
+    out.push(format!(
+        "to start it now anyway: taskguard start {}. It then runs on the cores it gets, slower, and no check holds it back, memory included",
+        e.pid
+    ));
+    out.push(format!(
+        "to change the outcome: raise cpu_max, lower partial_fit, or if its need comes from old runs, check taskguard history and run taskguard prune '{}' --apply",
+        e.key
+    ));
+    out
+}
+
 // ---------------------------------------------------------- status lines ----
 
 /// What the `done` line reports.
@@ -224,6 +289,17 @@ impl Lines {
         let text = format!("waiting {} {} - blocked by {}{also}{eta}{}", dur(waited), e.key, blocker_text(b), timeout_text(timeout));
         let hint = format!("It {}; this is not a hang", unblock_text(b, running, now));
         self.out(text, &hint);
+    }
+
+    /// The advice for a job that cannot fit (`cpu_advice`). Not a hint: it
+    /// is the only way an agent learns how to get the job going.
+    pub fn advice(&self, lines: &[String]) {
+        if self.quiet {
+            return;
+        }
+        for l in lines {
+            say(&format!("advice {l}"));
+        }
     }
 
     pub fn start(&self, e: &Entry, waited: f64, reason: &str) {
@@ -568,6 +644,75 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1024 * 1024;
+
+    fn advice_limits() -> Limits {
+        Limits {
+            cpu_max_pct: 150.0,
+            mem_max_pct: 85.0,
+            learn_stagger: 0.0,
+            max_bypass: 120.0,
+            max_backfill: 600.0,
+            cpu_min_duration: 5.0,
+            pressure_max: 20.0,
+            noise_mem_pct: 0.0,
+            noise_cpu: 0.0,
+            outside_admit: false,
+            outside_mem_max_pct: 95.0,
+            partial_fit: 0.5,
+        }
+    }
+
+    /// Voyager: 18 cores at cpu_max 150 is 27 cores. A typecheck that needs
+    /// 30 can never fully fit; its wait output says why and what to do.
+    #[test]
+    fn a_job_that_cannot_fit_gets_advice_an_agent_can_act_on() {
+        let lim = advice_limits();
+        let m = MachineSample::fixed(20.0, 18, 8 * GB, 128 * GB);
+        let mut lint = Entry { ticket: 1, pid: 11, key: "web:lint".into(), need_cpu: 15.0, known: true, ..Default::default() };
+        lint.started_at = Some(900.0);
+        lint.est_dur_s = Some(400.0);
+        let me = Entry {
+            ticket: 2,
+            pid: 4242,
+            key: "web:typecheck".into(),
+            need_cpu: 30.0,
+            known: true,
+            queued_at: 1000.0,
+            ..Default::default()
+        };
+        let behind: Vec<Entry> =
+            (3..6).map(|t| Entry { ticket: t, pid: t as i32, key: format!("t{t}"), queued_at: 1001.0, ..Default::default() }).collect();
+        let mut waiting = vec![me.clone()];
+        waiting.extend(behind);
+        let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), &waiting, &me, 1060.0, &[]);
+        let text = cpu_advice(&m, &lim, &me, &d, std::slice::from_ref(&lint), &waiting, 1060.0).join("\n");
+        for want in [
+            "needs 30.0 cores",
+            "27.0 cores",
+            "never fully fits",
+            "web:lint",
+            "1m00s",
+            "3 jobs wait behind it",
+            "taskguard start 4242",
+            "memory included",
+            "partial_fit",
+            "cpu_max",
+            "taskguard prune",
+        ] {
+            assert!(text.contains(want), "no {want:?} in:\n{text}");
+        }
+
+        // A job that fits gets none.
+        let small = Entry { need_cpu: 2.0, ..me.clone() };
+        let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(&small), &small, 1060.0, &[]);
+        assert!(cpu_advice(&m, &lim, &small, &d, std::slice::from_ref(&lint), &waiting, 1060.0).is_empty());
+        // Nor does a job short of CPU that will fit once the lint ends and has
+        // not waited long.
+        let mid = Entry { need_cpu: 10.0, ..me };
+        let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(&mid), &mid, 1060.0, &[]);
+        assert!(matches!(d, Decision::Wait { .. }));
+        assert!(cpu_advice(&m, &lim, &mid, &d, std::slice::from_ref(&lint), &waiting, 1060.0).is_empty());
+    }
 
     #[test]
     fn bars() {

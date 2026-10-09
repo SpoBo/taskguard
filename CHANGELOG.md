@@ -19,6 +19,17 @@ and the versions follow [semver](https://semver.org).
   at a quiet moment. It then books the cores it got, not its whole need, so
   other jobs keep moving. Memory stays a hard rule. `partial_fit = 0` turns
   it off. Set it per machine in `~/.config/taskguard/config.toml`.
+- A waiting job that CPU keeps out, and that cannot fit now (its need is
+  above the whole limit, or it has waited past `max_bypass`), prints advice
+  lines in its wait output: what it needs against the limit, what holds the
+  room and how long that should last, how many jobs wait behind it, how long
+  it has waited, when partial fit starts it, the command to start it now and
+  what that costs, and the settings that change the outcome. They print with
+  hints off too; `--quiet` hides them.
+- `taskguard start JOB` starts a waiting job now, whatever the limits say, as
+  `g` in `taskguard top` does. JOB is a pid, a ticket, a key, or a unique
+  part of a key. `start` is now a subcommand: to run a program named
+  `start`, use `taskguard run -- start`.
 
 ### Changed
 
