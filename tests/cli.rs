@@ -698,7 +698,7 @@ fn publish_by_tree_needs_no_checkout() {
     // The checkout goes away; the publish watches the branch on GitHub.
     let elsewhere = p.e.cwd.parent().unwrap().join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let mut child =
+    let child =
         p.e.cmd(&["proof", "publish", "--tree", &tree, "--branch", "main", "--repo", "o/r", "--wait", "30"])
             .current_dir(&elsewhere)
             .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
