@@ -47,10 +47,17 @@ below).
 
 - **Needs are learned.** Each run is measured, and the result is kept per
   command. The memory need is the highest peak of the last 10 runs, because
-  running out of memory kills processes. The CPU need is the median of the
-  cores the job *wanted* in its last 10 runs, because too little CPU only
-  makes a job slower. A memory need never passes `mem_max`: a job that once
-  took more is capped there, and says so.
+  running out of memory kills processes. The CPU need is the cores the job
+  *used* in its last 10 runs, because too little CPU only makes a job slower.
+  It is a median in which a run counts half as much as one four runs newer, so
+  it follows a job that gets faster or slower. Time a job's threads spent
+  waiting for a core does not count: `tsgo` and `oxlint` start one thread per
+  core, so on a busy machine they wait on every core. Runs far above the
+  others count as outliers do for memory (below). A run that was starved of
+  CPU used less than it needs, so starved runs are left out while three runs
+  that were not starved remain; what a starved run waited for never raises
+  the need. A memory need never passes `mem_max`: a job that once took more
+  is capped there, and says so.
 - **One wild run does not set the need.** A peak more than `outlier_ratio`
   (2) times the next peak below it, and at least `outlier_min` (1 GB) above
   it, is an outlier: a CI run that took 12 GB where it usually takes 4.5 GB.
@@ -123,10 +130,22 @@ below).
   start. Twenty pipelines that each move a little all finish late; twenty in
   turn finish one after the other, and the last one no later. A job of the
   older run that does not fit holds nothing back, so no room is left idle.
-  Priorities still come first.
+  Priorities still come first. A waiting job with a higher priority holds the
+  others back as a reserved job does: while it could start, and with backfill
+  (below) not while it cannot use the room.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
-  has started.
+  has started, except by backfill (below).
+- **Part of its CPU need is enough for a job that cannot fit.** A job whose
+  CPU need is above the whole limit never fits, and a job that waited past
+  `max_bypass` is the one others are held for. Such a job starts on part of
+  its CPU need: at least `partial_fit` (0.5) of it must be free, and the
+  machine must be near its lowest CPU use of the last two minutes (within one
+  core, or a tenth of the cores), so it starts at a quiet moment and has the
+  best chance to finish well. It then books the cores it got, not its whole
+  need, so it does not hold every other job out while it runs; from there it
+  follows what it uses. Memory stays a hard rule. `partial_fit = 0` turns it
+  off; set it per machine in `~/.config/taskguard/config.toml`.
 - **One line, no circles.** Every rule that holds a job back for another
   follows one fixed order: a higher priority, then the older run (a job outside
   any run counts from when it queued), then the older ticket. A job only ever
@@ -140,9 +159,9 @@ below).
   itself reports it waits for, and from then on no job waits for it. It may
   still start by itself. `taskguard status` shows the mark, and what an owner
   says when that differs from what it should do.
-- **Backfill, if you ask for it.** A reservation for a job that does not fit
+- **Backfill.** A reservation for a job that does not fit
   holds room it cannot use: a 29 GB compile that waits for memory keeps a
-  0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
+  0.2 GB install waiting too. So a reserved job holds
   its turn only while it could start: until it has waited `max_backfill`
   seconds, newer jobs that fit start while it cannot, and nothing newer starts
   once it fits. After `max_backfill`, a newer job that fits still starts if
@@ -152,8 +171,12 @@ below).
   first in line starts whatever the readings say). Such a job takes no room
   the reserved one could use, so a steady stream of small jobs cannot keep it
   out, and a lint is not held up for half an hour behind a job that waits for
-  two long test runs. A job with no learned duration waits. Off by default
-  (`0`); `1800` lets every job that fits through for half an hour.
+  two long test runs. A job with no learned duration waits. For a reserved job
+  that may start on part of its need, "could start" means once that part is
+  free. The drain always ends with the reserved job running: at the latest
+  when no other job runs, also when its need is above the whole limit. On by
+  default for 10 minutes (`max_backfill = 600`); `0` turns it off, `1800`
+  lets every job that fits through for half an hour.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. A slot ceiling only stops such jobs from
   running at the same time and breaking each other; CPU and memory are always
@@ -297,6 +320,22 @@ Status lines go to stderr, so the command's own output stays clean:
 [taskguard] done web:build - 7s, used 4.4 cores sustained (wanted 4.8), 1.2 GB peak, exit 0 (0 still queued)
 ```
 
+A job that CPU keeps out and that cannot fit now, because its need is above
+the whole limit or it has waited past `max_bypass`, also prints advice:
+
+```
+[taskguard] advice web:typecheck needs 30.0 cores; the limit is 27.0 cores (cpu_max 150% of 18 cores), so it never fully fits
+[taskguard] advice the room is held by web:lint 15.0 cores, about 4m00s left; web:lint-css 15.0 cores, about 6m10s left
+[taskguard] advice it has waited 1m00s; 46 jobs wait behind it
+[taskguard] advice it starts by itself on 15.0 cores (partial_fit 50% of its need) once that much is free and the machine is near its recent low
+[taskguard] advice to start it now anyway: taskguard start 4242. It then runs on the cores it gets, slower, and no check holds it back, memory included
+[taskguard] advice to change the outcome: raise cpu_max, lower partial_fit, or if its need comes from old runs, check taskguard history and run taskguard prune 'web:typecheck' --apply
+```
+
+It prints once when it applies and again with each status line, with hints
+off too: an agent only sees this output, and this is how it learns to get the
+job going.
+
 **Agent hints** ("this is not a hang", "starts when X finishes") are on by
 default, so an LLM agent does not kill a command that only waits. Set
 `hints = false` per repository or directory. `--hints` and `--no-hints` override
@@ -311,8 +350,9 @@ instructions, so it knows the whole tool at once. `taskguard help COMMAND`, or
 
 taskguard also measures whether a job was held back while it ran: its threads
 waited for a core more than half as long as they ran, it paged memory in while the machine was under memory pressure, or it
-took 1.5 times its usual time while the machine was full. A starved run
-teaches a higher need for the next run, and with hints on it prints advice
+took 1.5 times its usual time while the machine was full. A run starved of
+memory teaches a higher need for the next run; a run starved of CPU does not
+raise the CPU need (see "Needs are learned"). With hints on it prints advice
 that can be pasted:
 
 ```
@@ -432,6 +472,7 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard top` | The dashboard |
 | `taskguard status [--json]` | What runs, what waits, and why |
 | `taskguard pause JOB`, `taskguard resume JOB` | Pause or resume a running job by hand. JOB is a pid, a key, or a unique part of a key |
+| `taskguard start JOB` | Start a waiting job now, whatever the limits say, as `g` in `taskguard top` does. JOB is a pid, a ticket, a key, or a unique part of a key |
 | `taskguard history` | Learned needs per command |
 | `taskguard outliers [PATTERN] [--ratio R] [--min SIZE]` | Memory peaks far above a job's other runs, and how much each counts. `--ratio 1.5` finds more, `3` fewer |
 | `taskguard prune PATTERN [--older-than 30d]` | Drop the runs of the keys that match from the history. PATTERN is a key from `history`; `*` matches anything (`'packages/api:*'`). Without `--apply` it only shows what it would do |
@@ -468,6 +509,8 @@ mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
 outlier_ratio = 2      # a peak this many times the next one is an outlier; 0 = off
 outside_admit = true   # start jobs that only other programs keep out
+partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
+max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -597,6 +640,14 @@ queues or until one of them is stopped.
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each
 other's jobs. They still see the load of those jobs in the machine readings.
+
+A version that does not know partial fit reads the `machine` file and leaves
+the CPU history in it (`recent_cpu`) out when it writes the file. While its
+recorder runs, newer versions see no recent low and start a partial fit as
+soon as there is room for it. Such a version never starts its own job on part
+of its need; a newer job behind it may then mark it as stalled (see above).
+In 0.7.1 and older `max_backfill` is 0 by default, so such a version keeps
+every reservation unless a settings file sets it.
 
 Versions before 0.2.1 read settings files strictly: they reject a file with a
 setting they do not know. The user config and a repo's `.taskguard.toml` are

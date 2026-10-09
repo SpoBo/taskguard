@@ -46,6 +46,7 @@ pub struct Layer {
     pub noise_mem: Option<f64>,
     pub noise_cpu: Option<f64>,
     pub outside_admit: Option<bool>,
+    pub partial_fit: Option<f64>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -151,6 +152,9 @@ pub struct Config {
     /// A job that only programs outside taskguard keep out starts anyway,
     /// while memory stays under `pause_at`.
     pub outside_admit: bool,
+    /// A job that cannot fit now starts on this share of its CPU need, when
+    /// the machine is near its recent low. 0 turns it off.
+    pub partial_fit: f64,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -189,7 +193,7 @@ impl Default for Config {
             resume_at: 80.0,
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
-            max_backfill: 0,
+            max_backfill: 600,
             boost_runs: 5,
             outlier_ratio: 2.0,
             outlier_min_kb: 1024 * 1024,
@@ -197,6 +201,7 @@ impl Default for Config {
             noise_mem: 2.0,
             noise_cpu: 0.5,
             outside_admit: true,
+            partial_fit: 0.5,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -626,6 +631,7 @@ impl Config {
         set!(noise_mem);
         set!(noise_cpu);
         set!(outside_admit);
+        set!(partial_fit);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);
@@ -935,7 +941,8 @@ mod tests {
         assert_eq!(cl.min_cpu, Some(4.0));
         assert_eq!(cl.min_mem_kb, Some(6 * 1024 * 1024));
         assert!(c.origin["hints"].ends_with(".taskguard.toml"));
-        assert_eq!((Config::default().max_backfill, c.max_backfill), (0, 1800), "backfill is off unless a layer sets it");
+        assert_eq!((Config::default().max_backfill, c.max_backfill), (600, 1800), "backfill is on for 10 minutes unless a layer sets it");
+        assert_eq!((Config::default().partial_fit, c.partial_fit), (0.5, 0.5), "partial fit starts a job on half its need");
     }
 
     #[test]

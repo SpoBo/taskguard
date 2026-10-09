@@ -310,6 +310,7 @@ mod tests {
         noise_cpu: 0.0,
         outside_admit: false,
         outside_mem_max_pct: 95.0,
+        partial_fit: 0.0,
     };
 
     #[test]

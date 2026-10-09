@@ -227,6 +227,24 @@ pub fn starvation(f: &RunFacts) -> Option<Starvation> {
 
 // ---------------------------------------------------------------- advice ----
 
+/// What the next run reserves after a run starved of `kind`, for its warning
+/// line. A run starved of CPU, or slowed down, never raises the CPU need: it
+/// says what the need is now. Without a learned need, what the run used,
+/// never what it waited for. `mem_after` is the memory need after the boost.
+pub fn next_need(kind: &str, cpu_before: Option<f64>, cpu_after: Option<f64>, used: f64, mem_after: Option<u64>, peak_kb: u64) -> String {
+    match kind {
+        "memory" => format!("next run will reserve {} of memory", gb(mem_after.unwrap_or(peak_kb))),
+        _ => {
+            let now = cpu_after.unwrap_or(used);
+            match cpu_before {
+                Some(b) if (now - b).abs() <= 0.05 => format!("next run keeps reserving {b:.1} cores"),
+                Some(b) => format!("next run will reserve {now:.1} cores (was {b:.1})"),
+                None => format!("next run will reserve {now:.1} cores"),
+            }
+        }
+    }
+}
+
 pub struct AdviceInput<'a> {
     pub argv: &'a [String],
     pub effective: &'a [String],
@@ -239,7 +257,6 @@ pub struct AdviceInput<'a> {
     pub mem_before: Option<u64>,
     pub mem_after: Option<u64>,
     pub got_cores: f64,
-    pub wanted_cores: f64,
     pub peak_mem_kb: u64,
     pub others: Vec<String>,
     pub streak: usize,
@@ -272,7 +289,9 @@ pub fn advice(a: &AdviceInput) -> Vec<String> {
     }
     let min_flag = match a.starved.kind {
         "memory" => format!("--min-mem {}", size_flag(((a.peak_mem_kb as f64) * 1.25) as u64)),
-        _ => format!("--min-cpu {}", a.wanted_cores.ceil().max(1.0) as u64),
+        // What the job uses, as learned: a pin at what a starved run waited
+        // for would bring back the need that kept it out.
+        _ => format!("--min-cpu {}", a.cpu_after.unwrap_or(a.got_cores).ceil().max(1.0) as u64),
     };
     let cmd = a.argv.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
     let place = match (a.script, a.package_json) {
@@ -452,7 +471,6 @@ mod tests {
             mem_before: None,
             mem_after: None,
             got_cores: 2.2,
-            wanted_cores: 6.1,
             peak_mem_kb: 0,
             others: vec![],
             streak: 1,
@@ -466,6 +484,39 @@ mod tests {
                 "or let vitest fit the room it gets: add --maxWorkers=2".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_cpu_pin_is_what_the_job_uses_not_what_it_waited_for() {
+        let a = argv("tsgo --noEmit");
+        let st = Starvation { kind: "cpu", evidence: vec![] };
+        let lines = advice(&AdviceInput {
+            argv: &a,
+            effective: &a,
+            starved: &st,
+            script: None,
+            package_json: None,
+            cwd: "/r",
+            cpu_before: Some(4.0),
+            cpu_after: Some(4.0),
+            mem_before: None,
+            mem_after: None,
+            got_cores: 3.6,
+            peak_mem_kb: 0,
+            others: vec![],
+            streak: 1,
+        });
+        assert!(lines.iter().any(|l| l.contains("--min-cpu 4 tsgo")), "{lines:?}");
+    }
+
+    #[test]
+    fn after_a_starved_run_the_warning_says_what_the_next_run_reserves() {
+        // A slow run does not raise the CPU need any more; it says what stays.
+        assert_eq!(next_need("slowdown", Some(4.0), Some(4.0), 3.0, None, 0), "next run keeps reserving 4.0 cores");
+        assert_eq!(next_need("cpu", Some(4.0), Some(3.5), 3.0, None, 0), "next run will reserve 3.5 cores (was 4.0)");
+        // Without a learned need, what the run used, never what it waited for.
+        assert_eq!(next_need("cpu", None, None, 3.0, None, 0), "next run will reserve 3.0 cores");
+        assert_eq!(next_need("memory", None, None, 0.0, Some(2 * 1024 * 1024), 0), "next run will reserve 2.0 GB of memory");
     }
 
     #[test]
@@ -494,7 +545,6 @@ mod tests {
                 mem_before: None,
                 mem_after: None,
                 got_cores: 2.7,
-                wanted_cores: 4.0,
                 peak_mem_kb: 4 * 1024 * 1024,
                 others: vec![],
                 streak: 0,
