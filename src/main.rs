@@ -13,6 +13,7 @@ mod insight;
 mod key;
 mod machine;
 mod matcher;
+mod proof;
 mod queue;
 mod recorder;
 mod report;
@@ -41,6 +42,8 @@ usage:
                                                drop runs from the history, or put them back (a dry run without --apply)
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
+  taskguard --receipt ID -- COMMAND            run COMMAND as job ID, and publish a proof that CI can skip on
+  taskguard proof check|publish|show|log       skip or run in CI, publish by hand, and read proofs back
   taskguard run [options] -- COMMAND           the same as the first form, for a command named like a subcommand
   taskguard help COMMAND                       more about one command; COMMAND --help shows the same
   taskguard help --all                         every command in full, in one text (for LLM agents)
@@ -67,6 +70,7 @@ const SUBCOMMANDS: &[&str] = &[
     "prune",
     "doctor",
     "import-history",
+    "proof",
     "version",
     "help",
     "__recorder",
@@ -129,6 +133,9 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--hints" => o.hints = Some(true),
             "--no-hints" => o.hints = Some(false),
             "--wait" => o.wait = true,
+            "--receipt" => o.receipt = Some(take_value(args, &mut i, name)?),
+            "--allow-env-file" => o.allow_env_files.push(take_value(args, &mut i, name)?),
+            "--no-publish" => o.no_publish = true,
             "-h" | "--help" => o.help = true,
             _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{}", usage()),
             _ => break,
@@ -188,6 +195,7 @@ fn dispatch(args: &[String]) -> Result<i32> {
             "prune" => commands::prune(rest),
             "doctor" => commands::doctor(rest),
             "import-history" => commands::import_history(),
+            "proof" => proof::dispatch(rest),
             "top" => top::run(rest),
             "__recorder" => recorder::run().map(|_| 0),
             _ => unreachable!(),
@@ -198,6 +206,16 @@ fn dispatch(args: &[String]) -> Result<i32> {
     if o.help {
         print!("{}", help::text(if o.wait { "wait" } else { "run" }).unwrap_or_default());
         return Ok(0);
+    }
+    if let Some(id) = &o.receipt {
+        if o.jobs.is_some() || o.id.is_some() || o.bg || o.wait {
+            bail!("--receipt runs the command outside the queue; put taskguard inside the command for that");
+        }
+        let ro = proof::ReceiptOpts { id: id.clone(), allow_env_files: o.allow_env_files.clone(), no_publish: o.no_publish };
+        return proof::run_receipt(&ro, &o.cmd);
+    }
+    if !o.allow_env_files.is_empty() || o.no_publish {
+        bail!("--allow-env-file and --no-publish go with --receipt ID");
     }
     if o.wait && o.cmd.is_empty() {
         return runner::wait_pool(o.id.as_deref());
@@ -249,6 +267,11 @@ mod tests {
         assert_eq!(o.cmd, v("tsc --watch"), "options after the command belong to it");
 
         assert!(parse_opts(&v("--bogus tsc")).is_err());
+        let o = parse_opts(&v("--receipt unit-tests --allow-env-file '**/.env.test' --no-publish -- bun run ci")).unwrap();
+        assert_eq!(o.receipt.as_deref(), Some("unit-tests"));
+        assert_eq!(o.allow_env_files, ["**/.env.test"]);
+        assert!(o.no_publish);
+        assert_eq!(o.cmd, v("bun run ci"));
         let o = parse_opts(&v("--wait --id build")).unwrap();
         assert!(o.wait && o.cmd.is_empty());
     }

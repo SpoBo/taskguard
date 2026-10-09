@@ -481,11 +481,63 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
 | `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
 | `taskguard import-history` | Load tsc-queue's memory history |
+| `taskguard --receipt ID -- COMMAND` | Run COMMAND as job ID; when the files did not change during the run, publish a proof that CI can skip on. See [Proof receipts](#proof-receipts) |
+| `taskguard proof check\|publish\|show\|log` | Skip or run a job in CI, publish by hand, and read proofs back |
 | `taskguard help COMMAND`, `taskguard COMMAND --help` | Help for one command: what it does, its options, examples |
 | `taskguard help --all` | Every command in full, in one text, for LLM agents |
 
 `--help` after the command you run belongs to that command:
 `taskguard -- tsc --help` shows tsc's help.
+
+## Proof receipts
+
+CI runs the checks that the developer or the agent already ran before the
+push. taskguard can record that a job passed on an exact set of files, and
+publish that as a GitHub commit status, so CI can skip the job.
+
+A repo adds three things:
+
+```sh
+# 1. Where the job's command runs, in CI and in the local pipeline:
+taskguard --receipt unit-tests -- bun run ci
+
+# 2. One step in a small first CI job:
+taskguard proof check unit-tests --github-output
+
+# 3. On the heavy job:
+#    if: needs.<that job>.outputs.unit-tests != 'skip'
+```
+
+`--receipt ID` is the opt-in, per command. Every other taskguard call stays
+as it was. The receipt name is the contract: a run under `--receipt
+unit-tests` says "this is the Unit Tests job".
+
+1. **Run.** taskguard hashes the files on disk before and after the command,
+   uncommitted and untracked files included, ignored files left out, through
+   a temporary index: the real index does not change. That is the tree hash
+   a commit of exactly those files gets. When the hash did not change, it
+   keeps a receipt, green or red. A file that changed during the run means no
+   receipt: nobody knows which version passed. An ignored `.env*` file means
+   no receipt either, because it can change a result that the hash cannot see
+   (`--allow-env-file GLOB` lets one through).
+2. **Publish.** On a laptop, a background process watches the branch on
+   GitHub for an hour. When the branch head has exactly the tested files, it
+   posts the status `taskguard/ID`. It needs no checkout, so a pipeline may
+   delete its copy right after the push. In GitHub Actions the job posts at
+   once, on the PR head. The description is `f:FINGERPRINT, OS/ARCH,
+   DURATION, HOST`; the fingerprint is a hash of the command line.
+   `--no-publish` keeps a receipt on the machine, and `taskguard proof
+   publish` posts it by hand.
+3. **Check.** `taskguard proof check ID` reads the PR head and its labels
+   from the GitHub Actions event, and waits up to 30 s for a status that is
+   still on its way. It says `skip` for a green status, and `run` for no
+   status, a red one, a `taskguard:ci` or `taskguard:ci:ID` label, or an
+   error from `gh`. `--os linux` accepts only proof made on Linux.
+
+`taskguard proof log ID` lists the commits on main, the least proven first: the
+suspects when a scheduled full run goes red. A squash merge counts the
+statuses of its PR head when the two trees are the same. `taskguard proof
+show` lists the receipts and statuses of the current checkout.
 
 ## Configuration
 
@@ -607,6 +659,9 @@ the others write:
 - `taskguard prune` moves runs into the table `pruned_runs`, so every
   version stops learning from them; `prune --undo` moves them back. Without
   `--apply`, prune only shows what it would do.
+- Proof receipts live in their own tables, `receipts` and `receipt_posts`,
+  keyed by tree hash. A version without them ignores them, and its
+  `--receipt` is an unknown option.
 - The database only gains tables and columns. A new column is nullable or has
   a default, so older versions can still insert rows.
 - A job gets the same history key in every version.

@@ -10,6 +10,16 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Proof receipts (#17). `taskguard --receipt ID -- COMMAND` runs a job's
+  command and, when the files did not change during the run, keeps a receipt
+  and publishes it as the commit status `taskguard/ID` on the commit with
+  exactly those files: from a laptop once the branch on GitHub has them, from
+  GitHub Actions at once on the PR head. `taskguard proof check ID` tells CI
+  per job whether to skip or run. `proof publish`, `proof show` and `proof
+  log` publish by hand and read proofs back.
+
 ## [0.8.0] - 2026-10-09
 
 ### Added

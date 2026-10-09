@@ -41,6 +41,12 @@ pub struct Opts {
     pub wait: bool,
     /// Higher goes first; the default comes from the config, else 0.
     pub priority: Option<i32>,
+    /// --receipt ID: run the command for a proof receipt (see `proof.rs`).
+    pub receipt: Option<String>,
+    /// --allow-env-file GLOB: with --receipt, an ignored .env file that may exist.
+    pub allow_env_files: Vec<String>,
+    /// --no-publish: with --receipt, keep the receipt here only.
+    pub no_publish: bool,
     pub cmd: Vec<String>,
 }
 

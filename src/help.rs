@@ -18,6 +18,10 @@ options (sem style; the default is to run in the foreground):
   --pipe                  with --bg: pass stdin to the command
   -q, --quiet             only print waits longer than the status interval
   --hints / --no-hints    agent hints on or off for this call
+  --receipt ID            run COMMAND as job ID and publish a proof that CI
+                          can skip on (taskguard help proof)
+  --allow-env-file GLOB   with --receipt: an ignored .env* file that may exist
+  --no-publish            with --receipt: keep the receipt on this machine
 ";
 
 const RUN: &str = "\
@@ -197,6 +201,63 @@ Load tsc-queue's memory history (~/.cache/tsc-queue/history.tsv, or
 $TSC_QUEUE_DIR/history.tsv) into taskguard's history, once.
 ";
 
+const PROOF: &str = "\
+taskguard --receipt ID [--allow-env-file GLOB]... [--no-publish] -- COMMAND
+taskguard proof check ID... [--os OS] [--github-output] [--sha SHA] [--labels L,L] [--wait SECS]
+taskguard proof publish [--sha SHA]... [--wait SECS] [--again] [-q]
+taskguard proof show [--history]
+taskguard proof log ID... [--since SHA] [-n N] [--branch REF]
+
+Proof receipts: publish what passed on this machine as a GitHub commit status
+(taskguard/ID), so CI can skip a job that is already proven.
+
+A repo adds three things:
+
+  1. Where the job's command runs, in CI and in the local pipeline:
+       taskguard --receipt unit-tests -- <the command, unchanged>
+  2. One step in a small first CI job:
+       taskguard proof check unit-tests --github-output
+  3. On the heavy job:
+       if: needs.<that job>.outputs.unit-tests != 'skip'
+
+--receipt ID is the opt-in, per command; every other taskguard call stays as
+it was. The receipt name is the contract: a run under --receipt unit-tests
+says \"this is the Unit Tests job\".
+
+Run. taskguard hashes the files on disk before and after the command,
+uncommitted and untracked files included, ignored files left out. The same
+hash both times: a receipt, green or red, on that tree. A file that changed
+during the run, or an ignored .env* file, means no receipt. The command runs
+at once, outside the queue: it is mostly a task runner whose leaves queue.
+
+Publish. On a laptop a background process watches the branch on GitHub for an
+hour, and posts the status when the branch head has exactly the tested files;
+the checkout may be gone by then. Any commit with exactly those files gets
+it, so commit first, then run the receipt, then push. In GitHub Actions the job posts at once, on
+the PR head (it needs statuses: write and GH_TOKEN). The description is
+\"f:FINGERPRINT, OS/ARCH, DURATION, HOST\"; the fingerprint is a hash of the
+command line.
+
+Check. In GitHub Actions, proof check reads the PR head and its labels from
+the event, and waits up to 30 s for a status that is still on its way. Per ID:
+skip for a green status from an OS that --os accepts (default any); run for no
+status, red, a taskguard:ci or taskguard:ci:ID label, or a gh error. Exit 0
+when all skip; --github-output writes ID=skip|run to $GITHUB_OUTPUT and
+exits 0.
+
+commands:
+  check           skip or run per ID, for CI
+  publish         post receipts by hand: for HEAD (or each --sha) once it is
+                  on GitHub; --wait SECS waits for that
+  show            this checkout: local receipts and the statuses on HEAD
+  log             each ID per commit on the main branch, the least proven
+                  first when one ID is given; a squash merge reads the PR head
+                  (~ marks a different tree)
+
+GitHub is reached through the gh CLI (GH_TOKEN in CI, GH_REPO to name the
+repo). TASKGUARD_GH names another gh.
+";
+
 const VERSION: &str = "\
 taskguard version
 
@@ -226,6 +287,7 @@ pub fn text(cmd: &str) -> Option<String> {
         "prune" => PRUNE.into(),
         "doctor" => DOCTOR.into(),
         "import-history" => IMPORT.into(),
+        "proof" | "receipt" => PROOF.into(),
         "version" => VERSION.into(),
         "help" => HELP.into(),
         _ => return None,
@@ -233,8 +295,8 @@ pub fn text(cmd: &str) -> Option<String> {
 }
 
 /// Every command in the order `help --all` prints them.
-pub const ALL: [&str; 12] =
-    ["run", "wait", "top", "status", "pause", "start", "history", "outliers", "prune", "doctor", "import-history", "version"];
+pub const ALL: [&str; 13] =
+    ["run", "wait", "top", "status", "pause", "start", "history", "outliers", "prune", "doctor", "import-history", "proof", "version"];
 
 /// The full help, every command in one text: for LLM agents and for reading
 /// it all at once. `usage` is the overview that comes first.

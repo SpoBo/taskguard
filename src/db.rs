@@ -139,6 +139,35 @@ CREATE TABLE IF NOT EXISTS ns_1m (
   cores_avg REAL, mem_avg_kb REAL,
   PRIMARY KEY (minute, ns)
 );
+-- Proof receipts (`taskguard --receipt`): a command that ran on an exact tree of
+-- files. Keyed by the tree hash, not the checkout, so a receipt made in one
+-- worktree publishes from any other that holds the same files.
+CREATE TABLE IF NOT EXISTS receipts (
+  id INTEGER PRIMARY KEY,
+  receipt TEXT NOT NULL,
+  tree TEXT NOT NULL,
+  head TEXT,
+  repo TEXT,
+  level TEXT NOT NULL,
+  reason TEXT,
+  ok INTEGER NOT NULL,
+  exit INTEGER,
+  cmd TEXT NOT NULL,
+  host TEXT,
+  os TEXT,
+  arch TEXT,
+  version TEXT,
+  started_at REAL NOT NULL,
+  duration_s REAL NOT NULL,
+  fingerprint TEXT
+);
+CREATE INDEX IF NOT EXISTS receipts_tree ON receipts(tree);
+-- Each commit status a receipt was posted as.
+CREATE TABLE IF NOT EXISTS receipt_posts (
+  receipt_row INTEGER NOT NULL,
+  sha TEXT NOT NULL,
+  posted_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pruned_runs (
   id INTEGER PRIMARY KEY,
   ns TEXT NOT NULL,
@@ -528,6 +557,11 @@ impl Db {
             if !has {
                 conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {col} {kind}"))?;
             }
+        }
+        // Receipt tables of the 0.9.0 pre-releases: the command fingerprint.
+        let has_fp: bool = conn.prepare("SELECT 1 FROM pragma_table_info('receipts') WHERE name = 'fingerprint'")?.exists([])?;
+        if !has_fp {
+            conn.execute_batch("ALTER TABLE receipts ADD COLUMN fingerprint TEXT")?;
         }
         Ok(Db { conn })
     }
@@ -1091,6 +1125,16 @@ mod tests {
             "pruned_runs.prune_reason",
             "pruned_runs.pruned_at",
             "pruned_runs.queued_at",
+            "receipt_posts.posted_at",
+            "receipt_posts.receipt_row",
+            "receipt_posts.sha",
+            "receipts.cmd",
+            "receipts.duration_s",
+            "receipts.level",
+            "receipts.ok",
+            "receipts.receipt",
+            "receipts.started_at",
+            "receipts.tree",
         ];
         let mut want: Vec<String> = v0_1_0.iter().chain(added.iter()).map(|s| s.to_string()).collect();
         want.sort();
