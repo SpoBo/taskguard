@@ -24,8 +24,9 @@
 #   CPU busy     + CPU still promised to running jobs     + its CPU need     fits under cpu_max
 #   memory held  + memory still promised to running jobs  + its memory need  fits under mem_max
 # Needs are learned per command: memory is the highest peak of the last
-# hist_keep runs (outliers held back, see learning), CPU the median of the
-# cores it wanted. A memory need is capped at mem_max.
+# hist_keep runs (outliers held back, see learning), CPU the cores it used
+# (not the time it waited for a core), the newest runs counting most and
+# outliers held back the same way. A memory need is capped at mem_max.
 cpu_max = 100         # percent of all cores
 mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
@@ -45,7 +46,8 @@ resume_at = 80        # percent of RAM in use; kept at least 2 under pause_at
 
 # -------------------------------------------------------------- priority ----
 # A waiting job with a higher priority starts before jobs with a lower one:
-# they wait while it waits, unless its own pool is full. Jobs with the same
+# they wait while it waits, unless its own pool is full. With backfill
+# (max_backfill), jobs that fit start while it cannot, as for a reserved job. Jobs with the same
 # priority keep the order they came in. Set it per directory, per repository,
 # per command ([[job]] below), or for one call with --priority N.
 priority = 0
@@ -63,9 +65,10 @@ learn_stagger = 5     # a batch of jobs with no history starts after the last on
 new_job_mem = "1.5G"  # memory a job with no history reserves when no similar job is known
 cpu_min_duration = 5  # jobs that usually end sooner than this skip the CPU check
 max_bypass = 120      # seconds a job may be passed by newer ones before it is reserved
-max_backfill = 0      # until a reserved job has waited this many seconds, newer jobs that fit
+max_backfill = 600    # until a reserved job has waited this many seconds, newer jobs that fit
                       # may start while it cannot; after that, only those that should end
-                      # before it could start anyway. 0 (or anything up to max_bypass) = never.
+                      # before it could start anyway, so the machine drains for it.
+                      # 0 (or anything up to max_bypass) = never.
                       # taskguard 0.1.6 and older reject a file that sets it.
 boost_runs = 5        # runs that get +25% memory after a memory-starved run
 # A peak more than outlier_ratio times the next peak below it, and outlier_min
@@ -82,6 +85,11 @@ noise_cpu = 0.5       # cores
 # A job that only programs outside taskguard keep out starts anyway, with a
 # warning, while memory stays under pause_at.
 outside_admit = true
+# A job that cannot fit now (its CPU need is above the whole limit, or it has
+# waited past max_bypass) starts on this share of its CPU need, once the
+# machine is near its lowest CPU use of the last two minutes. It books the
+# cores it got. Memory is still checked. 0 turns it off. Set it per machine.
+partial_fit = 0.5
 
 # ---------------------------------------------------------------- timing ----
 sample_every = 2      # seconds between measurements of a running job

@@ -22,6 +22,56 @@ and the versions follow [semver](https://semver.org).
   repo up (policy, push hook, and a printed ruleset and CI checklist).
   `--receipt ID --publish SECS` publishes in the background after the push.
 
+## [0.8.0] - 2026-10-09
+
+### Added
+
+- Partial fit: a job that cannot fit now, because its CPU need is above the
+  whole limit or because it has waited past `max_bypass`, starts on part of
+  its CPU need. It needs at least `partial_fit` (0.5) of its need free, and
+  the machine near its lowest CPU use of the last two minutes, so it starts
+  at a quiet moment. It then books the cores it got, not its whole need, so
+  other jobs keep moving. Memory stays a hard rule. `partial_fit = 0` turns
+  it off. Set it per machine in `~/.config/taskguard/config.toml`.
+- A waiting job that CPU keeps out, and that cannot fit now (its need is
+  above the whole limit, or it has waited past `max_bypass`), prints advice
+  lines in its wait output: what it needs against the limit, what holds the
+  room and how long that should last, how many jobs wait behind it, how long
+  it has waited, when partial fit starts it, the command to start it now and
+  what that costs, and the settings that change the outcome. They print with
+  hints off too; `--quiet` hides them.
+- `taskguard start JOB` starts a waiting job now, whatever the limits say, as
+  `g` in `taskguard top` does. JOB is a pid, a ticket, a key, or a unique
+  part of a key. A job that CPU keeps out and starts this way (or at a
+  `--st` timeout) books only the cores that were free, so the jobs behind it
+  keep moving. `start` is now a subcommand: to run a program named `start`,
+  use `taskguard run -- start`.
+
+### Changed
+
+- Backfill is on by default: `max_backfill` is 600 (10 minutes) instead of
+  0. Small jobs that fit pass a reserved job that cannot start yet. After 10
+  minutes only jobs that end before the reserved job could start still pass,
+  so the machine drains for it, and it starts at the latest once no other job
+  runs, also when its need is above the whole limit. The same holds for a
+  waiting job with a higher priority: for its first 10 minutes, jobs with a
+  lower priority that fit start while it cannot. Set `max_backfill = 0` for
+  the old behavior.
+
+### Fixed
+
+- The CPU need is learned from the cores a job used, not from the time its
+  threads waited for a core. Tools that start one thread per core (`tsgo`,
+  `oxlint`) waited on every core of a busy machine, so they learned a need of
+  the whole machine and blocked the queue. Recent runs count more: a run
+  counts half as much as one four runs newer. A run far above the others is
+  an outlier and counts by `outlier_weights`, as memory peaks do. A
+  CPU-starved run no longer raises the need to what it waited for; starved
+  runs are left out while three runs that were not starved remain. A running
+  job books the cores it uses, and the `--min-cpu` advice after a starved run
+  pins the learned need. Run `taskguard prune KEY --apply` on a job whose need
+  is still inflated to start again from its next runs.
+
 ## [0.7.1] - 2026-10-07
 
 ### Fixed
@@ -231,7 +281,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/SpoBo/taskguard/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/SpoBo/taskguard/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/SpoBo/taskguard/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/SpoBo/taskguard/compare/v0.5.0...v0.6.0

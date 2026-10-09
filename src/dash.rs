@@ -553,7 +553,7 @@ pub struct TaskRow {
     pub runs: usize,
     pub last_end: f64,
     pub last_exit: Option<i64>,
-    /// The highest peak and the mean of the cores wanted, of its last 10
+    /// The highest peak and the mean of the cores used, of its last 10
     /// runs: close to what it learned, without outliers held back.
     pub mem_kb: Option<u64>,
     pub cpu: Option<f64>,
@@ -564,11 +564,11 @@ pub struct TaskRow {
 pub fn tasks(db: &Db) -> Result<Vec<TaskRow>> {
     let mut s = db.conn.prepare_cached(
         "WITH r AS (
-           SELECT key, ns, peak_mem_kb, cores_wanted, exit, ended_at,
+           SELECT key, ns, peak_mem_kb, coalesce(cores_used, cores_wanted) AS cores, exit, ended_at,
                   row_number() OVER (PARTITION BY key ORDER BY ended_at DESC) AS rn
            FROM runs WHERE ended_at IS NOT NULL)
          SELECT key, max(CASE WHEN rn = 1 THEN ns END), count(*), max(ended_at), max(CASE WHEN rn = 1 THEN exit END),
-                max(CASE WHEN rn <= 10 THEN peak_mem_kb END), avg(CASE WHEN rn <= 10 THEN cores_wanted END)
+                max(CASE WHEN rn <= 10 THEN peak_mem_kb END), avg(CASE WHEN rn <= 10 THEN cores END)
          FROM r GROUP BY key ORDER BY max(ended_at) DESC",
     )?;
     let rows = s

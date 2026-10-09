@@ -7,7 +7,7 @@ use crate::insight::{self, AdviceInput, RunFacts, Tracker};
 use crate::key;
 use crate::machine;
 use crate::matcher;
-use crate::queue::{self, Decision, Entry, Limits, Queue};
+use crate::queue::{self, Decision, Entry, Queue};
 use crate::report::{self, Lines, say};
 use crate::sys;
 use anyhow::{Context, Result, bail};
@@ -355,20 +355,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
 
     ensure_recorder(&dir);
     let sig = Signals::register();
-    let limits_of = |cfg: &Config| Limits {
-        cpu_max_pct: cfg.cpu_max,
-        mem_max_pct: cfg.mem_max,
-        learn_stagger: cfg.learn_stagger,
-        max_bypass: cfg.max_bypass as f64,
-        max_backfill: cfg.max_backfill as f64,
-        cpu_min_duration: cfg.cpu_min_duration,
-        pressure_max: cfg.pressure_max,
-        noise_mem_pct: cfg.noise_mem,
-        noise_cpu: cfg.noise_cpu,
-        outside_admit: cfg.outside_admit,
-        outside_mem_max_pct: cfg.pause_at,
-    };
-    let mut limits = limits_of(&cfg);
+    let mut limits = crate::commands::limits(&cfg);
     // A limit changed in the dashboard's Config view reaches jobs that
     // already wait: they read the user config again when it changes.
     let conf_path = config::user_config_path();
@@ -401,6 +388,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         admit_reason = "queue skipped on request".into();
     } else {
         let mut announced = false;
+        let mut advised = false;
         let mut last_line = t0;
         let mut span: Option<(String, String, f64)> = None;
         let mut started_by_hand = false;
@@ -437,11 +425,15 @@ pub fn run(mut o: Opts) -> Result<i32> {
             if mtime != seen_mtime {
                 seen_mtime = mtime;
                 if let Ok(c) = Config::load(&cwd, &checkout) {
-                    limits = limits_of(&c);
+                    limits = crate::commands::limits(&c);
                 }
             }
             let decision;
             let running;
+            // The advice for a job that cannot fit prints the first time and
+            // with each status line; only then is it worth working out.
+            let status_due = now - last_line >= cfg.status_every as f64;
+            let mut advice = Vec::new();
             {
                 let _g = q.lock()?;
                 let (gone, run, waiting) = q.reap_and_read();
@@ -467,6 +459,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 let unknown_starts = q.unknown_starts();
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &unknown_starts);
+                if status_due || !advised {
+                    advice = report::cpu_advice(&m, &limits, &me, &decision, &running, &waiting, now);
+                }
                 if let Some(w) = watch.step(&m, &limits, &running, &waiting, &me, &decision, now, &unknown_starts) {
                     let note = queue::Stall {
                         at: now,
@@ -495,6 +490,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     if !me.known && !queue::short(&limits, &me) {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
+                    me.need_cpu = queue::cpu_to_book(&decision, me.need_cpu);
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);
                     me.start_need_mem_kb = Some(me.need_mem_kb);
@@ -530,7 +526,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 main_blocker = Some(n.clone());
             }
             match &decision {
-                Decision::Admit { reason, early } => {
+                Decision::Admit { reason, early, .. } => {
                     admit_reason = reason.clone();
                     if let Some(why) = early {
                         say(&format!("warning {} - started before it fully fits: {why}", me.key));
@@ -538,7 +534,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     break;
                 }
                 _ if started_by_hand => {
-                    admit_reason = "started by hand from the dashboard".into();
+                    admit_reason = "started by hand (taskguard start, or g in taskguard top)".into();
                     break;
                 }
                 _ if forced => {
@@ -564,10 +560,16 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 announced = true;
                 lines.queued(&me, learned.runs, o.timeout);
             }
-            if now - last_line >= cfg.status_every as f64 {
+            // A job that cannot fit says so once it is clear, and again with
+            // each status line, with what an agent can do about it.
+            if status_due {
                 last_line = now;
                 let left = o.timeout.map(|t| if t > 0.0 { t - (now - t0) } else { t + (now - t0) });
                 lines.waiting(&me, now - t0, &decision, &running, now, left);
+            }
+            if !advice.is_empty() && (status_due || !advised) {
+                advised = true;
+                lines.advice(&advice);
             }
             std::thread::sleep(check_every);
         }
@@ -708,7 +710,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 seen_peak_kb = seen_peak_kb.max(r.mem_kb);
                 let (peak_cpu, peak_mem) = (me.need_cpu, me.need_mem_kb);
-                me.follow(r.mem_kb, r.wanted, r.used_recent, sys::ncpu() as f64, now, long);
+                me.follow(r.mem_kb, r.used_recent, sys::ncpu() as f64, now, long);
                 if me.steady_since == Some(now) {
                     tracker.steady_from(now, r.mem_kb);
                     paused_before_steady = me.paused_s;
@@ -825,21 +827,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     lines.done(&report::Done { key: &jkey, secs: wall, used, wanted, peak_kb: tracker.peak_mem_kb, code, queued: still });
 
     if let (Some(st), Some(d)) = (&starved, &database) {
-        after_starved(
-            d,
-            &cfg,
-            &o,
-            &me,
-            &cwd,
-            st,
-            &learned,
-            used,
-            wanted,
-            tracker.peak_mem_kb,
-            script.as_deref(),
-            package_json.as_deref(),
-            &lines,
-        );
+        after_starved(d, &cfg, &o, &me, &cwd, st, &learned, used, tracker.peak_mem_kb, script.as_deref(), package_json.as_deref(), &lines);
     }
     Ok(code)
 }
@@ -928,7 +916,6 @@ fn after_starved(
     st: &insight::Starvation,
     before: &db::Learned,
     used: f64,
-    wanted: f64,
     peak: u64,
     script: Option<&str>,
     package_json: Option<&str>,
@@ -948,21 +935,11 @@ fn after_starved(
     }
     let streak = d.starved_streak(&me.key).unwrap_or(0);
     if streak >= 3 {
-        let v = if st.kind == "memory" { peak as f64 * 1.25 } else { wanted.ceil() };
+        let v = if st.kind == "memory" { peak as f64 * 1.25 } else { after.cpu.unwrap_or(used).ceil() };
         let _ = d.adjustment(&me.key, me.run_id, "suggest_min", None, Some(v), &format!("starved {streak} runs in a row"));
     }
-    let what = if st.kind == "cpu" {
-        let now_need = after.cpu.unwrap_or(wanted);
-        match before.cpu {
-            Some(b) if now_need <= b + 0.05 => format!("next run keeps reserving {b:.1} cores"),
-            Some(b) => format!("next run will reserve {now_need:.1} cores (was {b:.1})"),
-            None => format!("next run will reserve {now_need:.1} cores"),
-        }
-    } else if st.kind == "memory" {
-        format!("next run will reserve {} of memory", report::gb(after.mem_kb.map(|m| (m as f64 * 1.25) as u64).unwrap_or(peak)))
-    } else {
-        "its needs are raised for the next run".into()
-    };
+    let mem_after = after.mem_kb.map(|m| (m as f64 * 1.25) as u64);
+    let what = insight::next_need(st.kind, before.cpu, after.cpu, used, mem_after, peak);
     say(&format!("warning {} - possibly starved: {}; {what}", me.key, st.evidence.join("; ")));
     if !lines.hints {
         return;
@@ -981,7 +958,6 @@ fn after_starved(
         mem_before: before.mem_kb,
         mem_after: after.mem_kb.map(|m| (m as f64 * 1.25) as u64),
         got_cores: used,
-        wanted_cores: wanted,
         peak_mem_kb: peak,
         others,
         streak,

@@ -315,6 +315,43 @@ fn a_waiting_job_started_by_hand_runs_at_once() {
 }
 
 #[test]
+fn taskguard_start_starts_a_waiting_job() {
+    let e = Env::new("");
+    let holder = e.spawn(&["-j1", "--id", "h", "--", "sh", "-c", "touch held; sleep 4"]);
+    wait_for(&e.file("held"));
+    let waiter = e.spawn(&["-j1", "--id", "h", "--", "touch", "started"]);
+    wait_until_queued(&e, waiter.id());
+    let nothing = e.run(&["start", "no-such-job"]);
+    assert!(!nothing.status.success());
+    assert!(stderr(&nothing).contains("no waiting job matches"), "{}", stderr(&nothing));
+    let out = e.run(&["start", &waiter.id().to_string()]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("started"), "{}", String::from_utf8_lossy(&out.stdout));
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("started by hand"), "{}", stderr(&out));
+    assert!(e.file("started").exists());
+    let t = Instant::now();
+    holder.wait_with_output().unwrap();
+    assert!(t.elapsed() > Duration::from_millis(500), "the job started while the holder still ran");
+}
+
+#[test]
+fn a_job_that_can_never_fit_prints_advice_with_the_start_command() {
+    let e = Env::new("");
+    let holder = e.spawn(&["--", "sh", "-c", "touch held; sleep 4"]);
+    wait_for(&e.file("held"));
+    let out = e.run(&["--min-cpu", "1000", "--st", "-2", "--", "true"]);
+    assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("advice ") && err.contains("never fully fits"), "{err}");
+    // On a machine short of memory (a busy CI runner), the advice says so
+    // instead of offering a start by hand.
+    assert!(err.contains("taskguard start ") || err.contains("memory keeps it out too"), "{err}");
+    holder.wait_with_output().unwrap();
+}
+
+#[test]
 fn needs_set_by_hand_let_a_job_fit() {
     let e = Env::new("");
     let holder = e.spawn(&["--", "sh", "-c", "touch held; sleep 4"]);

@@ -31,8 +31,8 @@ taskguard run [options] -- COMMAND [ARGS...]
 
 Run COMMAND when the machine has room for it. The room it needs is learned
 from its past runs: memory is the highest peak of the last 10 runs, CPU the
-median of the cores it wanted. Use the `run` form for a command named like a
-subcommand, such as a script called `top`.
+cores it used, the newest runs counting most. Use the `run` form for a
+command named like a subcommand, such as a script called `top`.
 
 A job that is short of room by only a little (noise_mem, noise_cpu), or only
 because programs outside taskguard hold the room (outside_admit), starts
@@ -89,6 +89,20 @@ Pause a running job (SIGSTOP on the command and every process below it), or
 let it go on (SIGCONT). JOB is a pid, a history key, or a unique part of a
 key. A job paused by hand keeps its memory but gives up its CPU, and
 auto_pause leaves it alone. Its paused time does not count as run time.
+";
+
+const START: &str = "\
+taskguard start JOB
+
+Start a waiting job now, whatever the limits say, as g in taskguard top does.
+JOB is a pid, a ticket, a history key, or a unique part of a key. The job
+runs on the cores it gets, so it may be slower, and no check holds it back:
+not CPU, not memory. A job that cannot fit prints this command in its wait
+output, with what it needs and what holds the room.
+
+Use it when a job waits for room it will not get soon. To fix the cause
+instead, see cpu_max, partial_fit and max_backfill in taskguard.example.toml,
+or taskguard prune for a need learned from old runs.
 ";
 
 const HISTORY: &str = "\
@@ -276,6 +290,7 @@ pub fn text(cmd: &str) -> Option<String> {
         "top" => TOP.into(),
         "status" => STATUS.into(),
         "pause" | "resume" => PAUSE.into(),
+        "start" => START.into(),
         "history" => HISTORY.into(),
         "outliers" => OUTLIERS.into(),
         "prune" => PRUNE.into(),
@@ -289,8 +304,8 @@ pub fn text(cmd: &str) -> Option<String> {
 }
 
 /// Every command in the order `help --all` prints them.
-pub const ALL: [&str; 12] =
-    ["run", "wait", "top", "status", "pause", "history", "outliers", "prune", "doctor", "import-history", "proof", "version"];
+pub const ALL: [&str; 13] =
+    ["run", "wait", "top", "status", "pause", "start", "history", "outliers", "prune", "doctor", "import-history", "proof", "version"];
 
 /// The full help, every command in one text: for LLM agents and for reading
 /// it all at once. `usage` is the overview that comes first.

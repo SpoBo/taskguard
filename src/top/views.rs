@@ -910,7 +910,7 @@ fn job(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![Line::styled(j.key.clone(), BOLD)];
     let cpu_src = match (l.cpu, j.min_cpu) {
         (Some(c), Some(m)) if m > c => format!("{m:.1} cores (minimum; learned {c:.1})"),
-        (Some(c), _) => format!("{c:.1} cores (learned, median of the last {} runs, from cores wanted)", l.runs),
+        (Some(c), _) => format!("{c:.1} cores (learned from the cores the last {} runs used, newest first)", l.runs),
         (None, Some(m)) => format!("{m:.1} cores (minimum)"),
         (None, None) => "unknown yet".into(),
     };
@@ -1448,7 +1448,7 @@ CHART LAYERS (Overview)
 HOW A JOB IS ADMITTED
   CPU busy + CPU promised to running jobs + this job's CPU need   must fit under cpu_max
   memory held + memory promised + this job's memory need          must fit under mem_max
-  needs are learned from past runs (memory: highest peak; CPU: median of cores wanted)
+  needs are learned from past runs (memory: highest peak; CPU: cores used, newest runs first)
   a first run just needs live room; nothing running means it always starts
 ";
     f.render_widget(Paragraph::new(text), area);
@@ -1609,7 +1609,7 @@ mod tests {
         app.view = View::Job;
         app.load().unwrap();
         let s = screen(&mut app, 150, 40);
-        assert!(s.contains("needs CPU:    6.0 cores (learned"), "{s}");
+        assert!(s.contains("needs CPU:    4.0 cores (learned"), "{s}");
         assert!(s.contains("next run reserves 6.0 cores (was 3.0)"), "{s}");
         assert!(
             s.contains("run that ended") && s.contains("peak 4.0 GB") && s.contains("cores wanted  ▄"),

@@ -251,7 +251,8 @@ pub struct Learned {
     pub mem_kb: Option<u64>,
     /// The recent memory peaks that stand far above the others.
     pub outliers: Option<Outliers>,
-    /// Median of the recent sustained "cores wanted". None when unknown.
+    /// The cores recent runs used, weighted toward the newest runs, with
+    /// outliers held back (see `cpu_need`). None when unknown.
     pub cpu: Option<f64>,
     /// Median duration, for estimated start times.
     pub dur_s: Option<f64>,
@@ -351,26 +352,106 @@ impl Outliers {
 /// outliers, as its full build is not a one-off and holding it back would
 /// let it start into a machine with no room for it.
 pub fn find_outliers(runs: &[Outlier], rules: &Learn) -> Option<Outliers> {
-    if rules.outlier_ratio <= 1.0 || runs.len() < 3 {
-        return None;
-    }
     let mut by_peak: Vec<&Outlier> = runs.iter().collect();
     by_peak.sort_by_key(|o| std::cmp::Reverse(o.peak_kb));
-    let n = by_peak.len();
-    let cut = (1..n).take_while(|j| *j < n - j && n - j >= 2).find(|&j| {
-        let (above, below) = (by_peak[j - 1].peak_kb, by_peak[j].peak_kb);
-        above as f64 > below as f64 * rules.outlier_ratio && above - below >= rules.outlier_min_kb && below >= rules.outlier_min_kb
-    })?;
+    let peaks: Vec<f64> = by_peak.iter().map(|o| o.peak_kb as f64).collect();
+    let cut = outlier_cut(&peaks, rules.outlier_ratio, rules.outlier_min_kb as f64)?;
     let normal_kb = by_peak[cut].peak_kb;
     let out: Vec<Outlier> = by_peak[..cut].iter().map(|o| (*o).clone()).collect();
-    let healthy = out.iter().filter(|o| !o.failed()).count();
-    let weight = match healthy {
-        0 => 0.0,
-        h => rules.outlier_weights.get(h - 1).copied().unwrap_or(1.0).clamp(0.0, 1.0),
-    };
+    let weight = outlier_weight(out.iter().filter(|o| !o.failed()).count(), rules);
     let top = out.iter().filter(|o| !o.failed()).map(|o| o.peak_kb).max().unwrap_or(normal_kb);
     let mem_kb = normal_kb + ((top - normal_kb) as f64 * weight) as u64;
     Some(Outliers { runs: out, normal_kb, weight, mem_kb })
+}
+
+/// Where `values`, sorted highest first, step down to the normal level: the
+/// values before the cut are outliers. The step must be more than `ratio`
+/// times and at least `min` apart, the value below it at least `min`, the
+/// outliers fewer than the rest, and at least two values below the cut.
+fn outlier_cut(values: &[f64], ratio: f64, min: f64) -> Option<usize> {
+    let n = values.len();
+    if ratio <= 1.0 || n < 3 {
+        return None;
+    }
+    (1..n).take_while(|j| *j < n - j && n - j >= 2).find(|&j| {
+        let (above, below) = (values[j - 1], values[j]);
+        above > below * ratio && above - below >= min && below >= min
+    })
+}
+
+/// How much outliers count when `healthy` of them did not fail.
+fn outlier_weight(healthy: usize, rules: &Learn) -> f64 {
+    match healthy {
+        0 => 0.0,
+        h => rules.outlier_weights.get(h - 1).copied().unwrap_or(1.0).clamp(0.0, 1.0),
+    }
+}
+
+/// A CPU outlier is also at least this many cores above the others, and
+/// those use at least this many: a job that idles at 0.2 cores and now and
+/// then compiles on 3 has no outliers.
+const CPU_OUTLIER_MIN: f64 = 1.0;
+/// A run counts half as much as one this many runs newer.
+const CPU_HALF_LIFE_RUNS: f64 = 4.0;
+
+/// One past run, as `cpu_need` reads it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CpuRun {
+    /// The cores it used: never the time it spent waiting for a core.
+    pub used: f64,
+    /// It was starved of CPU, so it used less than it would have.
+    pub starved: bool,
+    pub failed: bool,
+}
+
+/// The CPU need from recent runs, newest first: the weighted median of the
+/// cores they used. A run counts half as much as one `CPU_HALF_LIFE_RUNS`
+/// newer, so the need follows a job that gets faster or slower. Runs far
+/// above the others are outliers and count by `outlier_weights`, as memory
+/// peaks do. Runs that were starved of CPU used less than the job needs, so
+/// they are left out while at least three runs that were not starved remain;
+/// one run on a quiet machine alone does not set the need. The need is never
+/// more than a run used: what a starved run waited for does not count.
+pub fn cpu_need(runs: &[CpuRun], rules: &Learn) -> Option<f64> {
+    let mut w: Vec<f64> = (0..runs.len()).map(|i| 0.5f64.powf(i as f64 / CPU_HALF_LIFE_RUNS)).collect();
+    let mut by_use: Vec<usize> = (0..runs.len()).collect();
+    by_use.sort_by(|a, b| runs[*b].used.total_cmp(&runs[*a].used));
+    let used: Vec<f64> = by_use.iter().map(|i| runs[*i].used).collect();
+    if let Some(cut) = outlier_cut(&used, rules.outlier_ratio, CPU_OUTLIER_MIN) {
+        let out = &by_use[..cut];
+        let weight = outlier_weight(out.iter().filter(|i| !runs[**i].failed).count(), rules);
+        for &i in out {
+            w[i] *= if runs[i].failed { 0.0 } else { weight };
+        }
+    }
+    let fed = |i: usize| !runs[i].starved && w[i] > 0.0;
+    if (0..runs.len()).filter(|i| fed(*i)).count() >= 3 {
+        for (i, r) in runs.iter().enumerate() {
+            if r.starved {
+                w[i] = 0.0;
+            }
+        }
+    }
+    weighted_median(by_use.iter().rev().map(|i| (runs[*i].used, w[*i])))
+}
+
+/// The median of `(value, weight)` pairs, sorted by value from low to high.
+/// Where the weight below and above balance exactly, the two values are
+/// averaged, as a plain median does.
+fn weighted_median(pairs: impl Iterator<Item = (f64, f64)>) -> Option<f64> {
+    let pairs: Vec<(f64, f64)> = pairs.filter(|p| p.1 > 0.0).collect();
+    let half = pairs.iter().map(|p| p.1).sum::<f64>() / 2.0;
+    let mut acc = 0.0;
+    for (i, (v, wt)) in pairs.iter().enumerate() {
+        acc += wt;
+        if (acc - half).abs() < 1e-9 {
+            return Some(pairs.get(i + 1).map_or(*v, |n| (v + n.0) / 2.0));
+        }
+        if acc > half {
+            return Some(*v);
+        }
+    }
+    None
 }
 
 /// Runs that `prune` moved out of the history, or would move.
@@ -482,12 +563,12 @@ impl Db {
     pub fn learned(&self, key: &str, rules: &Learn) -> Result<Learned> {
         let (keep, boost_runs) = (rules.keep, rules.boost_runs);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT peak_mem_kb, cores_wanted, ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb, steady_cores_wanted,
-                    id, ended_at, exit
+            "SELECT peak_mem_kb, coalesce(cores_used, cores_wanted), ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb,
+                    steady_cores_wanted, id, ended_at, exit
              FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
-             ORDER BY ended_at DESC LIMIT ?2",
+             ORDER BY ended_at DESC, id DESC LIMIT ?2",
         )?;
-        // peak memory, cores wanted, duration, starved, and after the start-up: memory peak, cores wanted
+        // peak memory, cores used, duration, starved, and after the start-up: memory peak, cores wanted
         type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>);
         let rows: Vec<(Row, Outlier)> = stmt
             .query_map(params![key, keep.max(boost_runs) as i64], |r| {
@@ -503,14 +584,15 @@ impl Db {
             Some(o) => Some(o.mem_kb),
             None => recent.iter().map(|r| r.0 as u64).max(),
         };
-        let mut cpu = median_of(recent.iter().filter_map(|r| r.1).collect());
-        // After a run that was starved of CPU, the need is at least what that
-        // run wanted, so one starved run is never averaged away by the median.
-        if let Some((_, Some(w), _, Some(st), _, _)) = rows.first()
-            && (st == "cpu" || st == "slowdown")
-        {
-            cpu = cpu.map(|c| c.max(*w));
-        }
+        let cpu_runs: Vec<CpuRun> = recent
+            .iter()
+            .zip(&runs)
+            .filter_map(|(r, o)| {
+                let starved = matches!(r.3.as_deref(), Some("cpu" | "slowdown"));
+                r.1.map(|used| CpuRun { used, starved, failed: o.failed() })
+            })
+            .collect();
+        let cpu = cpu_need(&cpu_runs, rules);
         let dur = median_of(recent.iter().filter_map(|r| r.2).collect());
         let boosted = rows.iter().take(boost_runs).any(|r| r.3.as_deref() == Some("memory"));
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
@@ -747,7 +829,7 @@ impl Db {
     /// A guess for a job with no history, from jobs like it in the last 30
     /// days: first those of the same kind in the same pool, then the same
     /// kind, then the same pool, then the same program. Memory is the 90th
-    /// percentile of their peaks and CPU the 75th of the cores they wanted:
+    /// percentile of their peaks and CPU the 75th of the cores they used:
     /// a guess that is too low lets a first run crowd the machine.
     /// A first guess for a job with no history of its own. `same` is the
     /// job's package name and command: the same command of the same package
@@ -774,7 +856,7 @@ impl Db {
         tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
         for (same, l, p, t, what) in tiers {
             let mut stmt = self.conn.prepare_cached(
-                "SELECT max(peak_mem_kb), avg(cores_wanted), avg(ended_at - started_at - coalesce(paused_s, 0)) FROM runs
+                "SELECT max(peak_mem_kb), avg(coalesce(cores_used, cores_wanted)), avg(ended_at - started_at - coalesce(paused_s, 0)) FROM runs
                  WHERE peak_mem_kb > 0 AND ended_at > ?1
                    AND (?2 IS NULL OR label = ?2) AND (?3 IS NULL OR pool = ?3) AND (?4 IS NULL OR cmd LIKE ?4 || '%')
                    AND (?5 IS NULL OR (package = ?5 AND cmd = ?6))
@@ -1140,6 +1222,105 @@ mod tests {
         assert_eq!(db.starved_streak("k").unwrap(), 1);
     }
 
+    /// A run that used `used` cores while it wanted `wanted`.
+    fn run_cpu(db: &Db, key: &str, used: f64, wanted: f64, starved: Option<&str>) {
+        let id = db.insert_run(&NewRun { ns: "n", key, ..Default::default() }).unwrap();
+        db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+        let r = RunResult {
+            ended_at: now(),
+            peak_mem_kb: 1000,
+            cores_used: used,
+            cores_wanted: wanted,
+            measured: true,
+            starved: starved.map(str::to_string),
+            ..Default::default()
+        };
+        db.finish_run(id, &r).unwrap();
+    }
+
+    fn cpu(db: &Db) -> f64 {
+        db.learned("k", &Learn::default()).unwrap().cpu.unwrap()
+    }
+
+    #[test]
+    fn the_cpu_need_is_what_runs_used_not_what_they_waited_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        // tsgo on a busy machine: one thread per core, so it "wants" 17
+        // cores while it gets 4.
+        for _ in 0..5 {
+            run_cpu(&db, "k", 4.0, 17.0, None);
+        }
+        assert_eq!(cpu(&db), 4.0);
+        // Rows from before cores_used was kept fall back on cores wanted.
+        db.conn.execute("UPDATE runs SET cores_used = NULL", []).unwrap();
+        assert_eq!(cpu(&db), 17.0);
+    }
+
+    fn cpu_runs(spec: &[(f64, bool)]) -> Vec<CpuRun> {
+        spec.iter().map(|&(used, starved)| CpuRun { used, starved, failed: false }).collect()
+    }
+
+    #[test]
+    fn starved_runs_are_left_out_while_three_runs_that_were_not_starved_remain() {
+        let rules = Learn::default();
+        // Newest first: four starved runs at 2 cores, then three at 8.
+        let three = cpu_runs(&[(2.0, true), (2.0, true), (2.0, true), (2.0, true), (8.0, false), (8.0, false), (8.0, false)]);
+        assert_eq!(cpu_need(&three, &rules), Some(8.0), "what a starved run got does not pull the need down");
+        // With only two runs that were not starved, the starved ones count.
+        let two = cpu_runs(&[(2.0, true), (2.0, true), (2.0, true), (2.0, true), (8.0, false), (8.0, false)]);
+        assert_eq!(cpu_need(&two, &rules), Some(2.0));
+    }
+
+    #[test]
+    fn recent_runs_weigh_more_than_old_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..6 {
+            run_cpu(&db, "k", 8.0, 8.0, None);
+        }
+        for _ in 0..3 {
+            run_cpu(&db, "k", 2.0, 2.0, None);
+        }
+        assert_eq!(cpu(&db), 2.0, "three new runs outweigh six older ones");
+    }
+
+    #[test]
+    fn a_run_far_above_the_others_counts_more_each_time_it_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..5 {
+            run_cpu(&db, "k", 4.0, 4.0, None);
+        }
+        run_cpu(&db, "k", 16.0, 16.0, None);
+        assert_eq!(cpu(&db), 4.0, "a one-off does not set the need");
+        run_cpu(&db, "k", 16.0, 16.0, None);
+        assert_eq!(cpu(&db), 4.0, "the second time it counts half");
+        run_cpu(&db, "k", 16.0, 16.0, None);
+        assert_eq!(cpu(&db), 16.0, "the third time in full");
+    }
+
+    #[test]
+    fn a_starved_run_never_raises_the_cpu_need() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..4 {
+            run_cpu(&db, "k", 4.0, 4.0, None);
+        }
+        run_cpu(&db, "k", 2.0, 17.0, Some("cpu"));
+        assert_eq!(cpu(&db), 4.0, "neither what it wanted nor what it got");
+
+        // On a crowded machine nearly every run is starved. The one run on a
+        // quiet machine used every core; it alone does not set the need.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..8 {
+            run_cpu(&db, "k", 6.0, 17.0, Some("cpu"));
+        }
+        run_cpu(&db, "k", 18.0, 18.0, None);
+        assert_eq!(cpu(&db), 6.0);
+    }
+
     fn run_exit(db: &Db, key: &str, mem: u64, exit: i32) -> i64 {
         let id = db.insert_run(&NewRun { ns: "n", key, ..Default::default() }).unwrap();
         db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
@@ -1259,8 +1440,18 @@ mod tests {
         let add = |key: &str, label: &str, pool: Option<&str>, cmd: &str, mem: u64, cores: f64| {
             let id = db.insert_run(&NewRun { ns: "n", key, label: Some(label), pool, cmd, ..Default::default() }).unwrap();
             db.mark_started(id, now() - 5.0, 0.0, None).unwrap();
-            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: mem, cores_wanted: cores, measured: true, ..Default::default() })
-                .unwrap();
+            db.finish_run(
+                id,
+                &RunResult {
+                    ended_at: now(),
+                    peak_mem_kb: mem,
+                    cores_used: cores,
+                    cores_wanted: cores,
+                    measured: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         };
         for (i, mem) in [300, 500, 700, 900, 1100, 1300, 1500, 1700, 1900, 4200].iter().enumerate() {
             add(&format!("tc{i}"), "typecheck", None, "tsc -p .", *mem, 1.0 + i as f64 / 10.0);
@@ -1289,8 +1480,18 @@ mod tests {
             let id =
                 db.insert_run(&NewRun { ns: "n", key, label: Some("test"), package: Some(package), cmd, ..Default::default() }).unwrap();
             db.mark_started(id, now() - 5.0, 0.0, None).unwrap();
-            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: mem, cores_wanted: cores, measured: true, ..Default::default() })
-                .unwrap();
+            db.finish_run(
+                id,
+                &RunResult {
+                    ended_at: now(),
+                    peak_mem_kb: mem,
+                    cores_used: cores,
+                    cores_wanted: cores,
+                    measured: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         };
         // Many small test jobs, and one big one under the package's old folder.
         for i in 0..10 {
@@ -1324,6 +1525,7 @@ mod tests {
             let r = RunResult {
                 ended_at: now(),
                 peak_mem_kb: peak.0,
+                cores_used: peak.1,
                 cores_wanted: peak.1,
                 measured: true,
                 steady: Some((steady.1, steady.0)),
