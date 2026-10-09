@@ -349,8 +349,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
 
     ensure_recorder(&dir);
     let sig = Signals::register();
-    let limits_of = crate::commands::limits;
-    let mut limits = limits_of(&cfg);
+    let mut limits = crate::commands::limits(&cfg);
     // A limit changed in the dashboard's Config view reaches jobs that
     // already wait: they read the user config again when it changes.
     let conf_path = config::user_config_path();
@@ -420,12 +419,15 @@ pub fn run(mut o: Opts) -> Result<i32> {
             if mtime != seen_mtime {
                 seen_mtime = mtime;
                 if let Ok(c) = Config::load(&cwd, &checkout) {
-                    limits = limits_of(&c);
+                    limits = crate::commands::limits(&c);
                 }
             }
             let decision;
             let running;
-            let advice;
+            // The advice for a job that cannot fit prints the first time and
+            // with each status line; only then is it worth working out.
+            let status_due = now - last_line >= cfg.status_every as f64;
+            let mut advice = Vec::new();
             {
                 let _g = q.lock()?;
                 let (gone, run, waiting) = q.reap_and_read();
@@ -451,7 +453,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 let unknown_starts = q.unknown_starts();
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &unknown_starts);
-                advice = report::cpu_advice(&m, &limits, &me, &decision, &running, &waiting, now);
+                if status_due || !advised {
+                    advice = report::cpu_advice(&m, &limits, &me, &decision, &running, &waiting, now);
+                }
                 if let Some(w) = watch.step(&m, &limits, &running, &waiting, &me, &decision, now, &unknown_starts) {
                     let note = queue::Stall {
                         at: now,
@@ -556,7 +560,6 @@ pub fn run(mut o: Opts) -> Result<i32> {
             }
             // A job that cannot fit says so once it is clear, and again with
             // each status line, with what an agent can do about it.
-            let status_due = now - last_line >= cfg.status_every as f64;
             if status_due {
                 last_line = now;
                 let left = o.timeout.map(|t| if t > 0.0 { t - (now - t0) } else { t + (now - t0) });

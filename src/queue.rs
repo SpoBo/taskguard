@@ -205,8 +205,9 @@ impl Entry {
     /// Past its needs, a job's needs follow its peak, with room to grow: what
     /// it promises to take must keep up with what it takes. CPU follows the
     /// cores it uses, never the time its threads wait for a core: a tool that
-    /// starts one thread per core waits on every core of a busy machine. A long-lived job
-    /// does so through its start-up only. After that its needs start again
+    /// starts one thread per core waits on every core of a busy machine.
+    ///
+    /// A long-lived job follows its peak through its start-up only. After that its needs start again
     /// from what it uses: a dev stack that took every core while it started
     /// and seeded, and idles at a few percent, must not keep every core for
     /// hours. Its memory need is what it holds plus a quarter, or what its
@@ -1012,7 +1013,7 @@ impl Room {
             res_cpu,
             res_mem,
             promised_cpu: promised_cpu(running),
-            cpu_limit: m.ncpu as f64 * lim.cpu_max_pct / 100.0,
+            cpu_limit: cpu_limit(m, lim),
             mem_limit: m.mem_total_kb as f64 * lim.mem_max_pct / 100.0,
             mem_used: m.mem_for_admission(ours_mem),
             ours_mem,
@@ -1210,12 +1211,27 @@ impl Room {
     }
 }
 
+/// The cores the CPU limit allows on this machine.
+pub fn cpu_limit(m: &MachineSample, lim: &Limits) -> f64 {
+    m.ncpu as f64 * lim.cpu_max_pct / 100.0
+}
+
+/// Does `job` need more cores than the whole CPU limit, so it never fits?
+pub fn never_fits(job: &Entry, cpu_limit: f64) -> bool {
+    job.need_cpu > cpu_limit + 1e-9
+}
+
+/// Can `job` not fit now? It never fits, or it has waited past `max_bypass`,
+/// so it is the job others are held for.
+pub fn cannot_fit_now(lim: &Limits, job: &Entry, now: f64, cpu_limit: f64) -> bool {
+    never_fits(job, cpu_limit) || now - job.queued_at > lim.max_bypass
+}
+
 /// May `job` start on part of its CPU need? Only when partial fit is on, the
 /// job is not short (short jobs skip the CPU reading anyway), and it cannot
-/// fit now: its need is above the whole CPU limit, so it never fits, or it
-/// has waited past `max_bypass`, so it is the job others are held for.
+/// fit now.
 pub fn partial_fit_due(lim: &Limits, job: &Entry, now: f64, cpu_limit: f64) -> bool {
-    lim.partial_fit > 0.0 && !short(lim, job) && (job.need_cpu > cpu_limit + 1e-9 || now - job.queued_at > lim.max_bypass)
+    lim.partial_fit > 0.0 && !short(lim, job) && cannot_fit_now(lim, job, now, cpu_limit)
 }
 
 /// A job that usually ends within a few seconds is over before the CPU

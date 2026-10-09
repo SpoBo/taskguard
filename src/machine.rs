@@ -123,8 +123,8 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
         }
         None => inst,
     };
-    let mut recent_cpu: Vec<(f64, f64)> = prev.map(|p| p.recent_cpu.clone()).unwrap_or_default();
-    recent_cpu.retain(|(ts, _)| now - ts < LOW_WINDOW);
+    let mut recent_cpu: Vec<(f64, f64)> =
+        prev.map(|p| p.recent_cpu.iter().filter(|(ts, _)| now - ts < LOW_WINDOW).copied().collect()).unwrap_or_default();
     recent_cpu.push((now, cpu_busy));
     MachineSample {
         ts: now,
