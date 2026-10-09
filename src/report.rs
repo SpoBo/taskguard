@@ -176,12 +176,12 @@ pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, runn
     if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) {
         return Vec::new();
     }
-    let limit = m.ncpu as f64 * lim.cpu_max_pct / 100.0;
-    let never = e.need_cpu > limit + 1e-9;
-    let waited = now - e.queued_at;
-    if !never && waited <= lim.max_bypass {
+    let limit = crate::queue::cpu_limit(m, lim);
+    if !crate::queue::cannot_fit_now(lim, e, now, limit) {
         return Vec::new();
     }
+    let never = crate::queue::never_fits(e, limit);
+    let waited = now - e.queued_at;
     let mut out = Vec::new();
     out.push(format!(
         "{} needs {:.1} cores; the limit is {limit:.1} cores (cpu_max {:.0}% of {} cores){}",
@@ -393,7 +393,7 @@ impl Snapshot {
             .collect();
         Snapshot {
             now,
-            cpu_limit: machine.ncpu as f64 * limits.cpu_max_pct / 100.0,
+            cpu_limit: crate::queue::cpu_limit(&machine, &limits),
             mem_limit_kb: (machine.mem_total_kb as f64 * limits.mem_max_pct / 100.0) as u64,
             machine,
             limits,

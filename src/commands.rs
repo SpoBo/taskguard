@@ -141,8 +141,11 @@ pub fn start(args: &[String]) -> Result<i32> {
         q.waiting()
     };
     let number = target.parse::<i64>().ok();
-    let exact: Vec<&crate::queue::Entry> =
-        waiting.iter().filter(|e| number.is_some_and(|n| n == e.pid as i64 || n == e.ticket as i64) || &e.key == target).collect();
+    // A pid comes first: tickets count up past the pids of a busy machine, and
+    // the advice names the pid, so it must never start another job.
+    let by_pid: Vec<&crate::queue::Entry> = waiting.iter().filter(|e| number == Some(e.pid as i64)).collect();
+    let exact =
+        if by_pid.is_empty() { waiting.iter().filter(|e| number == Some(e.ticket as i64) || &e.key == target).collect() } else { by_pid };
     let found = if exact.is_empty() { waiting.iter().filter(|e| e.key.contains(target.as_str())).collect() } else { exact };
     let e = match found.as_slice() {
         [e] => *e,
