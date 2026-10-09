@@ -702,7 +702,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 seen_peak_kb = seen_peak_kb.max(r.mem_kb);
                 let (peak_cpu, peak_mem) = (me.need_cpu, me.need_mem_kb);
-                me.follow(r.mem_kb, r.wanted, r.used_recent, sys::ncpu() as f64, now, long);
+                me.follow(r.mem_kb, r.used_recent, sys::ncpu() as f64, now, long);
                 if me.steady_since == Some(now) {
                     tracker.steady_from(now, r.mem_kb);
                     paused_before_steady = me.paused_s;
@@ -942,7 +942,7 @@ fn after_starved(
     }
     let streak = d.starved_streak(&me.key).unwrap_or(0);
     if streak >= 3 {
-        let v = if st.kind == "memory" { peak as f64 * 1.25 } else { wanted.ceil() };
+        let v = if st.kind == "memory" { peak as f64 * 1.25 } else { after.cpu.unwrap_or(used).ceil() };
         let _ = d.adjustment(&me.key, me.run_id, "suggest_min", None, Some(v), &format!("starved {streak} runs in a row"));
     }
     let what = if st.kind == "cpu" {
@@ -975,7 +975,6 @@ fn after_starved(
         mem_before: before.mem_kb,
         mem_after: after.mem_kb.map(|m| (m as f64 * 1.25) as u64),
         got_cores: used,
-        wanted_cores: wanted,
         peak_mem_kb: peak,
         others,
         streak,

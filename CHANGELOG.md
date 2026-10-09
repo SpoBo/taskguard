@@ -10,6 +10,20 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- The CPU need is learned from the cores a job used, not from the time its
+  threads waited for a core. Tools that start one thread per core (`tsgo`,
+  `oxlint`) waited on every core of a busy machine, so they learned a need of
+  the whole machine and blocked the queue. Recent runs count more: a run
+  counts half as much as one four runs newer. A run far above the others is
+  an outlier and counts by `outlier_weights`, as memory peaks do. A
+  CPU-starved run no longer raises the need to what it waited for; starved
+  runs are left out while three runs that were not starved remain. A running
+  job books the cores it uses, and the `--min-cpu` advice after a starved run
+  pins the learned need. Run `taskguard prune KEY --apply` on a job whose need
+  is still inflated to start again from its next runs.
+
 ## [0.7.1] - 2026-10-07
 
 ### Fixed

@@ -203,7 +203,9 @@ impl Entry {
     /// cores it used in the recent window.
     ///
     /// Past its needs, a job's needs follow its peak, with room to grow: what
-    /// it promises to take must keep up with what it takes. A long-lived job
+    /// it promises to take must keep up with what it takes. CPU follows the
+    /// cores it uses, never the time its threads wait for a core: a tool that
+    /// starts one thread per core waits on every core of a busy machine. A long-lived job
     /// does so through its start-up only. After that its needs start again
     /// from what it uses: a dev stack that took every core while it started
     /// and seeded, and idles at a few percent, must not keep every core for
@@ -212,7 +214,7 @@ impl Entry {
     /// its peak from there: running out of memory kills processes. Its CPU
     /// need is measured use plus a margin, up or down, because runnable wait
     /// can reflect priority and contention rather than useful work.
-    pub fn follow(&mut self, mem_kb: u64, wanted: f64, used_recent: f64, ncpu: f64, now: f64, long: Option<LongLived>) {
+    pub fn follow(&mut self, mem_kb: u64, used_recent: f64, ncpu: f64, now: f64, long: Option<LongLived>) {
         if let Some(l) = long
             && self.steady_since.is_none()
             && now - self.started_at.unwrap_or(now) >= l.startup
@@ -226,8 +228,8 @@ impl Entry {
             self.need_cpu = (used_recent * (1.0 + STEADY_CPU_MARGIN)).min(ncpu);
         } else if mem_kb > self.need_mem_kb {
             self.need_mem_kb = mem_kb + mem_kb / 4;
-        } else if wanted > self.need_cpu {
-            self.need_cpu = wanted.min(ncpu);
+        } else if used_recent > self.need_cpu {
+            self.need_cpu = used_recent.min(ncpu);
         }
     }
 }
@@ -1678,8 +1680,8 @@ mod tests {
 
         // Started at 1000: through its start-up it holds that peak, even in a lull.
         let mut s = Entry { started_at: Some(1000.0), ..me };
-        s.follow(2 * GB, 11.0, 11.0, 12.0, 1010.0, Some(STACK));
-        s.follow(3 * GB, 0.2, 0.2, 12.0, 1200.0, Some(STACK));
+        s.follow(2 * GB, 11.0, 12.0, 1010.0, Some(STACK));
+        s.follow(3 * GB, 0.2, 12.0, 1200.0, Some(STACK));
         (s.live_cpu, s.live_mem_kb) = (0.2, 3 * GB);
         assert_eq!((s.need_cpu, s.need_mem_kb, s.steady_since), (11.0, 6 * GB, None));
         // 0.5 busy + 10.8 still promised to the stack + 3 > 12 cores.
@@ -1691,9 +1693,9 @@ mod tests {
     #[test]
     fn after_its_start_up_a_long_lived_job_reserves_what_it_uses() {
         let mut s = Entry { started_at: Some(1000.0), ..stack() };
-        s.follow(5 * GB, 11.0, 11.0, 12.0, 1100.0, Some(STACK));
+        s.follow(5 * GB, 11.0, 12.0, 1100.0, Some(STACK));
         // 300 s in, its start-up is over. It holds 3 GB and wants 0.3 cores.
-        s.follow(3 * GB, 0.2, 0.2, 12.0, 1300.0, Some(STACK));
+        s.follow(3 * GB, 0.2, 12.0, 1300.0, Some(STACK));
         assert_eq!(s.steady_since, Some(1300.0));
         assert_eq!((s.need_cpu, s.need_mem_kb), (0.25, 3 * GB + 3 * GB / 4));
         (s.live_cpu, s.live_mem_kb) = (0.2, 3 * GB);
@@ -1703,34 +1705,42 @@ mod tests {
         assert!(blockers(decide(&machine(0.5, 4), &LIM, r, std::slice::from_ref(&build), &build, 1300.0, &[])).is_empty());
 
         // A test run against the stack raises its CPU need, which falls back after.
-        s.follow(3 * GB, 6.0, 6.0, 12.0, 1400.0, Some(STACK));
+        s.follow(3 * GB, 6.0, 12.0, 1400.0, Some(STACK));
         assert_eq!(s.need_cpu, 7.5);
-        s.follow(3 * GB, 0.2, 0.2, 12.0, 1420.0, Some(STACK));
+        s.follow(3 * GB, 0.2, 12.0, 1420.0, Some(STACK));
         assert_eq!(s.need_cpu, 0.25);
         // Its steady memory booking follows current RSS and can fall.
-        s.follow(4 * GB, 0.2, 0.3, 12.0, 1440.0, Some(STACK));
-        s.follow(2 * GB, 0.2, 0.3, 12.0, 1460.0, Some(STACK));
+        s.follow(4 * GB, 0.3, 12.0, 1440.0, Some(STACK));
+        s.follow(2 * GB, 0.3, 12.0, 1460.0, Some(STACK));
         assert_eq!(s.need_mem_kb, 2 * GB + (2 * GB) / 4);
 
         // What its past runs grew to after their start-up stays reserved.
         let mut again = Entry { started_at: Some(1000.0), ..stack() };
-        again.follow(3 * GB, 0.2, 0.2, 12.0, 1300.0, Some(LongLived { steady_mem_kb: Some(5 * GB), ..STACK }));
+        again.follow(3 * GB, 0.2, 12.0, 1300.0, Some(LongLived { steady_mem_kb: Some(5 * GB), ..STACK }));
         assert_eq!(again.need_mem_kb, 3 * GB + (3 * GB) / 4);
 
         // An ordinary job keeps its peak needs for its whole run.
         let mut compile = Entry { started_at: Some(1000.0), ..job(4, "compile", 2.0, 6) };
-        compile.follow(3 * GB, 11.0, 11.0, 12.0, 1010.0, None);
-        compile.follow(3 * GB, 0.2, 0.2, 12.0, 5000.0, None);
+        compile.follow(3 * GB, 11.0, 12.0, 1010.0, None);
+        compile.follow(3 * GB, 0.2, 12.0, 5000.0, None);
         assert_eq!((compile.need_cpu, compile.need_mem_kb, compile.steady_since), (11.0, 6 * GB, None));
+    }
+
+    #[test]
+    fn a_running_job_books_the_cores_it_uses_not_those_it_waits_for() {
+        // tsgo on a busy machine: 4 cores used, 17 wanted.
+        let mut tsgo = Entry { started_at: Some(1000.0), ..job(4, "tsgo", 2.0, 2) };
+        tsgo.follow(GB, 4.0, 18.0, 1010.0, None);
+        assert_eq!(tsgo.need_cpu, 4.0);
     }
 
     #[test]
     fn steady_cpu_ignores_runnable_wait_and_stays_under_host_capacity() {
         let mut s = Entry { started_at: Some(1000.0), ..stack() };
-        s.follow(3 * GB, 20.0, 0.5, 18.0, 1300.0, Some(STACK));
+        s.follow(3 * GB, 0.5, 18.0, 1300.0, Some(STACK));
         assert_eq!(s.steady_since, Some(1300.0));
         assert!((s.need_cpu - 0.625).abs() < f64::EPSILON, "{}", s.need_cpu);
-        s.follow(3 * GB, 100.0, 100.0, 18.0, 1400.0, Some(STACK));
+        s.follow(3 * GB, 100.0, 18.0, 1400.0, Some(STACK));
         assert_eq!(s.need_cpu, 18.0);
     }
 

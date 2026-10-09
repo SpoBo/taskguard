@@ -24,8 +24,9 @@
 #   CPU busy     + CPU still promised to running jobs     + its CPU need     fits under cpu_max
 #   memory held  + memory still promised to running jobs  + its memory need  fits under mem_max
 # Needs are learned per command: memory is the highest peak of the last
-# hist_keep runs (outliers held back, see learning), CPU the median of the
-# cores it wanted. A memory need is capped at mem_max.
+# hist_keep runs (outliers held back, see learning), CPU the cores it used
+# (not the time it waited for a core), the newest runs counting most and
+# outliers held back the same way. A memory need is capped at mem_max.
 cpu_max = 100         # percent of all cores
 mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)

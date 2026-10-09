@@ -239,7 +239,6 @@ pub struct AdviceInput<'a> {
     pub mem_before: Option<u64>,
     pub mem_after: Option<u64>,
     pub got_cores: f64,
-    pub wanted_cores: f64,
     pub peak_mem_kb: u64,
     pub others: Vec<String>,
     pub streak: usize,
@@ -272,7 +271,9 @@ pub fn advice(a: &AdviceInput) -> Vec<String> {
     }
     let min_flag = match a.starved.kind {
         "memory" => format!("--min-mem {}", size_flag(((a.peak_mem_kb as f64) * 1.25) as u64)),
-        _ => format!("--min-cpu {}", a.wanted_cores.ceil().max(1.0) as u64),
+        // What the job uses, as learned: a pin at what a starved run waited
+        // for would bring back the need that kept it out.
+        _ => format!("--min-cpu {}", a.cpu_after.unwrap_or(a.got_cores).ceil().max(1.0) as u64),
     };
     let cmd = a.argv.iter().map(|w| shell_quote(w)).collect::<Vec<_>>().join(" ");
     let place = match (a.script, a.package_json) {
@@ -452,7 +453,6 @@ mod tests {
             mem_before: None,
             mem_after: None,
             got_cores: 2.2,
-            wanted_cores: 6.1,
             peak_mem_kb: 0,
             others: vec![],
             streak: 1,
@@ -466,6 +466,29 @@ mod tests {
                 "or let vitest fit the room it gets: add --maxWorkers=2".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn the_cpu_pin_is_what_the_job_uses_not_what_it_waited_for() {
+        let a = argv("tsgo --noEmit");
+        let st = Starvation { kind: "cpu", evidence: vec![] };
+        let lines = advice(&AdviceInput {
+            argv: &a,
+            effective: &a,
+            starved: &st,
+            script: None,
+            package_json: None,
+            cwd: "/r",
+            cpu_before: Some(4.0),
+            cpu_after: Some(4.0),
+            mem_before: None,
+            mem_after: None,
+            got_cores: 3.6,
+            peak_mem_kb: 0,
+            others: vec![],
+            streak: 1,
+        });
+        assert!(lines.iter().any(|l| l.contains("--min-cpu 4 tsgo")), "{lines:?}");
     }
 
     #[test]
@@ -494,7 +517,6 @@ mod tests {
                 mem_before: None,
                 mem_after: None,
                 got_cores: 2.7,
-                wanted_cores: 4.0,
                 peak_mem_kb: 4 * 1024 * 1024,
                 others: vec![],
                 streak: 0,

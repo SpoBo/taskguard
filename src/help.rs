@@ -26,7 +26,7 @@ taskguard run [options] -- COMMAND [ARGS...]
 
 Run COMMAND when the machine has room for it. The room it needs is learned
 from its past runs: memory is the highest peak of the last 10 runs, CPU the
-median of the cores it wanted. Use the `run` form for a command named like a
+cores it used, the newest runs counting most. Use the `run` form for a command named like a
 subcommand, such as a script called `top`.
 
 A job that is short of room by only a little (noise_mem, noise_cpu), or only

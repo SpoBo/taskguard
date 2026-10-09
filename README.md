@@ -47,10 +47,17 @@ below).
 
 - **Needs are learned.** Each run is measured, and the result is kept per
   command. The memory need is the highest peak of the last 10 runs, because
-  running out of memory kills processes. The CPU need is the median of the
-  cores the job *wanted* in its last 10 runs, because too little CPU only
-  makes a job slower. A memory need never passes `mem_max`: a job that once
-  took more is capped there, and says so.
+  running out of memory kills processes. The CPU need is the cores the job
+  *used* in its last 10 runs, because too little CPU only makes a job slower.
+  It is a median in which a run counts half as much as one four runs newer, so
+  it follows a job that gets faster or slower. Time a job's threads spent
+  waiting for a core does not count: `tsgo` and `oxlint` start one thread per
+  core, so on a busy machine they wait on every core. Runs far above the
+  others count as outliers do for memory (below). A run that was starved of
+  CPU used less than it needs, so starved runs are left out while three runs
+  that were not starved remain; what a starved run waited for never raises
+  the need. A memory need never passes `mem_max`: a job that once took more
+  is capped there, and says so.
 - **One wild run does not set the need.** A peak more than `outlier_ratio`
   (2) times the next peak below it, and at least `outlier_min` (1 GB) above
   it, is an outlier: a CI run that took 12 GB where it usually takes 4.5 GB.
@@ -311,8 +318,9 @@ instructions, so it knows the whole tool at once. `taskguard help COMMAND`, or
 
 taskguard also measures whether a job was held back while it ran: its threads
 waited for a core more than half as long as they ran, it paged memory in while the machine was under memory pressure, or it
-took 1.5 times its usual time while the machine was full. A starved run
-teaches a higher need for the next run, and with hints on it prints advice
+took 1.5 times its usual time while the machine was full. A run starved of
+memory teaches a higher need for the next run; a run starved of CPU does not
+raise the CPU need (see "Needs are learned"). With hints on it prints advice
 that can be pasted:
 
 ```
