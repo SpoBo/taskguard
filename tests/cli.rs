@@ -345,7 +345,9 @@ fn a_job_that_can_never_fit_prints_advice_with_the_start_command() {
     assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("advice ") && err.contains("never fully fits"), "{err}");
-    assert!(err.contains("taskguard start "), "{err}");
+    // On a machine short of memory (a busy CI runner), the advice says so
+    // instead of offering a start by hand.
+    assert!(err.contains("taskguard start ") || err.contains("memory keeps it out too"), "{err}");
     holder.wait_with_output().unwrap();
 }
 

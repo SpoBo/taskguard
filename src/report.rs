@@ -173,11 +173,10 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
 /// outcome. Empty for any other job.
 pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, running: &[Entry], waiting: &[Entry], now: f64) -> Vec<String> {
     let Decision::Wait { blockers } = d else { return Vec::new() };
-    // Only CPU, which only makes a job slower: a start by hand also skips
-    // the memory check, and that is never advice to give.
-    if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) || blockers.iter().any(|b| matches!(b, Blocker::Memory { .. })) {
+    if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) {
         return Vec::new();
     }
+    let short_of_memory = blockers.iter().any(|b| matches!(b, Blocker::Memory { .. }));
     let limit = crate::queue::cpu_limit(m, lim);
     if !crate::queue::cannot_fit_now(lim, e, now, limit) {
         return Vec::new();
@@ -221,10 +220,17 @@ pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, runn
     } else {
         "partial_fit is 0, so it waits until it fully fits or no other job runs".into()
     });
-    out.push(format!(
-        "to start it now anyway: taskguard start {}. It then runs on the cores it gets, slower, and no check holds it back, memory included",
-        e.pid
-    ));
+    // Too little CPU only makes a job slower; too little memory makes the
+    // machine swap. A start by hand skips the memory check too, so it is
+    // only advice while CPU alone keeps the job out.
+    out.push(if short_of_memory {
+        "memory keeps it out too, so do not start it by hand: it starts once memory frees up".into()
+    } else {
+        format!(
+            "to start it now anyway: taskguard start {}. It then runs on the cores it gets, slower, and no check holds it back, memory included",
+            e.pid
+        )
+    });
     out.push(format!(
         "to change the outcome: raise cpu_max, lower partial_fit, or if its need comes from old runs, check taskguard history and run taskguard prune '{}' --apply",
         e.key
@@ -717,7 +723,7 @@ mod tests {
     }
 
     /// Starting a job by hand skips the memory check. A job that memory keeps
-    /// out too gets no advice to do that.
+    /// out too gets the advice without the command to do that.
     #[test]
     fn a_job_short_of_memory_too_gets_no_advice_to_start_it_by_hand() {
         let lim = advice_limits();
@@ -743,7 +749,9 @@ mod tests {
             w => w,
         };
         assert!(matches!(&d, Decision::Wait { blockers } if blockers.iter().any(|b| matches!(b, Blocker::Memory { .. }))), "{d:?}");
-        assert!(cpu_advice(&m, &lim, &me, &d, &[], std::slice::from_ref(&me), 1060.0).is_empty());
+        let text = cpu_advice(&m, &lim, &me, &d, &[], std::slice::from_ref(&me), 1060.0).join("\n");
+        assert!(text.contains("never fully fits") && text.contains("memory keeps it out too"), "{text}");
+        assert!(!text.contains("taskguard start"), "{text}");
     }
 
     #[test]
