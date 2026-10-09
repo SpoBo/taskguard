@@ -227,6 +227,24 @@ pub fn starvation(f: &RunFacts) -> Option<Starvation> {
 
 // ---------------------------------------------------------------- advice ----
 
+/// What the next run reserves after a run starved of `kind`, for its warning
+/// line. A run starved of CPU, or slowed down, never raises the CPU need: it
+/// says what the need is now. Without a learned need, what the run used,
+/// never what it waited for. `mem_after` is the memory need after the boost.
+pub fn next_need(kind: &str, cpu_before: Option<f64>, cpu_after: Option<f64>, used: f64, mem_after: Option<u64>, peak_kb: u64) -> String {
+    match kind {
+        "memory" => format!("next run will reserve {} of memory", gb(mem_after.unwrap_or(peak_kb))),
+        _ => {
+            let now = cpu_after.unwrap_or(used);
+            match cpu_before {
+                Some(b) if (now - b).abs() <= 0.05 => format!("next run keeps reserving {b:.1} cores"),
+                Some(b) => format!("next run will reserve {now:.1} cores (was {b:.1})"),
+                None => format!("next run will reserve {now:.1} cores"),
+            }
+        }
+    }
+}
+
 pub struct AdviceInput<'a> {
     pub argv: &'a [String],
     pub effective: &'a [String],
@@ -489,6 +507,16 @@ mod tests {
             streak: 1,
         });
         assert!(lines.iter().any(|l| l.contains("--min-cpu 4 tsgo")), "{lines:?}");
+    }
+
+    #[test]
+    fn after_a_starved_run_the_warning_says_what_the_next_run_reserves() {
+        // A slow run does not raise the CPU need any more; it says what stays.
+        assert_eq!(next_need("slowdown", Some(4.0), Some(4.0), 3.0, None, 0), "next run keeps reserving 4.0 cores");
+        assert_eq!(next_need("cpu", Some(4.0), Some(3.5), 3.0, None, 0), "next run will reserve 3.5 cores (was 4.0)");
+        // Without a learned need, what the run used, never what it waited for.
+        assert_eq!(next_need("cpu", None, None, 3.0, None, 0), "next run will reserve 3.0 cores");
+        assert_eq!(next_need("memory", None, None, 0.0, Some(2 * 1024 * 1024), 0), "next run will reserve 2.0 GB of memory");
     }
 
     #[test]

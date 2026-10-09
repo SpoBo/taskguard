@@ -821,21 +821,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     lines.done(&report::Done { key: &jkey, secs: wall, used, wanted, peak_kb: tracker.peak_mem_kb, code, queued: still });
 
     if let (Some(st), Some(d)) = (&starved, &database) {
-        after_starved(
-            d,
-            &cfg,
-            &o,
-            &me,
-            &cwd,
-            st,
-            &learned,
-            used,
-            wanted,
-            tracker.peak_mem_kb,
-            script.as_deref(),
-            package_json.as_deref(),
-            &lines,
-        );
+        after_starved(d, &cfg, &o, &me, &cwd, st, &learned, used, tracker.peak_mem_kb, script.as_deref(), package_json.as_deref(), &lines);
     }
     Ok(code)
 }
@@ -924,7 +910,6 @@ fn after_starved(
     st: &insight::Starvation,
     before: &db::Learned,
     used: f64,
-    wanted: f64,
     peak: u64,
     script: Option<&str>,
     package_json: Option<&str>,
@@ -947,18 +932,8 @@ fn after_starved(
         let v = if st.kind == "memory" { peak as f64 * 1.25 } else { after.cpu.unwrap_or(used).ceil() };
         let _ = d.adjustment(&me.key, me.run_id, "suggest_min", None, Some(v), &format!("starved {streak} runs in a row"));
     }
-    let what = if st.kind == "cpu" {
-        let now_need = after.cpu.unwrap_or(wanted);
-        match before.cpu {
-            Some(b) if now_need <= b + 0.05 => format!("next run keeps reserving {b:.1} cores"),
-            Some(b) => format!("next run will reserve {now_need:.1} cores (was {b:.1})"),
-            None => format!("next run will reserve {now_need:.1} cores"),
-        }
-    } else if st.kind == "memory" {
-        format!("next run will reserve {} of memory", report::gb(after.mem_kb.map(|m| (m as f64 * 1.25) as u64).unwrap_or(peak)))
-    } else {
-        "its needs are raised for the next run".into()
-    };
+    let mem_after = after.mem_kb.map(|m| (m as f64 * 1.25) as u64);
+    let what = insight::next_need(st.kind, before.cpu, after.cpu, used, mem_after, peak);
     say(&format!("warning {} - possibly starved: {}; {what}", me.key, st.evidence.join("; ")));
     if !lines.hints {
         return;

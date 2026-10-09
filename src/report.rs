@@ -211,14 +211,17 @@ pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, runn
     });
     let behind = waiting.iter().filter(|w| e.ahead_of(w)).count();
     out.push(format!("it has waited {}; {behind} jobs wait behind it", dur(waited)));
-    out.push(if lim.partial_fit > 0.0 {
+    // Only a partial fit that can happen: a short job skips the CPU reading,
+    // and a share above the whole limit is never free.
+    let share = lim.partial_fit * e.need_cpu;
+    out.push(if crate::queue::partial_fit_due(lim, e, now, limit) && share <= limit + 1e-9 {
         format!(
             "it starts by itself on {:.1} cores (partial_fit {:.0}% of its need) once that much is free and the machine is near its recent low",
-            lim.partial_fit * e.need_cpu,
+            share,
             lim.partial_fit * 100.0
         )
     } else {
-        "partial_fit is 0, so it waits until it fully fits or no other job runs".into()
+        "it waits until it fully fits or no other job runs (partial_fit cannot start it)".into()
     });
     // Too little CPU only makes a job slower; too little memory makes the
     // machine swap. A start by hand skips the memory check too, so it is
@@ -720,6 +723,38 @@ mod tests {
         let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(&mid), &mid, 1060.0, &[]);
         assert!(matches!(d, Decision::Wait { .. }));
         assert!(cpu_advice(&m, &lim, &mid, &d, std::slice::from_ref(&lint), &waiting, 1060.0).is_empty());
+    }
+
+    /// The advice only promises a partial fit that can happen: not for a job
+    /// whose share is above the whole limit, nor for a short job.
+    #[test]
+    fn the_advice_promises_a_partial_fit_only_when_one_can_happen() {
+        let lim = advice_limits();
+        let m = MachineSample::fixed(20.0, 18, 8 * GB, 128 * GB);
+        let mut lint = Entry { ticket: 1, pid: 11, key: "web:lint".into(), need_cpu: 15.0, known: true, ..Default::default() };
+        lint.started_at = Some(900.0);
+        let advice = |me: &Entry| {
+            let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(me), me, 1200.0, &[]);
+            cpu_advice(&m, &lim, me, &d, std::slice::from_ref(&lint), std::slice::from_ref(me), 1200.0).join("\n")
+        };
+        let me = Entry {
+            ticket: 2,
+            pid: 4242,
+            key: "web:typecheck".into(),
+            need_cpu: 30.0,
+            known: true,
+            queued_at: 1000.0,
+            ..Default::default()
+        };
+        assert!(advice(&me).contains("starts by itself on 15.0 cores"));
+        // Half of 1000 cores never fits in 27.
+        let huge = Entry { need_cpu: 1000.0, ..me.clone() };
+        let text = advice(&huge);
+        assert!(!text.contains("starts by itself") && text.contains("waits until it fully fits or no other job runs"), "{text}");
+        // A short job skips the CPU reading, so partial fit does not apply.
+        let short = Entry { need_cpu: 30.0, est_dur_s: Some(2.0), ..me };
+        let text = advice(&short);
+        assert!(!text.contains("starts by itself"), "{text}");
     }
 
     /// Starting a job by hand skips the memory check. A job that memory keeps
