@@ -408,8 +408,8 @@ pub fn run_receipt(id: &str, partial: Option<&str>, publish: Option<u64>, cmd: &
     insert(&db, &r)?;
     let next = match publish {
         Some(secs) => {
-            let log = spawn_publish(&root, secs)?;
-            format!("It is posted once HEAD has these files and is on GitHub, for {} (log: {}).", dur(secs as f64), log.display())
+            let (log, how) = spawn_publish(&root, &r.tree, secs)?;
+            format!("It is posted {how}, for up to {} (log: {}).", dur(secs as f64), log.display())
         }
         None => "After you push, `taskguard proof publish` posts it.".into(),
     };
@@ -616,9 +616,13 @@ fn root_here() -> Result<PathBuf> {
 /// HEAD has a receipt and is on GitHub. That fits a pipeline that runs the
 /// receipt, then may add commits, then pushes from the same checkout.
 fn publish(rest: &[String]) -> Result<i32> {
-    let a = parse(rest, &["--sha", "--wait"], &["--again", "-q", "--quiet"])?;
+    let a = parse(rest, &["--sha", "--wait", "--tree", "--branch", "--repo"], &["--again", "-q", "--quiet"])?;
     let quiet = a.has("-q") || a.has("--quiet");
     let again = a.has("--again");
+    if let Some(tree) = a.one("--tree") {
+        let branch = a.one("--branch").context("--tree goes with --branch")?;
+        return publish_tree(tree, branch, a.one("--repo"), a.secs("--wait")?, again, quiet);
+    }
     let root = root_here()?;
     let policy = Policy::load(&root)?;
     let wait = a.secs("--wait")?;
@@ -695,15 +699,78 @@ fn post_all(db: &Db, root: &Path, sha: &str, rs: Vec<Receipt>, quiet: bool) -> R
     Ok(())
 }
 
-/// `--receipt ID --publish SECS`: publish in the background once HEAD reaches
-/// GitHub, for up to SECS. The output goes to a log in the temp folder.
-fn spawn_publish(root: &Path, secs: u64) -> Result<PathBuf> {
+/// `proof publish --tree TREE --branch BRANCH [--repo OWNER/REPO] --wait SECS`:
+/// no checkout needed. Watch the branch on GitHub and post the receipts of
+/// TREE on its head once that head has those files. A pipeline that deletes
+/// its checkout right after the push (no-mistakes) can still publish.
+fn publish_tree(tree: &str, branch: &str, repo: Option<&str>, wait: u64, again: bool, quiet: bool) -> Result<i32> {
+    if let Some(r) = repo {
+        // gh fills {owner}/{repo} from GH_REPO; nothing else runs yet.
+        unsafe { std::env::set_var("GH_REPO", r) };
+    }
+    let dir = std::env::temp_dir();
+    let db = Db::open_dir(&config::state_dir())?;
+    let t0 = Instant::now();
+    loop {
+        let head = gh_api(
+            &dir,
+            &[&format!("repos/{{owner}}/{{repo}}/branches/{branch}"), "--jq", ".commit.sha + \" \" + .commit.commit.tree.sha"],
+        );
+        if let Ok(line) = &head
+            && let Some((sha, head_tree)) = line.trim().split_once(' ')
+            && head_tree == tree
+        {
+            let rs: Vec<Receipt> = strongest_per_id(receipts_for(&db, &[tree.to_string()])?)
+                .into_iter()
+                .filter(|r| again || !posted_to(&db, r.row, sha))
+                .collect();
+            if rs.is_empty() && !quiet {
+                println!("{}: nothing to publish: no new receipt for its files", short(sha));
+            }
+            post_all(&db, &dir, sha, rs, quiet)?;
+            return Ok(0);
+        }
+        if t0.elapsed().as_secs() >= wait {
+            let now = head.map(|l| l.trim().to_string()).unwrap_or_else(|e| format!("{e:#}"));
+            bail!("{branch} on GitHub never had tree {} within {wait}s (last seen: {now})", short(tree));
+        }
+        std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
+/// `--receipt ID --publish SECS`: publish in the background, for up to SECS.
+/// On a branch it watches that branch on GitHub for the tested files, so the
+/// checkout may go away after the push; detached, it follows HEAD in the
+/// checkout. GH_REPO names the repo when the checkout's remote is not GitHub.
+/// The output goes to a log in the temp folder.
+fn spawn_publish(root: &Path, tree: &str, secs: u64) -> Result<(PathBuf, String)> {
     use std::os::unix::process::CommandExt;
     let log = std::env::temp_dir().join("taskguard-proof-publish.log");
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    cmd.args(["proof", "publish", "--wait", &secs.to_string()]).current_dir(root).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    cmd.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
+    let repo = std::env::var("GH_REPO").ok().filter(|r| !r.is_empty()).or_else(|| {
+        let o = Command::new(gh_bin())
+            .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+            .current_dir(root)
+            .output()
+            .ok()?;
+        let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (o.status.success() && !r.is_empty()).then_some(r)
+    });
+    let how = match (&branch, &repo) {
+        (Some(b), Some(r)) => {
+            cmd.args(["proof", "publish", "--tree", tree, "--branch", b, "--repo", r, "--wait", &secs.to_string()])
+                .current_dir(std::env::temp_dir());
+            format!("when {b} on {r} has these files")
+        }
+        _ => {
+            cmd.args(["proof", "publish", "--wait", &secs.to_string()]).current_dir(root);
+            "when HEAD has these files and is on GitHub".to_string()
+        }
+    };
     unsafe {
         cmd.pre_exec(|| {
             libc::setsid();
@@ -711,7 +778,7 @@ fn spawn_publish(root: &Path, secs: u64) -> Result<PathBuf> {
         });
     }
     cmd.spawn().context("starting the background publish")?;
-    Ok(log)
+    Ok((log, how))
 }
 
 /// What CI does for one receipt id, given the newest status on the commit.
@@ -770,9 +837,11 @@ fn check(rest: &[String]) -> Result<i32> {
     let wait = a.secs("--wait")?;
     let t0 = Instant::now();
     let decisions = loop {
+        let mut failed = false;
         let got = match statuses(&root, &sha) {
             Ok(s) => newest(&s),
             Err(e) => {
+                failed = true;
                 // Unsure means run: CI must not skip work it cannot see the proof of.
                 eprintln!("taskguard: cannot read the statuses of {}, so CI runs everything: {e:#}", short(&sha));
                 BTreeMap::new()
@@ -789,7 +858,8 @@ fn check(rest: &[String]) -> Result<i32> {
             })
             .collect();
         let missing = ids.iter().any(|id| policy.receipt.contains_key(id) && !got.contains_key(id));
-        if !missing || t0.elapsed().as_secs() >= wait {
+        // A gh error means run; waiting longer would only delay that.
+        if !missing || failed || t0.elapsed().as_secs() >= wait {
             break d;
         }
         std::thread::sleep(Duration::from_secs(5));

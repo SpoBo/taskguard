@@ -530,9 +530,10 @@ impl Proof {
         std::fs::write(
             &gh,
             format!(
-                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$*\" in\n  *statuses\\ --jq*) cat {st} ;;\n  *-X\\ POST*) ;;\n  *commits/*) echo sha ;;\nesac\n",
+                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$*\" in\n  *statuses\\ --jq*) cat {st} ;;\n  *-X\\ POST*) ;;\n  *branches/*) cat {br} 2>/dev/null ;;\n  *commits/*) echo sha ;;\nesac\n",
                 log = p.gh_log.display(),
-                st = statuses.display()
+                st = statuses.display(),
+                br = p.e.cwd.parent().unwrap().join("branch.txt").display()
             ),
         )
         .unwrap();
@@ -686,4 +687,29 @@ fn check_with_github_output_runs_ids_it_does_not_know() {
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "e2e=run\n");
     // Without --github-output it is an error.
     assert_eq!(p.tg(&["proof", "check", "e2e", "--sha", &head]).status.code(), Some(2));
+}
+
+#[test]
+fn publish_by_tree_needs_no_checkout() {
+    let p = Proof::new("true");
+    std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
+    assert!(p.tg(&["--receipt", "unit"]).status.success());
+    let tree = p.receipts()[0].1.clone();
+    // The checkout goes away; the publish watches the branch on GitHub.
+    let elsewhere = p.e.cwd.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut child =
+        p.e.cmd(&["proof", "publish", "--tree", &tree, "--branch", "main", "--repo", "o/r", "--wait", "30"])
+            .current_dir(&elsewhere)
+            .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    std::fs::write(p.e.cwd.parent().unwrap().join("branch.txt"), format!("{sha} {tree}\n")).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(p.gh_calls().contains(&format!("-X POST repos/{{owner}}/{{repo}}/statuses/{sha}")), "{}", p.gh_calls());
 }
