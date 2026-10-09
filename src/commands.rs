@@ -25,6 +25,7 @@ pub fn limits(cfg: &Config) -> Limits {
         noise_cpu: cfg.noise_cpu,
         outside_admit: cfg.outside_admit,
         outside_mem_max_pct: cfg.pause_at,
+        partial_fit: cfg.partial_fit.clamp(0.0, 1.0),
     }
 }
 

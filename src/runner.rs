@@ -7,7 +7,7 @@ use crate::insight::{self, AdviceInput, RunFacts, Tracker};
 use crate::key;
 use crate::machine;
 use crate::matcher;
-use crate::queue::{self, Decision, Entry, Limits, Queue};
+use crate::queue::{self, Decision, Entry, Queue};
 use crate::report::{self, Lines, say};
 use crate::sys;
 use anyhow::{Context, Result, bail};
@@ -349,19 +349,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
 
     ensure_recorder(&dir);
     let sig = Signals::register();
-    let limits_of = |cfg: &Config| Limits {
-        cpu_max_pct: cfg.cpu_max,
-        mem_max_pct: cfg.mem_max,
-        learn_stagger: cfg.learn_stagger,
-        max_bypass: cfg.max_bypass as f64,
-        max_backfill: cfg.max_backfill as f64,
-        cpu_min_duration: cfg.cpu_min_duration,
-        pressure_max: cfg.pressure_max,
-        noise_mem_pct: cfg.noise_mem,
-        noise_cpu: cfg.noise_cpu,
-        outside_admit: cfg.outside_admit,
-        outside_mem_max_pct: cfg.pause_at,
-    };
+    let limits_of = crate::commands::limits;
     let mut limits = limits_of(&cfg);
     // A limit changed in the dashboard's Config view reaches jobs that
     // already wait: they read the user config again when it changes.
@@ -489,6 +477,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     if !me.known && !queue::short(&limits, &me) {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
+                    // A partial fit books the cores it got; it follows what it
+                    // uses from there.
+                    if let Decision::Admit { booked_cpu: Some(b), .. } = decision {
+                        me.need_cpu = b;
+                    }
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);
                     me.start_need_mem_kb = Some(me.need_mem_kb);
@@ -524,7 +517,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 main_blocker = Some(n.clone());
             }
             match &decision {
-                Decision::Admit { reason, early } => {
+                Decision::Admit { reason, early, .. } => {
                     admit_reason = reason.clone();
                     if let Some(why) = early {
                         say(&format!("warning {} - started before it fully fits: {why}", me.key));

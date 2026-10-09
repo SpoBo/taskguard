@@ -26,6 +26,9 @@ pub struct MachineSample {
     /// Readings of the last `PEAK_WINDOW` seconds, oldest first: the time,
     /// the memory in use, and how much of it taskguard's own jobs held.
     pub recent_mem: Vec<(f64, u64, u64)>,
+    /// Readings of the last `LOW_WINDOW` seconds, oldest first: the time and
+    /// the busy cores (smoothed). Older versions leave it out.
+    pub recent_cpu: Vec<(f64, f64)>,
     pub(crate) ticks_busy: u64,
     pub(crate) ticks_total: u64,
 }
@@ -48,6 +51,19 @@ impl MachineSample {
     pub fn mem_for_admission(&self, ours_now_kb: u64) -> u64 {
         let others_peak = self.recent_mem.iter().map(|(_, used, ours)| used.saturating_sub(*ours)).max().unwrap_or(0);
         (others_peak + ours_now_kb).max(self.mem_used_kb)
+    }
+
+    /// The fewest busy cores of the last `LOW_WINDOW` seconds, this reading
+    /// included. A reading written by an older version has no history: then
+    /// the low is the reading itself.
+    pub fn cpu_low(&self) -> f64 {
+        self.recent_cpu.iter().filter(|(ts, _)| self.ts - ts < LOW_WINDOW).map(|(_, b)| *b).fold(self.cpu_busy, f64::min)
+    }
+
+    /// Is the machine about as quiet as it has been lately? Within one core,
+    /// or a tenth of the cores on a big machine, of its recent low.
+    pub fn near_cpu_low(&self) -> bool {
+        self.cpu_busy <= self.cpu_low() + (0.1 * self.ncpu as f64).max(1.0)
     }
 
     pub fn mem_pct(&self) -> f64 {
@@ -107,6 +123,9 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
         }
         None => inst,
     };
+    let mut recent_cpu: Vec<(f64, f64)> = prev.map(|p| p.recent_cpu.clone()).unwrap_or_default();
+    recent_cpu.retain(|(ts, _)| now - ts < LOW_WINDOW);
+    recent_cpu.push((now, cpu_busy));
     MachineSample {
         ts: now,
         cpu_busy,
@@ -121,6 +140,7 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
             Err(_) => sys::mem_pressure_pct(),
         },
         recent_mem,
+        recent_cpu,
         ticks_busy: t.busy,
         ticks_total: t.total,
     }
@@ -128,6 +148,10 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
 
 /// Seconds of memory readings the admission check takes the highest of.
 pub const PEAK_WINDOW: f64 = 10.0;
+
+/// Seconds of CPU readings a job that cannot fully fit looks back over, to
+/// start when the machine is about as quiet as it gets (`cpu_low`).
+pub const LOW_WINDOW: f64 = 120.0;
 
 /// The cached reading if it is fresh, otherwise a new one. Call with the queue
 /// lock held, so only one process refreshes at a time.
@@ -141,4 +165,37 @@ pub fn current(dir: &Path, max_age: f64, ours_kb: u64) -> MachineSample {
     let s = measure(cached.as_ref(), ours_kb);
     write_cache(dir, &s);
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reading_from_an_older_version_reads_and_is_its_own_low() {
+        let old =
+            r#"{"ts":100.0,"cpu_busy":6.0,"cpu_inst":6.0,"ncpu":10,"mem_used_kb":1,"mem_total_kb":2,"mem_pressure":null,"recent_mem":[]}"#;
+        let m: MachineSample = serde_json::from_str(old).unwrap();
+        assert!(m.recent_cpu.is_empty());
+        assert_eq!(m.cpu_low(), 6.0);
+        assert!(m.near_cpu_low());
+    }
+
+    #[test]
+    fn the_low_is_the_quietest_reading_of_the_window() {
+        let m = MachineSample {
+            ts: 1000.0,
+            cpu_busy: 9.0,
+            ncpu: 10,
+            // The 1-core reading is older than the window.
+            recent_cpu: vec![(850.0, 1.0), (900.0, 4.0), (950.0, 7.5), (1000.0, 9.0)],
+            ..Default::default()
+        };
+        assert_eq!(m.cpu_low(), 4.0);
+        assert!(!m.near_cpu_low(), "9 busy is far above the low of 4");
+        let quiet = MachineSample { cpu_busy: 4.8, ..m.clone() };
+        assert!(quiet.near_cpu_low(), "within one core of the low");
+        let big = MachineSample { ncpu: 64, cpu_busy: 10.0, ..m };
+        assert!(big.near_cpu_low(), "within a tenth of 64 cores of the low");
+    }
 }

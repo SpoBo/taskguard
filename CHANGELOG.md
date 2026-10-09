@@ -10,6 +10,25 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- Partial fit: a job that cannot fit now, because its CPU need is above the
+  whole limit or because it has waited past `max_bypass`, starts on part of
+  its CPU need. It needs at least `partial_fit` (0.5) of its need free, and
+  the machine near its lowest CPU use of the last two minutes, so it starts
+  at a quiet moment. It then books the cores it got, not its whole need, so
+  other jobs keep moving. Memory stays a hard rule. `partial_fit = 0` turns
+  it off. Set it per machine in `~/.config/taskguard/config.toml`.
+
+### Changed
+
+- Backfill is on by default: `max_backfill` is 600 (10 minutes) instead of
+  0. Small jobs that fit pass a reserved job that cannot start yet. After 10
+  minutes only jobs that end before the reserved job could start still pass,
+  so the machine drains for it, and it starts at the latest once no other job
+  runs, also when its need is above the whole limit. Set `max_backfill = 0`
+  for the old behavior.
+
 ### Fixed
 
 - The CPU need is learned from the cores a job used, not from the time its

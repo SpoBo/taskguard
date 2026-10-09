@@ -590,6 +590,7 @@ mod tests {
             noise_cpu: 0.0,
             outside_admit: false,
             outside_mem_max_pct: 95.0,
+            partial_fit: 0.0,
         };
         let mut m = MachineSample::fixed(10.0, 10, 23 * GB, 32 * GB);
         m.mem_pressure = Some(50.0);
@@ -616,6 +617,7 @@ mod tests {
             noise_cpu: 0.0,
             outside_admit: false,
             outside_mem_max_pct: 95.0,
+            partial_fit: 0.0,
         };
         let m = MachineSample::fixed(7.4, 12, 23 * GB, 32 * GB);
         let api = Entry {

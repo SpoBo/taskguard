@@ -539,6 +539,10 @@ pub struct Limits {
     /// memory would stay under `outside_mem_max_pct` of RAM.
     pub outside_admit: bool,
     pub outside_mem_max_pct: f64,
+    /// A job that cannot fit now (its CPU need is above the whole limit, or
+    /// it has waited past `max_bypass`) starts on this share of its CPU need,
+    /// when the machine is near its recent low. 0 turns it off.
+    pub partial_fit: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -632,6 +636,10 @@ pub enum Decision {
         /// lacks, and the rule that lets it start anyway.
         #[serde(skip_serializing_if = "Option::is_none")]
         early: Option<String>,
+        /// Set when the job starts on part of its CPU need (`partial_fit`):
+        /// the cores it books instead of its whole need.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        booked_cpu: Option<f64>,
     },
     Wait {
         blockers: Vec<Blocker>,
@@ -708,8 +716,12 @@ pub fn decide(
     // it keeps out would otherwise hold up the whole queue until it is stopped.
     if running.iter().all(Entry::steady) {
         return match older.first() {
-            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into(), early: None },
-            None => Decision::Admit { reason: "nothing else is running but long-lived jobs past their start-up".into(), early: None },
+            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into(), early: None, booked_cpu: None },
+            None => Decision::Admit {
+                reason: "nothing else is running but long-lived jobs past their start-up".into(),
+                early: None,
+                booked_cpu: None,
+            },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
         };
     }
@@ -723,11 +735,21 @@ pub fn decide(
     // `max_backfill` only jobs that should end before it could start anyway
     // still do. They take no room it could use, and a stream of them cannot
     // keep it out: it starts once the running jobs have made room for it, or
-    // when none runs, which they do not put off.
+    // when none runs, which they do not put off. A job that may start on part
+    // of its need (`partial_fit`) waits only for that part.
     let holds = |w: &Entry| {
-        let (theirs, _) = room.left(m, lim, running, w, now, unknown_starts);
-        theirs.is_empty()
-            || now - w.queued_at > lim.max_backfill && !me.est_dur_s.zip(soonest_start(&theirs, running, now)).is_some_and(|(d, t)| d <= t)
+        let (mut theirs, _) = room.left(m, lim, running, w, now, unknown_starts);
+        if theirs.is_empty() {
+            return true;
+        }
+        if partial_fit_due(lim, w, now, room.cpu_limit) {
+            for b in &mut theirs {
+                if let Blocker::Cpu { short, need, .. } = b {
+                    *short = (*short - (1.0 - lim.partial_fit) * *need).max(0.0);
+                }
+            }
+        }
+        now - w.queued_at > lim.max_backfill && !me.est_dur_s.zip(soonest_start(&theirs, running, now)).is_some_and(|(d, t)| d <= t)
     };
     // An older job that newer ones have passed for `max_bypass` goes first.
     // Only a job ahead in line holds `me` back, so a job of an older run is
@@ -771,7 +793,8 @@ pub fn decide(
             pct(mem_would, m.mem_total_kb as f64),
             lim.mem_max_pct
         );
-        Decision::Admit { reason, early }
+        let (early, booked_cpu) = early.unzip();
+        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten() }
     } else {
         Decision::Wait { blockers }
     }
@@ -1002,8 +1025,9 @@ impl Room {
 
     /// What keeps `job` from starting, after the leeway: a job that falls
     /// short only by a little, or only because of programs outside taskguard,
-    /// starts anyway. Then the second value says what it lacks and why it
-    /// starts, for the job's warning line.
+    /// or that cannot fit now and gets its `partial_fit`, starts anyway. Then
+    /// the second value says what it lacks and why it starts, for the job's
+    /// warning line, and for a partial fit the cores it books.
     fn left(
         &self,
         m: &MachineSample,
@@ -1012,9 +1036,9 @@ impl Room {
         job: &Entry,
         now: f64,
         unknown_starts: &[f64],
-    ) -> (Vec<Blocker>, Option<String>) {
+    ) -> (Vec<Blocker>, Option<(String, Option<f64>)>) {
         let blockers = self.blockers(m, lim, running, job, now, unknown_starts);
-        match self.early(m, lim, job, &blockers) {
+        match self.early(m, lim, job, &blockers, now) {
             Some(why) => (Vec::new(), Some(why)),
             None => (blockers, None),
         }
@@ -1029,13 +1053,21 @@ impl Room {
     /// hard rule above `outside_mem_max_pct`, as there the machine swaps.
     /// A shortfall is measured with every job started before counted in, so
     /// a run of such starts cannot pile up: the next one falls short by more.
-    fn early(&self, m: &MachineSample, lim: &Limits, job: &Entry, blockers: &[Blocker]) -> Option<String> {
+    ///
+    /// A job that cannot fit now (`partial_fit_due`) and lacks CPU may also
+    /// start on part of its need, `partial_fit` of it at least, when the
+    /// machine is near its recent low: too little CPU only makes a job
+    /// slower, and a quiet moment gives it the best chance to finish well.
+    /// It then books the cores that were free, not its whole need, so it
+    /// does not hold every other job out while it runs.
+    fn early(&self, m: &MachineSample, lim: &Limits, job: &Entry, blockers: &[Blocker], now: f64) -> Option<(String, Option<f64>)> {
         if blockers.is_empty() || !blockers.iter().all(|b| matches!(b, Blocker::Memory { .. } | Blocker::Cpu { .. })) {
             return None;
         }
         let total = m.mem_total_kb as f64;
         let gb = |kb: f64| kb / (1024.0 * 1024.0);
         let mut why = Vec::new();
+        let mut booked = None;
         for b in blockers {
             match *b {
                 Blocker::Memory { short_kb, .. } => {
@@ -1070,6 +1102,18 @@ impl Room {
                         why.push(format!(
                             "CPU short by {short:.1} cores, but only because programs outside taskguard keep cores busy (outside_admit)"
                         ));
+                    } else if partial_fit_due(lim, job, now, self.cpu_limit)
+                        && job.need_cpu - short >= lim.partial_fit * job.need_cpu - 1e-9
+                        && m.near_cpu_low()
+                    {
+                        let free = job.need_cpu - short;
+                        booked = Some(free);
+                        why.push(format!(
+                            "CPU short by {short:.1} cores; it gets {free:.1} of the {:.1} it needs, at least partial_fit {:.0}%, with the machine near its recent low of {:.1} busy cores",
+                            job.need_cpu,
+                            lim.partial_fit * 100.0,
+                            m.cpu_low()
+                        ));
                     } else {
                         return None;
                     }
@@ -1077,7 +1121,7 @@ impl Room {
                 _ => return None,
             }
         }
-        Some(why.join("; "))
+        Some((why.join("; "), booked))
     }
 
     /// What keeps `job` itself from starting now, apart from the jobs ahead
@@ -1166,6 +1210,14 @@ impl Room {
     }
 }
 
+/// May `job` start on part of its CPU need? Only when partial fit is on, the
+/// job is not short (short jobs skip the CPU reading anyway), and it cannot
+/// fit now: its need is above the whole CPU limit, so it never fits, or it
+/// has waited past `max_bypass`, so it is the job others are held for.
+pub fn partial_fit_due(lim: &Limits, job: &Entry, now: f64, cpu_limit: f64) -> bool {
+    lim.partial_fit > 0.0 && !short(lim, job) && (job.need_cpu > cpu_limit + 1e-9 || now - job.queued_at > lim.max_bypass)
+}
+
 /// A job that usually ends within a few seconds is over before the CPU
 /// reading could react to it, so holding it back only makes it late. Too
 /// little CPU only slows a job down; memory stays a hard rule for all.
@@ -1194,6 +1246,7 @@ mod tests {
         noise_cpu: 0.0,
         outside_admit: false,
         outside_mem_max_pct: 95.0,
+        partial_fit: 0.0,
     };
 
     /// A running entry exactly as v0.1.2 writes it.
@@ -1369,6 +1422,111 @@ mod tests {
         assert!(early(decide(&cpu(8.0), &lim, run, me_too, &me, 1000.0, &[])).unwrap().contains("keep cores busy"));
         // A job that fits starts as before, with no warning.
         assert_eq!(early(decide(&cpu(1.0), &lim, run, me_too, &me, 1000.0, &[])), None);
+    }
+
+    fn booked(d: &Decision) -> Option<f64> {
+        match d {
+            Decision::Admit { booked_cpu, .. } => *booked_cpu,
+            Decision::Wait { .. } => None,
+        }
+    }
+
+    /// A typecheck that wants 14 cores on a 12-core limit can never fully
+    /// fit. With `partial_fit`, it starts once it can get half of that while
+    /// the machine is about as quiet as it gets, and books what it got.
+    #[test]
+    fn a_job_that_can_never_fully_fit_starts_on_part_of_its_need() {
+        let lim = Limits { partial_fit: 0.5, ..LIM };
+        let mut lint = job(1, "lint", 4.0, 2);
+        lint.started_at = Some(990.0);
+        lint.live_cpu = 4.0;
+        let r = std::slice::from_ref(&lint);
+        let head = job(2, "typecheck", 14.0, 2);
+        let w = std::slice::from_ref(&head);
+        // 12 - 5 busy = 7 cores free: half of 14.
+        let d = decide(&machine(5.0, 4), &lim, r, w, &head, 1010.0, &[]);
+        assert!(early(d.clone()).is_some_and(|e| e.contains("partial_fit")), "{d:?}");
+        assert_eq!(booked(&d), Some(7.0), "it books the room it started on, not 14 cores");
+        // Only 5 free: too little.
+        assert_eq!(blockers(decide(&machine(7.0, 4), &lim, r, w, &head, 1010.0, &[])), vec!["cpu"]);
+        // 7 free, but the machine was at 1 core a minute ago: wait for quiet.
+        let busy = MachineSample { recent_cpu: vec![(-60.0, 1.0)], ..machine(5.0, 4) };
+        assert_eq!(blockers(decide(&busy, &lim, r, w, &head, 1010.0, &[])), vec!["cpu"]);
+        // Memory stays a hard rule.
+        let big = job(2, "typecheck", 14.0, 30);
+        assert_eq!(blockers(decide(&machine(5.0, 4), &lim, r, std::slice::from_ref(&big), &big, 1010.0, &[])), vec!["memory", "cpu"]);
+        // partial_fit = 0 turns it off.
+        assert_eq!(blockers(decide(&machine(5.0, 4), &LIM, r, w, &head, 1010.0, &[])), vec!["cpu"]);
+    }
+
+    #[test]
+    fn a_job_that_fits_later_gets_a_partial_fit_only_once_it_waited_max_bypass() {
+        let lim = Limits { partial_fit: 0.5, ..LIM };
+        let mut lint = job(1, "lint", 6.0, 2);
+        lint.started_at = Some(990.0);
+        lint.live_cpu = 6.0;
+        let r = std::slice::from_ref(&lint);
+        let head = job(2, "typecheck", 8.0, 2);
+        let w = std::slice::from_ref(&head);
+        // 12 - 6 = 6 free of 8: it fits once the lint ends, so it waits.
+        assert_eq!(blockers(decide(&machine(6.0, 4), &lim, r, w, &head, 1050.0, &[])), vec!["cpu"]);
+        // Past max_bypass (120 s) it takes the 6 cores it can get.
+        let d = decide(&machine(6.0, 4), &lim, r, w, &head, 1121.0, &[]);
+        assert_eq!(booked(&d), Some(6.0), "{d:?}");
+    }
+
+    /// A job whose CPU need is above the whole limit never "could start":
+    /// no running job frees enough. Past `max_backfill` only jobs that end
+    /// before the running ones do still pass, and once none runs, it starts.
+    #[test]
+    fn the_drain_ends_with_a_job_bigger_than_the_whole_limit_running() {
+        let lim = Limits { max_backfill: 600.0, ..LIM };
+        let mut lint = job(1, "lint", 4.0, 2);
+        lint.started_at = Some(990.0);
+        lint.live_cpu = 4.0;
+        lint.est_dur_s = Some(1000.0);
+        let mut head = job(2, "typecheck", 14.0, 2);
+        head.bypassed_since = Some(1001.0);
+        let quick = Entry { est_dur_s: Some(30.0), ..job(3, "test-a", 1.0, 1) };
+        let slow = Entry { est_dur_s: Some(600.0), ..job(4, "test-b", 1.0, 1) };
+        let waiting = [head.clone(), quick.clone(), slow.clone()];
+        let r = std::slice::from_ref(&lint);
+        let m = machine(5.0, 4);
+        // Within max_backfill both small jobs pass the head.
+        assert!(blockers(decide(&m, &lim, r, &waiting, &slow, 1300.0, &[])).is_empty());
+        // Past it, the lint has 290 s left: the 30 s job still passes, the
+        // 600 s one waits for the head.
+        assert!(blockers(decide(&m, &lim, r, &waiting, &quick, 1700.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &slow, 1700.0, &[])), vec!["reserved"]);
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &head, 1700.0, &[])), vec!["cpu"]);
+        // The lint ends: the head starts, though it needs more than the limit.
+        assert!(blockers(decide(&m, &lim, &[], &waiting, &head, 2000.0, &[])).is_empty());
+    }
+
+    /// With partial fit, the head can start once half its need is free, so
+    /// past `max_backfill` a newer job only passes when it ends before that.
+    #[test]
+    fn past_max_backfill_the_drain_counts_on_the_partial_fit() {
+        let lim = Limits { max_backfill: 600.0, partial_fit: 0.5, ..LIM };
+        let mut lint = Entry { est_dur_s: Some(1000.0), ..job(1, "lint", 4.0, 2) };
+        lint.started_at = Some(990.0);
+        lint.live_cpu = 4.0;
+        let mut long = Entry { est_dur_s: Some(5000.0), ..job(5, "e2e", 4.0, 2) };
+        long.started_at = Some(990.0);
+        long.live_cpu = 4.0;
+        let mut head = job(2, "typecheck", 14.0, 2);
+        head.bypassed_since = Some(1001.0);
+        let slow = Entry { est_dur_s: Some(600.0), ..job(4, "test-b", 1.0, 1) };
+        let waiting = [head.clone(), slow.clone()];
+        let r = [lint, long];
+        // 9 busy: 3 free of the 7 the head needs to start. Once the lint ends
+        // (290 s) it has 7: the 600 s job would still run then, so it waits,
+        // though the e2e job runs for over an hour.
+        let m = machine(9.0, 4);
+        assert_eq!(blockers(decide(&m, &lim, &r, &waiting, &slow, 1700.0, &[])), vec!["reserved"]);
+        let quick = Entry { est_dur_s: Some(200.0), ..slow.clone() };
+        let waiting = [head, quick.clone()];
+        assert!(blockers(decide(&m, &lim, &r, &waiting, &quick, 1700.0, &[])).is_empty());
     }
 
     #[test]

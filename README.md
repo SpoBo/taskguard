@@ -133,7 +133,17 @@ below).
   Priorities still come first.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
-  has started.
+  has started, except by backfill (below).
+- **Part of its CPU need is enough for a job that cannot fit.** A job whose
+  CPU need is above the whole limit never fits, and a job that waited past
+  `max_bypass` is the one others are held for. Such a job starts on part of
+  its CPU need: at least `partial_fit` (0.5) of it must be free, and the
+  machine must be near its lowest CPU use of the last two minutes (within one
+  core, or a tenth of the cores), so it starts at a quiet moment and has the
+  best chance to finish well. It then books the cores it got, not its whole
+  need, so it does not hold every other job out while it runs; from there it
+  follows what it uses. Memory stays a hard rule. `partial_fit = 0` turns it
+  off; set it per machine in `~/.config/taskguard/config.toml`.
 - **One line, no circles.** Every rule that holds a job back for another
   follows one fixed order: a higher priority, then the older run (a job outside
   any run counts from when it queued), then the older ticket. A job only ever
@@ -147,9 +157,9 @@ below).
   itself reports it waits for, and from then on no job waits for it. It may
   still start by itself. `taskguard status` shows the mark, and what an owner
   says when that differs from what it should do.
-- **Backfill, if you ask for it.** A reservation for a job that does not fit
+- **Backfill.** A reservation for a job that does not fit
   holds room it cannot use: a 29 GB compile that waits for memory keeps a
-  0.2 GB install waiting too. With `max_backfill` set, a reserved job holds
+  0.2 GB install waiting too. So a reserved job holds
   its turn only while it could start: until it has waited `max_backfill`
   seconds, newer jobs that fit start while it cannot, and nothing newer starts
   once it fits. After `max_backfill`, a newer job that fits still starts if
@@ -159,8 +169,12 @@ below).
   first in line starts whatever the readings say). Such a job takes no room
   the reserved one could use, so a steady stream of small jobs cannot keep it
   out, and a lint is not held up for half an hour behind a job that waits for
-  two long test runs. A job with no learned duration waits. Off by default
-  (`0`); `1800` lets every job that fits through for half an hour.
+  two long test runs. A job with no learned duration waits. For a reserved job
+  that may start on part of its need, "could start" means once that part is
+  free. The drain always ends with the reserved job running: at the latest
+  when no other job runs, also when its need is above the whole limit. On by
+  default for 10 minutes (`max_backfill = 600`); `0` turns it off, `1800`
+  lets every job that fits through for half an hour.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. A slot ceiling only stops such jobs from
   running at the same time and breaking each other; CPU and memory are always
@@ -476,6 +490,8 @@ mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
 outlier_ratio = 2      # a peak this many times the next one is an outlier; 0 = off
 outside_admit = true   # start jobs that only other programs keep out
+partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
+max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -605,6 +621,14 @@ queues or until one of them is stopped.
 Tests hold each of these rules. A change that cannot follow them must use a
 new state directory. Versions that use different directories do not see each
 other's jobs. They still see the load of those jobs in the machine readings.
+
+A version that does not know partial fit reads the `machine` file and leaves
+the CPU history in it (`recent_cpu`) out when it writes the file. While its
+recorder runs, newer versions see no recent low and start a partial fit as
+soon as there is room for it. Such a version never starts its own job on part
+of its need; a newer job behind it may then mark it as stalled (see above).
+In 0.7.1 and older `max_backfill` is 0 by default, so such a version keeps
+every reservation unless a settings file sets it.
 
 Versions before 0.2.1 read settings files strictly: they reject a file with a
 setting they do not know. The user config and a repo's `.taskguard.toml` are
