@@ -232,7 +232,8 @@ at once, outside the queue: it is mostly a task runner whose leaves queue.
 
 Publish. On a laptop a background process watches the branch on GitHub for an
 hour, and posts the status when the branch head has exactly the tested files;
-the checkout may be gone by then. In GitHub Actions the job posts at once, on
+the checkout may be gone by then. Any commit with exactly those files gets
+it, so commit first, then run the receipt, then push. In GitHub Actions the job posts at once, on
 the PR head (it needs statuses: write and GH_TOKEN). The description is
 \"f:FINGERPRINT, OS/ARCH, DURATION, HOST\"; the fingerprint is a hash of the
 command line.

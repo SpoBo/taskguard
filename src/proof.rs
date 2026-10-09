@@ -419,7 +419,8 @@ fn spawn_publish(root: &Path, tree: &str) -> Result<String> {
             (o.status.success() && !r.is_empty()).then_some(r)
         })
         .context("no GitHub repo for this checkout (set GH_REPO=OWNER/REPO)")?;
-    let log = std::env::temp_dir().join("taskguard-proof-publish.log");
+    // One log per repo, so the posts of different repos do not mix.
+    let log = std::env::temp_dir().join(format!("taskguard-proof-publish-{}.log", repo.replace('/', "-")));
     let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["proof", "publish", "--tree", tree, "--branch", &branch, "--repo", &repo, "--wait", &PUBLISH_WATCH_S.to_string(), "-q"])
