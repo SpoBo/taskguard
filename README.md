@@ -473,7 +473,10 @@ git commit -am "..." && git push    # the push hook runs `taskguard proof publis
    command passed, red when it failed. The description is
    `LEVEL, OS/ARCH, DURATION, HOST`, a shape that `proof check` reads back. A
    commit of other files gets nothing: you committed something other than
-   what was tested.
+   what was tested. A full receipt wins over a partial one on the same
+   files. `taskguard --receipt ID --publish SECS` publishes in the
+   background: it waits up to SECS for HEAD to hold the tested files and to
+   reach GitHub, for a pipeline that runs the receipt, then pushes.
 3. **Check.** One small CI job runs `taskguard proof check --sha HEAD_SHA
    --github-output` first. Per ID it says `skip` for green proof at a level
    and on an OS that the policy accepts, and `run` for anything else: no

@@ -45,6 +45,8 @@ pub struct Opts {
     pub receipt: Option<String>,
     /// --partial REASON: the receipt covers a chosen subset.
     pub partial: Option<String>,
+    /// --publish SECS: with --receipt, publish in the background after the push.
+    pub publish: Option<u64>,
     pub cmd: Vec<String>,
 }
 

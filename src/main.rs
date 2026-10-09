@@ -135,6 +135,10 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--wait" => o.wait = true,
             "--receipt" => o.receipt = Some(take_value(args, &mut i, name)?),
             "--partial" => o.partial = Some(take_value(args, &mut i, name)?),
+            "--publish" => {
+                let v = take_value(args, &mut i, name)?;
+                o.publish = Some(v.parse().map_err(|_| anyhow::anyhow!("--publish needs a number of seconds"))?);
+            }
             "-h" | "--help" => o.help = true,
             _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{}", usage()),
             _ => break,
@@ -209,10 +213,10 @@ fn dispatch(args: &[String]) -> Result<i32> {
         if o.jobs.is_some() || o.id.is_some() || o.bg || o.wait {
             bail!("--receipt runs the command outside the queue; put taskguard inside the command for that");
         }
-        return proof::run_receipt(id, o.partial.as_deref(), &o.cmd);
+        return proof::run_receipt(id, o.partial.as_deref(), o.publish, &o.cmd);
     }
-    if o.partial.is_some() {
-        bail!("--partial goes with --receipt ID");
+    if o.partial.is_some() || o.publish.is_some() {
+        bail!("--partial and --publish go with --receipt ID");
     }
     if o.wait && o.cmd.is_empty() {
         return runner::wait_pool(o.id.as_deref());

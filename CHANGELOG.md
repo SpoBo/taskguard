@@ -20,6 +20,7 @@ and the versions follow [semver](https://semver.org).
   `proof show`, `proof log`, `proof install` and `proof uninstall` read
   receipts back, rank commits on main by how well they were proven, and set a
   repo up (policy, push hook, and a printed ruleset and CI checklist).
+  `--receipt ID --publish SECS` publishes in the background after the push.
 
 ## [0.7.1] - 2026-10-07
 

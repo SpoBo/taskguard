@@ -321,8 +321,11 @@ pub fn receipts_for(db: &Db, trees: &[String]) -> Result<Vec<Receipt>> {
     Ok(out)
 }
 
-/// The newest receipt per id.
-fn newest_per_id(rs: Vec<Receipt>) -> Vec<Receipt> {
+/// One receipt per id: the strongest level, then the newest. A partial run
+/// on the same files does not hide a full one; a newer full run, green or
+/// red, does replace an older one.
+fn strongest_per_id(mut rs: Vec<Receipt>) -> Vec<Receipt> {
+    rs.sort_by_key(|r| r.level != "full");
     let mut seen = std::collections::HashSet::new();
     rs.into_iter().filter(|r| seen.insert(r.receipt.clone())).collect()
 }
@@ -345,7 +348,7 @@ fn mark_posted(db: &Db, row: i64, sha: &str) -> Result<()> {
 /// (the policy command when none is given) and, when the files did not change
 /// while it ran, keep a receipt of the result. The command runs straight away,
 /// outside the queue: it is mostly a task runner whose own leaves queue.
-pub fn run_receipt(id: &str, partial: Option<&str>, cmd: &[String]) -> Result<i32> {
+pub fn run_receipt(id: &str, partial: Option<&str>, publish: Option<u64>, cmd: &[String]) -> Result<i32> {
     let cwd = std::env::current_dir().context("reading the current directory")?;
     let root = toplevel(&cwd)?;
     let policy = Policy::load(&root)?;
@@ -403,8 +406,15 @@ pub fn run_receipt(id: &str, partial: Option<&str>, cmd: &[String]) -> Result<i3
     };
     let db = Db::open_dir(&config::state_dir())?;
     insert(&db, &r)?;
+    let next = match publish {
+        Some(secs) => {
+            let log = spawn_publish(&root, secs)?;
+            format!("It is posted once HEAD has these files and is on GitHub, for {} (log: {}).", dur(secs as f64), log.display())
+        }
+        None => "After you push, `taskguard proof publish` posts it.".into(),
+    };
     crate::report::say(&format!(
-        "receipt {id}: {} {} on tree {} ({}). After you push, `taskguard proof publish` posts it.",
+        "receipt {id}: {} {} on tree {} ({}). {next}",
         r.level,
         if r.ok { "passed" } else { "failed" },
         short(&r.tree),
@@ -601,54 +611,107 @@ fn root_here() -> Result<PathBuf> {
 }
 
 /// `proof publish [--sha SHA]... [--wait SECS] [--again]`
+///
+/// Without --sha it follows HEAD for up to --wait seconds: it posts as soon as
+/// HEAD has a receipt and is on GitHub. That fits a pipeline that runs the
+/// receipt, then may add commits, then pushes from the same checkout.
 fn publish(rest: &[String]) -> Result<i32> {
     let a = parse(rest, &["--sha", "--wait"], &["--again", "-q", "--quiet"])?;
     let quiet = a.has("-q") || a.has("--quiet");
+    let again = a.has("--again");
     let root = root_here()?;
     let policy = Policy::load(&root)?;
-    let head = commit_of(&root, "HEAD")?;
-    let shas = match a.all("--sha") {
-        v if v.is_empty() => vec![head.clone()],
-        v => v.iter().map(|s| commit_of(&root, s)).collect::<Result<_>>()?,
-    };
     let wait = a.secs("--wait")?;
     let db = Db::open_dir(&config::state_dir())?;
-    for sha in shas {
-        let mut trees = vec![tree_of(&root, &sha)?];
-        // CI checks out a merge of the PR head onto its base: what passed there
-        // passed on the head merged with the newest base, which counts for the head.
-        let parents = git(&root, &["rev-parse", "HEAD^@"]).unwrap_or_default();
-        if sha != head && parents.lines().count() >= 2 && parents.lines().any(|p| p == sha) {
-            trees.push(tree_of(&root, "HEAD")?);
+    let t0 = Instant::now();
+    let explicit = a.all("--sha");
+    if explicit.is_empty() {
+        loop {
+            let head = commit_of(&root, "HEAD")?;
+            let rs = unposted(&db, &policy, &root, &head, again)?;
+            let ready = !rs.is_empty() && on_github(&root, &head);
+            if ready {
+                post_all(&db, &root, &head, rs, quiet)?;
+                return Ok(0);
+            }
+            if t0.elapsed().as_secs() >= wait {
+                if rs.is_empty() {
+                    if !quiet {
+                        println!("{}: nothing to publish: no new receipt for its files", short(&head));
+                    }
+                    return Ok(0);
+                }
+                bail!("commit {} is not on GitHub yet; push it first, or give --wait SECS", short(&head));
+            }
+            std::thread::sleep(Duration::from_secs(5));
         }
-        let rs: Vec<Receipt> = newest_per_id(receipts_for(&db, &trees)?)
-            .into_iter()
-            .filter(|r| policy.receipt.contains_key(&r.receipt))
-            .filter(|r| a.has("--again") || !posted_to(&db, r.row, &sha))
-            .collect();
+    }
+    for s in explicit {
+        let sha = commit_of(&root, &s)?;
+        let rs = unposted(&db, &policy, &root, &sha, again)?;
         if rs.is_empty() {
             if !quiet {
                 println!("{}: nothing to publish: no new receipt for its files", short(&sha));
             }
             continue;
         }
-        let t0 = Instant::now();
         while !on_github(&root, &sha) {
             if t0.elapsed().as_secs() >= wait {
                 bail!("commit {} is not on GitHub yet; push it first, or give --wait SECS", short(&sha));
             }
             std::thread::sleep(Duration::from_secs(3));
         }
-        for r in rs {
-            let desc = r.description();
-            post_status(&root, &sha, &r.receipt, r.state(), &desc)?;
-            mark_posted(&db, r.row, &sha)?;
-            if !quiet {
-                println!("{}: posted {CONTEXT}{} {}: {desc}", short(&sha), r.receipt, r.state());
-            }
-        }
+        post_all(&db, &root, &sha, rs, quiet)?;
     }
     Ok(0)
+}
+
+/// The receipts for the files of `sha` that are not posted on it yet.
+fn unposted(db: &Db, policy: &Policy, root: &Path, sha: &str, again: bool) -> Result<Vec<Receipt>> {
+    let mut trees = vec![tree_of(root, sha)?];
+    // CI checks out a merge of the PR head onto its base: what passed there
+    // passed on the head merged with the newest base, which counts for the head.
+    let head = commit_of(root, "HEAD")?;
+    let parents = git(root, &["rev-parse", "HEAD^@"]).unwrap_or_default();
+    if sha != head && parents.lines().count() >= 2 && parents.lines().any(|p| p == sha) {
+        trees.push(tree_of(root, "HEAD")?);
+    }
+    Ok(strongest_per_id(receipts_for(db, &trees)?)
+        .into_iter()
+        .filter(|r| policy.receipt.contains_key(&r.receipt))
+        .filter(|r| again || !posted_to(db, r.row, sha))
+        .collect())
+}
+
+fn post_all(db: &Db, root: &Path, sha: &str, rs: Vec<Receipt>, quiet: bool) -> Result<()> {
+    for r in rs {
+        let desc = r.description();
+        post_status(root, sha, &r.receipt, r.state(), &desc)?;
+        mark_posted(db, r.row, sha)?;
+        if !quiet {
+            println!("{}: posted {CONTEXT}{} {}: {desc}", short(sha), r.receipt, r.state());
+        }
+    }
+    Ok(())
+}
+
+/// `--receipt ID --publish SECS`: publish in the background once HEAD reaches
+/// GitHub, for up to SECS. The output goes to a log in the temp folder.
+fn spawn_publish(root: &Path, secs: u64) -> Result<PathBuf> {
+    use std::os::unix::process::CommandExt;
+    let log = std::env::temp_dir().join("taskguard-proof-publish.log");
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.args(["proof", "publish", "--wait", &secs.to_string()]).current_dir(root).stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().context("starting the background publish")?;
+    Ok(log)
 }
 
 /// What CI does for one receipt id, given the newest status on the commit.
@@ -679,10 +742,23 @@ pub fn decide(id: &str, rule: &Rule, status: Option<&Status>, labels: &[String])
 fn check(rest: &[String]) -> Result<i32> {
     let a = parse(rest, &["--sha", "--labels", "--wait"], &["--github-output"])?;
     let root = root_here()?;
-    let policy = Policy::load(&root)?;
+    // With --github-output a missing policy or id is not an error: it means
+    // nothing is proven, so CI runs. A branch made before the policy has none.
+    let policy = match Policy::load(&root) {
+        Err(e) if a.has("--github-output") => {
+            eprintln!("taskguard: {e:#}; so CI runs");
+            Policy::default()
+        }
+        p => p?,
+    };
     let ids: Vec<String> = if a.pos.is_empty() { policy.receipt.keys().cloned().collect() } else { a.pos.clone() };
     for id in &ids {
-        policy.rule(id)?;
+        if let Err(e) = policy.rule(id) {
+            if !a.has("--github-output") {
+                return Err(e);
+            }
+            eprintln!("taskguard: {e:#}; so CI runs {id}");
+        }
     }
     let sha = match a.one("--sha") {
         Some(s) if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) => s.to_string(),
@@ -705,11 +781,14 @@ fn check(rest: &[String]) -> Result<i32> {
         let d: Vec<(String, bool, String)> = ids
             .iter()
             .map(|id| {
-                let (skip, why) = decide(id, &policy.receipt[id], got.get(id), &labels);
+                let (skip, why) = match policy.receipt.get(id) {
+                    Some(rule) => decide(id, rule, got.get(id), &labels),
+                    None => (false, format!("no receipt id {id} in {POLICY}")),
+                };
                 (id.clone(), skip, why)
             })
             .collect();
-        let missing = ids.iter().any(|id| !got.contains_key(id));
+        let missing = ids.iter().any(|id| policy.receipt.contains_key(id) && !got.contains_key(id));
         if !missing || t0.elapsed().as_secs() >= wait {
             break d;
         }
@@ -859,9 +938,11 @@ fn log(rest: &[String]) -> Result<i32> {
         let (mut got, mut same, mut pr) = (own, true, String::new());
         if !ids.iter().any(|id| got.contains_key(id)) {
             // A squash merge: the proof sits on the PR head.
-            let pulls =
-                gh_api(&root, &[&format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls"), "--jq", ".[0] // empty | \"\\(.number) \\(.head.sha)\""])
-                    .unwrap_or_default();
+            let pulls = gh_api(
+                &root,
+                &[&format!("repos/{{owner}}/{{repo}}/commits/{sha}/pulls"), "--jq", ".[0] // empty | \"\\(.number) \\(.head.sha)\""],
+            )
+            .unwrap_or_default();
             if let Some((num, head)) = pulls.trim().split_once(' ') {
                 pr = format!("#{num}");
                 let head_tree = tree_of(&root, head)
@@ -1213,6 +1294,33 @@ mod tests {
         assert!(decide("unit", &r, Some(&status("success", "full, linux/x86_64, 9m, ci")), &[]).0);
         r.levels = vec!["full".into(), "partial".into()];
         assert!(decide("unit", &r, Some(&status("success", "partial, linux/x86_64, 1m, box: api only")), &[]).0);
+    }
+
+    #[test]
+    fn a_partial_receipt_does_not_hide_a_full_one() {
+        let mk = |row: i64, level: &str, ok: bool| Receipt {
+            row,
+            receipt: "unit".into(),
+            tree: "t".into(),
+            head: None,
+            repo: None,
+            level: level.into(),
+            reason: None,
+            ok,
+            exit: Some(0),
+            cmd: "x".into(),
+            host: "h".into(),
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            version: "v".into(),
+            started_at: row as f64,
+            duration_s: 1.0,
+        };
+        // Newest first, as receipts_for gives them.
+        let got = strongest_per_id(vec![mk(3, "partial", true), mk(2, "full", true), mk(1, "full", false)]);
+        assert_eq!(got.iter().map(|r| r.row).collect::<Vec<_>>(), [2]);
+        let got = strongest_per_id(vec![mk(3, "full", false), mk(2, "full", true)]);
+        assert_eq!(got[0].row, 3, "a newer full run counts, red too");
     }
 
     #[test]

@@ -652,3 +652,39 @@ fn check_skips_on_green_full_proof_and_runs_otherwise() {
     assert_eq!(o.status.code(), Some(0));
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "unit=run\n", "the label forces CI");
 }
+
+#[test]
+fn publish_follows_head_until_a_commit_has_the_receipt_files() {
+    let p = Proof::new("true");
+    std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
+    // --publish starts the background publish; HEAD has other files for now.
+    let o = p.tg(&["--receipt", "unit", "--publish", "30"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!p.gh_calls().contains("POST"));
+    p.git(&["commit", "-qam", "second"]);
+    let head = p.git(&["rev-parse", "HEAD"]);
+    let t0 = Instant::now();
+    while !p.gh_calls().contains(&format!("statuses/{head}")) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "no post: {}", p.gh_calls());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn check_with_github_output_runs_ids_it_does_not_know() {
+    let p = Proof::new("true");
+    let head = p.git(&["rev-parse", "HEAD"]);
+    let out = p.e.cwd.parent().unwrap().join("gh_output");
+    let o = p
+        .e
+        .cmd(&["proof", "check", "e2e", "--sha", &head, "--github-output"])
+        .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
+        .env("GITHUB_OUTPUT", &out)
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "e2e=run\n");
+    // Without --github-output it is an error.
+    assert_eq!(p.tg(&["proof", "check", "e2e", "--sha", &head]).status.code(), Some(2));
+}

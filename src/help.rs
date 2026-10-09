@@ -21,6 +21,8 @@ options (sem style; the default is to run in the foreground):
   --receipt ID            run for a proof receipt (taskguard help proof); no
                           COMMAND runs the policy command of ID
   --partial REASON        with --receipt: a chosen subset, and why it is enough
+  --publish SECS          with --receipt: publish in the background once HEAD has
+                          these files and is on GitHub, for up to SECS
 ";
 
 const RUN: &str = "\
@@ -187,7 +189,7 @@ $TSC_QUEUE_DIR/history.tsv) into taskguard's history, once.
 ";
 
 const PROOF: &str = "\
-taskguard --receipt ID [--partial REASON] [-- COMMAND]
+taskguard --receipt ID [--partial REASON] [--publish SECS] [-- COMMAND]
 taskguard proof publish [--sha SHA]... [--wait SECS] [--again] [-q]
 taskguard proof show [--history]
 taskguard proof check [ID...] [--sha SHA] [--labels L,L] [--wait SECS] [--github-output]
@@ -213,7 +215,8 @@ Proof receipts: publish what passed on this machine as GitHub commit statuses
    ID: skip (green, at a level and on an OS the policy accepts) or run (no
    proof, red, another level or OS, a taskguard:ci or taskguard:ci:ID label).
    It cannot read the statuses: run. Exit 0 when all skip; with
-   --github-output it writes ID=skip|run to $GITHUB_OUTPUT and exits 0.
+   --github-output it writes ID=skip|run to $GITHUB_OUTPUT and exits 0, and
+   a missing policy or ID means run, not an error.
 
 The policy, .taskguard/proof.toml:
 
@@ -229,8 +232,11 @@ the lockfile, and let the task runner build dist and generated code.
 
 commands:
   publish         post receipts for HEAD (or each --sha). --wait SECS waits
-                  for the commit to reach GitHub. CI checks out a merge of the
-                  PR head: --sha HEAD_SHA posts its receipts on the PR head.
+                  for the commit to reach GitHub; without --sha it follows
+                  HEAD meanwhile, so later commits and the push may come
+                  after it starts. A full receipt wins over a partial one on
+                  the same files. CI checks out a merge of the PR head:
+                  --sha HEAD_SHA posts its receipts on the PR head.
   show            this checkout: local receipts and the statuses on HEAD
   check           CI: skip or run per ID. --wait SECS waits for statuses that
                   are missing, for a push whose proof is still on its way.
