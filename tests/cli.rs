@@ -676,13 +676,12 @@ fn check_with_github_output_runs_ids_it_does_not_know() {
     let p = Proof::new("true");
     let head = p.git(&["rev-parse", "HEAD"]);
     let out = p.e.cwd.parent().unwrap().join("gh_output");
-    let o = p
-        .e
-        .cmd(&["proof", "check", "e2e", "--sha", &head, "--github-output"])
-        .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
-        .env("GITHUB_OUTPUT", &out)
-        .output()
-        .unwrap();
+    let o =
+        p.e.cmd(&["proof", "check", "e2e", "--sha", &head, "--github-output"])
+            .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
+            .env("GITHUB_OUTPUT", &out)
+            .output()
+            .unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "e2e=run\n");
     // Without --github-output it is an error.
