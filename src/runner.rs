@@ -41,6 +41,10 @@ pub struct Opts {
     pub wait: bool,
     /// Higher goes first; the default comes from the config, else 0.
     pub priority: Option<i32>,
+    /// --receipt ID: run the command for a proof receipt (see `proof.rs`).
+    pub receipt: Option<String>,
+    /// --partial REASON: the receipt covers a chosen subset.
+    pub partial: Option<String>,
     pub cmd: Vec<String>,
 }
 

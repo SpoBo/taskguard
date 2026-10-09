@@ -13,6 +13,7 @@ mod insight;
 mod key;
 mod machine;
 mod matcher;
+mod proof;
 mod queue;
 mod recorder;
 mod report;
@@ -40,6 +41,10 @@ usage:
                                                drop runs from the history, or put them back (a dry run without --apply)
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
+  taskguard --receipt ID [--partial WHY] [-- COMMAND]
+                                               run a command for a proof receipt that CI can skip on
+  taskguard proof publish|show|check|log|install|uninstall
+                                               publish receipts as commit statuses, and read them back
   taskguard run [options] -- COMMAND           the same as the first form, for a command named like a subcommand
   taskguard help COMMAND                       more about one command; COMMAND --help shows the same
   taskguard help --all                         every command in full, in one text (for LLM agents)
@@ -55,8 +60,21 @@ fn usage() -> String {
     format!("{USAGE_HEAD}{}{USAGE_TAIL}", help::RUN_OPTIONS)
 }
 
-const SUBCOMMANDS: &[&str] =
-    &["top", "status", "pause", "resume", "history", "outliers", "prune", "doctor", "import-history", "version", "help", "__recorder"];
+const SUBCOMMANDS: &[&str] = &[
+    "top",
+    "status",
+    "pause",
+    "resume",
+    "history",
+    "outliers",
+    "prune",
+    "doctor",
+    "import-history",
+    "proof",
+    "version",
+    "help",
+    "__recorder",
+];
 
 fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
     let a = &args[*i];
@@ -115,6 +133,8 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--hints" => o.hints = Some(true),
             "--no-hints" => o.hints = Some(false),
             "--wait" => o.wait = true,
+            "--receipt" => o.receipt = Some(take_value(args, &mut i, name)?),
+            "--partial" => o.partial = Some(take_value(args, &mut i, name)?),
             "-h" | "--help" => o.help = true,
             _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{}", usage()),
             _ => break,
@@ -173,6 +193,7 @@ fn dispatch(args: &[String]) -> Result<i32> {
             "prune" => commands::prune(rest),
             "doctor" => commands::doctor(rest),
             "import-history" => commands::import_history(),
+            "proof" => proof::dispatch(rest),
             "top" => top::run(rest),
             "__recorder" => recorder::run().map(|_| 0),
             _ => unreachable!(),
@@ -183,6 +204,15 @@ fn dispatch(args: &[String]) -> Result<i32> {
     if o.help {
         print!("{}", help::text(if o.wait { "wait" } else { "run" }).unwrap_or_default());
         return Ok(0);
+    }
+    if let Some(id) = &o.receipt {
+        if o.jobs.is_some() || o.id.is_some() || o.bg || o.wait {
+            bail!("--receipt runs the command outside the queue; put taskguard inside the command for that");
+        }
+        return proof::run_receipt(id, o.partial.as_deref(), &o.cmd);
+    }
+    if o.partial.is_some() {
+        bail!("--partial goes with --receipt ID");
     }
     if o.wait && o.cmd.is_empty() {
         return runner::wait_pool(o.id.as_deref());
@@ -234,6 +264,11 @@ mod tests {
         assert_eq!(o.cmd, v("tsc --watch"), "options after the command belong to it");
 
         assert!(parse_opts(&v("--bogus tsc")).is_err());
+        let o = parse_opts(&v("--receipt e2e --partial 'transfer specs only' -- bunx playwright test transfer")).unwrap();
+        assert_eq!((o.receipt.as_deref(), o.partial.as_deref()), (Some("e2e"), Some("transfer specs only")));
+        assert_eq!(o.cmd, v("bunx playwright test transfer"));
+        let o = parse_opts(&v("--receipt=unit")).unwrap();
+        assert!(o.receipt.is_some() && o.cmd.is_empty(), "no command: the policy command");
         let o = parse_opts(&v("--wait --id build")).unwrap();
         assert!(o.wait && o.cmd.is_empty());
     }

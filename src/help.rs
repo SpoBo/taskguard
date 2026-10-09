@@ -18,6 +18,9 @@ options (sem style; the default is to run in the foreground):
   --pipe                  with --bg: pass stdin to the command
   -q, --quiet             only print waits longer than the status interval
   --hints / --no-hints    agent hints on or off for this call
+  --receipt ID            run for a proof receipt (taskguard help proof); no
+                          COMMAND runs the policy command of ID
+  --partial REASON        with --receipt: a chosen subset, and why it is enough
 ";
 
 const RUN: &str = "\
@@ -183,6 +186,67 @@ Load tsc-queue's memory history (~/.cache/tsc-queue/history.tsv, or
 $TSC_QUEUE_DIR/history.tsv) into taskguard's history, once.
 ";
 
+const PROOF: &str = "\
+taskguard --receipt ID [--partial REASON] [-- COMMAND]
+taskguard proof publish [--sha SHA]... [--wait SECS] [--again] [-q]
+taskguard proof show [--history]
+taskguard proof check [ID...] [--sha SHA] [--labels L,L] [--wait SECS] [--github-output]
+taskguard proof log [--id ID] [--since SHA] [-n N] [--branch REF]
+taskguard proof install [ID --command \"CMD\" [--os OS] [--levels L,L]]
+taskguard proof uninstall [ID] [--purge-local]
+
+Proof receipts: publish what passed on this machine as GitHub commit statuses
+(taskguard/ID), so CI can skip work that is already proven.
+
+1. Run. `taskguard --receipt ID` runs the command that .taskguard/proof.toml
+   names for ID. It hashes the files on disk before and after the run,
+   uncommitted and untracked files included, ignored files left out. When the
+   hash did not change, it keeps a receipt: passed or failed, on that tree.
+   A file that changed during the run means no receipt. The command runs at
+   once, outside the queue: it is mostly a task runner whose leaves queue.
+   Another command proves only a part: give --partial \"REASON\".
+2. Publish. After the push, `proof publish` posts each receipt whose tree is
+   the tree of the pushed commit, as status taskguard/ID: green or red, with
+   \"LEVEL, OS/ARCH, DURATION, HOST\" as its description. A commit of other
+   files gets nothing. The push hook from `proof install` does this.
+3. Check. In CI, `proof check` reads the statuses of the PR head and says per
+   ID: skip (green, at a level and on an OS the policy accepts) or run (no
+   proof, red, another level or OS, a taskguard:ci or taskguard:ci:ID label).
+   It cannot read the statuses: run. Exit 0 when all skip; with
+   --github-output it writes ID=skip|run to $GITHUB_OUTPUT and exits 0.
+
+The policy, .taskguard/proof.toml:
+
+  [receipt.unit-tests]
+  command = \"bun install --frozen-lockfile && turbo run test:unit\"
+  os = \"any\"             # any, linux or macos: whose proof CI accepts
+  levels = [\"full\"]      # full and/or partial: what lets a PR skip CI
+  env_files = \"deny\"     # deny: no receipt while an ignored .env* file exists
+  env_allow = []          # globs of ignored .env* files that may exist
+
+The command must rebuild what the hash cannot see: install dependencies from
+the lockfile, and let the task runner build dist and generated code.
+
+commands:
+  publish         post receipts for HEAD (or each --sha). --wait SECS waits
+                  for the commit to reach GitHub. CI checks out a merge of the
+                  PR head: --sha HEAD_SHA posts its receipts on the PR head.
+  show            this checkout: local receipts and the statuses on HEAD
+  check           CI: skip or run per ID. --wait SECS waits for statuses that
+                  are missing, for a push whose proof is still on its way.
+  log             proof per commit on the main branch; a squash merge reads
+                  the PR head (~ marks proof on a different tree). With --id,
+                  the least proven commits first: the suspects when a full
+                  run goes red.
+  install         write a policy entry, the pre-push hook, and print what
+                  else is missing: the CI check job, and the ruleset that
+                  makes the statuses a merge gate.
+  uninstall       remove one ID from the policy, or the policy and the hook.
+
+GitHub is reached through the gh CLI (GH_TOKEN in CI). TASKGUARD_GH names
+another gh.
+";
+
 const VERSION: &str = "\
 taskguard version
 
@@ -211,6 +275,7 @@ pub fn text(cmd: &str) -> Option<String> {
         "prune" => PRUNE.into(),
         "doctor" => DOCTOR.into(),
         "import-history" => IMPORT.into(),
+        "proof" | "receipt" => PROOF.into(),
         "version" => VERSION.into(),
         "help" => HELP.into(),
         _ => return None,
@@ -218,8 +283,8 @@ pub fn text(cmd: &str) -> Option<String> {
 }
 
 /// Every command in the order `help --all` prints them.
-pub const ALL: [&str; 11] =
-    ["run", "wait", "top", "status", "pause", "history", "outliers", "prune", "doctor", "import-history", "version"];
+pub const ALL: [&str; 12] =
+    ["run", "wait", "top", "status", "pause", "history", "outliers", "prune", "doctor", "import-history", "proof", "version"];
 
 /// The full help, every command in one text: for LLM agents and for reading
 /// it all at once. `usage` is the overview that comes first.

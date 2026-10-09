@@ -440,11 +440,59 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
 | `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
 | `taskguard import-history` | Load tsc-queue's memory history |
+| `taskguard --receipt ID [--partial WHY]` | Run the command the proof policy names for ID, and keep a receipt when the files did not change during the run |
+| `taskguard proof publish\|show\|check\|log\|install\|uninstall` | Publish receipts as `taskguard/ID` commit statuses, and read them back in CI. See [Proof receipts](#proof-receipts) |
 | `taskguard help COMMAND`, `taskguard COMMAND --help` | Help for one command: what it does, its options, examples |
 | `taskguard help --all` | Every command in full, in one text, for LLM agents |
 
 `--help` after the command you run belongs to that command:
 `taskguard -- tsc --help` shows tsc's help.
+
+## Proof receipts
+
+CI runs the checks that the developer or the agent already ran before the
+push. taskguard can record that a command passed on an exact set of files, and
+publish that as a GitHub commit status, so CI can skip that job.
+
+```sh
+taskguard proof install unit-tests --command "bun install --frozen-lockfile && turbo run test:unit"
+taskguard --receipt unit-tests      # runs that command; keeps a receipt when it ends
+git commit -am "..." && git push    # the push hook runs `taskguard proof publish`
+```
+
+1. **Run.** `taskguard --receipt ID` runs the command that
+   `.taskguard/proof.toml` names for ID. It hashes the files on disk before
+   and after the run, uncommitted and untracked files included, ignored files
+   left out, through a temporary index: the real index does not change. That
+   is the tree hash a commit of exactly those files gets. When a file changed
+   during the run, nobody knows which version passed, so there is no receipt.
+   An ignored `.env*` file means no receipt either (`env_files`), because it
+   can change a result that the hash cannot see.
+2. **Publish.** `taskguard proof publish` posts each receipt whose tree is the
+   tree of the pushed commit as the status `taskguard/ID`: green when the
+   command passed, red when it failed. The description is
+   `LEVEL, OS/ARCH, DURATION, HOST`, a shape that `proof check` reads back. A
+   commit of other files gets nothing: you committed something other than
+   what was tested.
+3. **Check.** One small CI job runs `taskguard proof check --sha HEAD_SHA
+   --github-output` first. Per ID it says `skip` for green proof at a level
+   and on an OS that the policy accepts, and `run` for anything else: no
+   proof, red proof, a `taskguard:ci` or `taskguard:ci:ID` label, or statuses
+   it cannot read. The heavy jobs use `if:` on that output and never start.
+
+A receipt is `full` only for the exact policy command. Another command needs
+`--partial "WHY"` and proves a part: the policy's `levels` say whether a PR
+may skip CI on it. `taskguard proof log --id ID` lists the commits on main by
+how well they were proven, the least proven first: the suspects when a full
+scheduled run goes red. A squash merge counts the statuses of its PR head
+when the two trees are the same.
+
+The receipt command must rebuild what the hash cannot see: install
+dependencies from the lockfile, and let the task runner build `dist` and
+generated code. A red laptop status does not stop CI: CI runs the job and its
+own result is the newest status. To make the statuses a merge gate, `proof
+install` prints the `gh api` call for a ruleset named `taskguard` (in
+evaluate mode first). `taskguard help proof` has the details.
 
 ## Configuration
 
@@ -564,6 +612,9 @@ the others write:
 - `taskguard prune` moves runs into the table `pruned_runs`, so every
   version stops learning from them; `prune --undo` moves them back. Without
   `--apply`, prune only shows what it would do.
+- Proof receipts live in their own tables, `receipts` and `receipt_posts`,
+  keyed by tree hash. A version without them ignores them, and its
+  `--receipt` is an unknown option.
 - The database only gains tables and columns. A new column is nullable or has
   a default, so older versions can still insert rows.
 - A job gets the same history key in every version.
