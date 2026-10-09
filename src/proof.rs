@@ -2,7 +2,9 @@
 //! publish that as a GitHub commit status, so CI can skip the work a machine
 //! already did. See `taskguard help proof`.
 //!
-//! The tree is hashed as it is on disk, uncommitted and untracked files
+//! `--receipt ID` is the opt-in, per command. The receipt name is the
+//! contract: a run under `--receipt unit-tests` says "this is the Unit Tests
+//! job". The tree is hashed as it is on disk, uncommitted and untracked files
 //! included, through a temporary index: the same hash a commit of exactly
 //! those files gets. A receipt only counts for a commit whose tree is that
 //! hash. GitHub talks go through the `gh` CLI (`TASKGUARD_GH` overrides it).
@@ -21,110 +23,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// The policy file, at the root of the checkout.
-pub const POLICY: &str = ".taskguard/proof.toml";
 /// Commit status contexts are `taskguard/<id>`.
 pub const CONTEXT: &str = "taskguard/";
-/// The first line of the push hook that `install` writes; it marks the hook as ours.
-const HOOK_MARK: &str = "# taskguard proof: publish receipts once the pushed commits reach GitHub.";
 /// GitHub cuts a status description at 140 characters.
 const DESC_MAX: usize = 140;
+/// How long a laptop's background publish watches the branch on GitHub.
+const PUBLISH_WATCH_S: u64 = 3600;
+/// How long `proof check` in GitHub Actions waits for a status that is missing.
+const CHECK_WAIT_CI_S: u64 = 30;
 
-// --- policy ---------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, Default)]
-pub struct Policy {
-    #[serde(default)]
-    pub receipt: BTreeMap<String, Rule>,
-}
-
-/// What one receipt id runs, and what proof of it CI accepts.
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-pub struct Rule {
-    /// The full command. A receipt of exactly this command is `full`.
-    pub command: String,
-    /// The OS whose proof CI accepts: any, linux or macos.
-    #[serde(default = "default_os")]
-    pub os: String,
-    /// The levels that let a PR skip CI: full, partial.
-    #[serde(default = "default_levels")]
-    pub levels: Vec<String>,
-    /// deny: no receipt while an ignored `.env*` file exists; allow: ignore them.
-    #[serde(default = "default_env_files")]
-    pub env_files: String,
-    /// Ignored `.env*` files that do not count with `env_files = "deny"` (globs).
-    #[serde(default)]
-    pub env_allow: Vec<String>,
-}
-
-fn default_os() -> String {
-    "any".into()
-}
-fn default_levels() -> Vec<String> {
-    vec!["full".into()]
-}
-fn default_env_files() -> String {
-    "deny".into()
-}
-
-impl Policy {
-    pub fn parse(text: &str, origin: &str) -> Result<Policy> {
-        let p: Policy = toml::from_str(text).with_context(|| format!("reading {origin}"))?;
-        for (id, r) in &p.receipt {
-            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
-                bail!("{origin}: receipt id {id:?} may only hold letters, digits, - _ and .");
-            }
-            if r.command.trim().is_empty() {
-                bail!("{origin}: [receipt.{id}] needs a command");
-            }
-            if !matches!(r.os.as_str(), "any" | "linux" | "macos") {
-                bail!("{origin}: [receipt.{id}] os is any, linux or macos, not {:?}", r.os);
-            }
-            if r.levels.is_empty() || r.levels.iter().any(|l| !matches!(l.as_str(), "full" | "partial")) {
-                bail!("{origin}: [receipt.{id}] levels lists full and/or partial");
-            }
-            if !matches!(r.env_files.as_str(), "deny" | "allow") {
-                bail!("{origin}: [receipt.{id}] env_files is deny or allow, not {:?}", r.env_files);
-            }
-        }
-        Ok(p)
+fn valid_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+        bail!("receipt id {id:?} may only hold letters, digits, - _ and .");
     }
-
-    pub fn load(root: &Path) -> Result<Policy> {
-        let path = root.join(POLICY);
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("no {POLICY} in {}; `taskguard proof install ID --command \"CMD\"` writes one", root.display()))?;
-        Policy::parse(&text, &path.display().to_string())
-    }
-
-    pub fn rule(&self, id: &str) -> Result<&Rule> {
-        self.receipt.get(id).with_context(|| {
-            let known: Vec<&str> = self.receipt.keys().map(String::as_str).collect();
-            format!("no receipt id {id:?} in {POLICY} (it has: {})", if known.is_empty() { "none".into() } else { known.join(", ") })
-        })
-    }
-}
-
-/// The level of a receipt for `cmd`: full when it is the policy command, as
-/// argv or as the `sh -c` line that `taskguard --receipt ID` runs.
-pub fn level_of(rule: &Rule, cmd: &[String], partial: Option<&str>) -> Result<(&'static str, Option<String>)> {
-    if let Some(reason) = partial {
-        if reason.trim().is_empty() {
-            bail!("--partial needs a reason: what ran, and why that is enough");
-        }
-        return Ok(("partial", Some(reason.trim().to_string())));
-    }
-    let full = cmd.is_empty()
-        || *cmd == matcher::split_shell(&rule.command)
-        || (cmd.len() == 3 && cmd[0] == "sh" && cmd[1] == "-c" && cmd[2] == rule.command);
-    if !full {
-        bail!(
-            "this is not the policy command, so it proves nothing in full\n  policy:  {}\n  command: {}\nRun `taskguard --receipt ID` alone to run the policy command, or add --partial \"REASON\" for a chosen subset.",
-            rule.command,
-            cmd.join(" ")
-        );
-    }
-    Ok(("full", None))
+    Ok(())
 }
 
 // --- git ------------------------------------------------------------------------
@@ -197,10 +109,30 @@ fn ignored_env_files(root: &Path, allow: &[String]) -> Result<Vec<String>> {
         .collect())
 }
 
-// --- the machine ----------------------------------------------------------------
+/// A short hash of the command line, so a status says which command passed.
+/// git's object hash: no hashing crate needed, and the same on every machine.
+fn fingerprint(root: &Path, argv: &[String]) -> Result<String> {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("running git")?;
+    child.stdin.take().context("git stdin")?.write_all(argv.join("\0").as_bytes())?;
+    let out = child.wait_with_output()?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().chars().take(12).collect())
+}
+
+// --- the machine and GitHub Actions ---------------------------------------------
+
+fn in_actions() -> bool {
+    std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true")
+}
 
 fn host() -> String {
-    if std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true") {
+    if in_actions() {
         return "ci".into();
     }
     let mut buf = [0u8; 256];
@@ -208,6 +140,31 @@ fn host() -> String {
     let name = if ok { String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(0)]).into_owned() } else { String::new() };
     let name = name.split('.').next().unwrap_or("").to_string();
     if name.is_empty() { "unknown".into() } else { name }
+}
+
+/// The PR head sha and its labels from the GitHub Actions event, when this
+/// runs for a pull request. CI checks out a merge of the head onto its base;
+/// the status belongs on the head.
+#[derive(Debug, Default, PartialEq)]
+pub struct Event {
+    pub head_sha: Option<String>,
+    pub labels: Vec<String>,
+}
+
+pub fn read_event(json: &str) -> Event {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let pr = &v["pull_request"];
+    Event {
+        head_sha: pr["head"]["sha"].as_str().map(str::to_string),
+        labels: pr["labels"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|l| l["name"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+    }
+}
+
+fn actions_event() -> Event {
+    std::env::var("GITHUB_EVENT_PATH").ok().and_then(|p| std::fs::read_to_string(p).ok()).map(|t| read_event(&t)).unwrap_or_default()
 }
 
 // --- receipts -------------------------------------------------------------------
@@ -218,33 +175,24 @@ pub struct Receipt {
     pub receipt: String,
     pub tree: String,
     pub head: Option<String>,
-    pub repo: Option<String>,
-    pub level: String,
-    pub reason: Option<String>,
     pub ok: bool,
     pub exit: Option<i32>,
     pub cmd: String,
+    pub fingerprint: String,
     pub host: String,
     pub os: String,
     pub arch: String,
-    pub version: String,
     pub started_at: f64,
     pub duration_s: f64,
 }
 
 impl Receipt {
     /// The status description, in the fixed shape `parse_description` reads
-    /// back: `full, macos/aarch64, 12m03s, host` and `: reason` for a partial.
+    /// back: `f:3fa1c0d2e4b1, macos/aarch64, 12m03s, host`. The host comes
+    /// last, so a long one is what gets cut.
     pub fn description(&self) -> String {
-        let mut s = format!("{}, {}/{}, {}, {}", self.level, self.os, self.arch, dur(self.duration_s), self.host);
-        if let Some(r) = &self.reason {
-            s.push_str(": ");
-            s.push_str(r);
-        }
-        if s.chars().count() > DESC_MAX {
-            s = s.chars().take(DESC_MAX - 1).collect::<String>() + "…";
-        }
-        s
+        let s = format!("f:{}, {}/{}, {}, {}", self.fingerprint, self.os, self.arch, dur(self.duration_s), self.host);
+        if s.chars().count() > DESC_MAX { s.chars().take(DESC_MAX - 1).collect::<String>() + "…" } else { s }
     }
 
     pub fn state(&self) -> &'static str {
@@ -252,32 +200,30 @@ impl Receipt {
     }
 }
 
-/// The level and OS of a `taskguard/<id>` status, from its description.
-pub fn parse_description(d: &str) -> Option<(String, String)> {
-    let mut parts = d.splitn(3, ", ");
-    let level = parts.next()?;
-    let os = parts.next()?.split('/').next()?;
-    matches!(level, "full" | "partial").then(|| (level.to_string(), os.to_string()))
+/// The OS of a `taskguard/<id>` status, from its description.
+pub fn parse_description(d: &str) -> Option<String> {
+    let os_arch = d.split(", ").nth(1)?;
+    let (os, _) = os_arch.split_once('/')?;
+    (!os.is_empty()).then(|| os.to_string())
 }
 
-fn insert(db: &Db, r: &Receipt) -> Result<i64> {
+fn insert(db: &Db, id: &str, r: &Receipt, repo: &Path) -> Result<i64> {
     db.conn.execute(
-        "INSERT INTO receipts (receipt, tree, head, repo, level, reason, ok, exit, cmd, host, os, arch, version, started_at, duration_s)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO receipts (receipt, tree, head, repo, level, ok, exit, cmd, fingerprint, host, os, arch, version, started_at, duration_s)
+         VALUES (?1, ?2, ?3, ?4, 'full', ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
-            r.receipt,
+            id,
             r.tree,
             r.head,
-            r.repo,
-            r.level,
-            r.reason,
+            repo.display().to_string(),
             r.ok,
             r.exit,
             r.cmd,
+            r.fingerprint,
             r.host,
             r.os,
             r.arch,
-            r.version,
+            env!("CARGO_PKG_VERSION"),
             r.started_at,
             r.duration_s
         ],
@@ -289,7 +235,7 @@ fn insert(db: &Db, r: &Receipt) -> Result<i64> {
 pub fn receipts_for(db: &Db, trees: &[String]) -> Result<Vec<Receipt>> {
     let mut out = Vec::new();
     let mut stmt = db.conn.prepare_cached(
-        "SELECT id, receipt, tree, head, repo, level, reason, ok, exit, cmd, host, os, arch, version, started_at, duration_s
+        "SELECT id, receipt, tree, head, ok, exit, cmd, fingerprint, host, os, arch, started_at, duration_s
          FROM receipts WHERE tree = ?1",
     )?;
     for t in trees {
@@ -299,18 +245,15 @@ pub fn receipts_for(db: &Db, trees: &[String]) -> Result<Vec<Receipt>> {
                 receipt: r.get(1)?,
                 tree: r.get(2)?,
                 head: r.get(3)?,
-                repo: r.get(4)?,
-                level: r.get(5)?,
-                reason: r.get(6)?,
-                ok: r.get(7)?,
-                exit: r.get(8)?,
-                cmd: r.get(9)?,
-                host: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
-                os: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                arch: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
-                version: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
-                started_at: r.get(14)?,
-                duration_s: r.get(15)?,
+                ok: r.get(4)?,
+                exit: r.get(5)?,
+                cmd: r.get(6)?,
+                fingerprint: r.get::<_, Option<String>>(7)?.unwrap_or_else(|| "?".into()),
+                host: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                os: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
+                arch: r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                started_at: r.get(11)?,
+                duration_s: r.get(12)?,
             })
         })?;
         for row in rows {
@@ -321,11 +264,8 @@ pub fn receipts_for(db: &Db, trees: &[String]) -> Result<Vec<Receipt>> {
     Ok(out)
 }
 
-/// One receipt per id: the strongest level, then the newest. A partial run
-/// on the same files does not hide a full one; a newer full run, green or
-/// red, does replace an older one.
-fn strongest_per_id(mut rs: Vec<Receipt>) -> Vec<Receipt> {
-    rs.sort_by_key(|r| r.level != "full");
+/// The newest receipt per id.
+fn newest_per_id(rs: Vec<Receipt>) -> Vec<Receipt> {
     let mut seen = std::collections::HashSet::new();
     rs.into_iter().filter(|r| seen.insert(r.receipt.clone())).collect()
 }
@@ -344,32 +284,39 @@ fn mark_posted(db: &Db, row: i64, sha: &str) -> Result<()> {
 
 // --- the receipt run ------------------------------------------------------------
 
-/// `taskguard --receipt ID [--partial REASON] [-- COMMAND]`: run the command
-/// (the policy command when none is given) and, when the files did not change
-/// while it ran, keep a receipt of the result. The command runs straight away,
+/// What `taskguard --receipt` was given besides the command.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ReceiptOpts {
+    pub id: String,
+    pub allow_env_files: Vec<String>,
+    pub no_publish: bool,
+}
+
+/// `taskguard --receipt ID [--allow-env-file GLOB]... [--no-publish] -- COMMAND`:
+/// run the command and, when the files did not change while it ran, keep a
+/// receipt of the result and publish it. The command runs straight away,
 /// outside the queue: it is mostly a task runner whose own leaves queue.
-pub fn run_receipt(id: &str, partial: Option<&str>, publish: Option<u64>, cmd: &[String]) -> Result<i32> {
+pub fn run_receipt(o: &ReceiptOpts, cmd: &[String]) -> Result<i32> {
+    valid_id(&o.id)?;
+    if cmd.is_empty() {
+        bail!("--receipt {} needs the command to run: taskguard --receipt {} -- COMMAND", o.id, o.id);
+    }
+    let id = o.id.as_str();
     let cwd = std::env::current_dir().context("reading the current directory")?;
     let root = toplevel(&cwd)?;
-    let policy = Policy::load(&root)?;
-    let rule = policy.rule(id)?;
-    let (level, reason) = level_of(rule, cmd, partial)?;
-    if rule.env_files == "deny" {
-        let env = ignored_env_files(&root, &rule.env_allow)?;
-        if !env.is_empty() {
-            bail!(
-                "no receipt: ignored settings files can change the result, and the proof cannot see them: {}\nMove them away, or list them in env_allow of [receipt.{id}] in {POLICY}.",
-                env.join(", ")
-            );
-        }
+    let env = ignored_env_files(&root, &o.allow_env_files)?;
+    if !env.is_empty() {
+        bail!(
+            "no receipt: ignored settings files can change the result, and the proof cannot see them: {}\nMove them away, or pass --allow-env-file GLOB for one that may stay.",
+            env.join(", ")
+        );
     }
-    let argv: Vec<String> = if cmd.is_empty() { vec!["sh".into(), "-c".into(), rule.command.clone()] } else { cmd.to_vec() };
 
     let before = work_tree(&root)?;
     let head = commit_of(&root, "HEAD").ok();
     let started_at = db::now();
     let t0 = Instant::now();
-    let code = spawn_and_wait(&argv)?;
+    let code = spawn_and_wait(cmd)?;
     let duration_s = t0.elapsed().as_secs_f64();
     let after = work_tree(&root)?;
 
@@ -386,40 +333,43 @@ pub fn run_receipt(id: &str, partial: Option<&str>, publish: Option<u64>, cmd: &
         ));
         return Ok(exit);
     }
-    let r = Receipt {
+    let mut r = Receipt {
         row: 0,
         receipt: id.to_string(),
-        tree: before.clone(),
+        tree: before,
         head,
-        repo: Some(root.display().to_string()),
-        level: level.to_string(),
-        reason,
         ok: exit == 0,
         exit: Some(exit),
-        cmd: argv.join(" "),
+        cmd: cmd.join(" "),
+        fingerprint: fingerprint(&root, cmd)?,
         host: host(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
         started_at,
         duration_s,
     };
     let db = Db::open_dir(&config::state_dir())?;
-    insert(&db, &r)?;
-    let next = match publish {
-        Some(secs) => {
-            let (log, how) = spawn_publish(&root, &r.tree, secs)?;
-            format!("It is posted {how}, for up to {} (log: {}).", dur(secs as f64), log.display())
+    r.row = insert(&db, id, &r, &root)?;
+    let what = format!("receipt {id}: {} on tree {} ({})", if r.ok { "passed" } else { "failed" }, short(&r.tree), dur(duration_s));
+    if o.no_publish {
+        crate::report::say(&format!("{what}. Kept here only (--no-publish); `taskguard proof publish` posts it."));
+    } else if in_actions() {
+        // In CI the commit is on GitHub already: post now, on the PR head.
+        let sha = actions_event().head_sha.or_else(|| std::env::var("GITHUB_SHA").ok()).unwrap_or_else(|| "HEAD".into());
+        match commit_of(&root, &sha).and_then(|sha| unposted(&db, &root, &sha, false).map(|rs| (sha, rs))) {
+            Ok((sha, rs)) if !rs.is_empty() => match post_all(&db, &root, &sha, rs, true) {
+                Ok(()) => crate::report::say(&format!("{what}. Posted {CONTEXT}{id} on {}.", short(&sha))),
+                Err(e) => crate::report::say(&format!("{what}. Could not post it: {e:#}")),
+            },
+            Ok((sha, _)) => crate::report::say(&format!("{what}. Not posted: {} has other files than the ones tested.", short(&sha))),
+            Err(e) => crate::report::say(&format!("{what}. Could not post it: {e:#}")),
         }
-        None => "After you push, `taskguard proof publish` posts it.".into(),
-    };
-    crate::report::say(&format!(
-        "receipt {id}: {} {} on tree {} ({}). {next}",
-        r.level,
-        if r.ok { "passed" } else { "failed" },
-        short(&r.tree),
-        dur(duration_s)
-    ));
+    } else {
+        match spawn_publish(&root, &r.tree) {
+            Ok(how) => crate::report::say(&format!("{what}. {how}")),
+            Err(e) => crate::report::say(&format!("{what}. Not published: {e:#}. `taskguard proof publish` after the push posts it.")),
+        }
+    }
     Ok(exit)
 }
 
@@ -449,13 +399,52 @@ fn spawn_and_wait(argv: &[String]) -> Result<Option<i32>> {
     }
 }
 
+/// Publish in the background. On a branch it watches that branch on GitHub
+/// for the tested files, so the checkout may go away after the push (as
+/// no-mistakes does). GH_REPO names the repo when the checkout's remote is not
+/// GitHub. The output goes to a log in the temp folder.
+fn spawn_publish(root: &Path, tree: &str) -> Result<String> {
+    use std::os::unix::process::CommandExt;
+    let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).context("HEAD is not on a branch")?;
+    let repo = std::env::var("GH_REPO")
+        .ok()
+        .filter(|r| !r.is_empty())
+        .or_else(|| {
+            let o = Command::new(gh_bin())
+                .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+                .current_dir(root)
+                .output()
+                .ok()?;
+            let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (o.status.success() && !r.is_empty()).then_some(r)
+        })
+        .context("no GitHub repo for this checkout (set GH_REPO=OWNER/REPO)")?;
+    let log = std::env::temp_dir().join("taskguard-proof-publish.log");
+    let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["proof", "publish", "--tree", tree, "--branch", &branch, "--repo", &repo, "--wait", &PUBLISH_WATCH_S.to_string(), "-q"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(out);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().context("starting the background publish")?;
+    Ok(format!("It is posted when {branch} on {repo} has these files, within {} (log: {}).", dur(PUBLISH_WATCH_S as f64), log.display()))
+}
+
 // --- GitHub ---------------------------------------------------------------------
 
 fn gh_bin() -> String {
     std::env::var("TASKGUARD_GH").unwrap_or_else(|_| "gh".into())
 }
 
-/// `gh api ...` in the checkout, so `{owner}/{repo}` resolves from its remote.
+/// `gh api ...` in the checkout, so `{owner}/{repo}` resolves from its remote
+/// (or from GH_REPO).
 fn gh_api(root: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new(gh_bin())
         .arg("api")
@@ -586,8 +575,8 @@ impl Args {
     fn all(&self, f: &str) -> Vec<String> {
         self.flags.get(f).cloned().unwrap_or_default()
     }
-    fn secs(&self, f: &str) -> Result<u64> {
-        self.one(f).map(|v| v.parse().with_context(|| format!("{f} needs a number of seconds"))).transpose().map(|v| v.unwrap_or(0))
+    fn secs(&self, f: &str) -> Result<Option<u64>> {
+        self.one(f).map(|v| v.parse().with_context(|| format!("{f} needs a number of seconds"))).transpose()
     }
 }
 
@@ -599,10 +588,8 @@ pub fn dispatch(rest: &[String]) -> Result<i32> {
         "show" => show(args),
         "check" => check(args),
         "log" => log(args),
-        "install" => install(args),
-        "uninstall" => uninstall(args),
-        "" => bail!("proof needs a command: publish, show, check, log, install or uninstall; see `taskguard help proof`"),
-        other => bail!("no proof command {other:?}: publish, show, check, log, install or uninstall"),
+        "" => bail!("proof needs a command: check, publish, show or log; see `taskguard help proof`"),
+        other => bail!("no proof command {other:?}: check, publish, show or log"),
     }
 }
 
@@ -610,31 +597,29 @@ fn root_here() -> Result<PathBuf> {
     toplevel(&std::env::current_dir().context("reading the current directory")?)
 }
 
-/// `proof publish [--sha SHA]... [--wait SECS] [--again]`
+/// `proof publish [--sha SHA]... [--wait SECS] [--again]`, and the background
+/// form `proof publish --tree TREE --branch BRANCH [--repo OWNER/REPO] --wait SECS`.
 ///
 /// Without --sha it follows HEAD for up to --wait seconds: it posts as soon as
-/// HEAD has a receipt and is on GitHub. That fits a pipeline that runs the
-/// receipt, then may add commits, then pushes from the same checkout.
+/// HEAD has a receipt and is on GitHub.
 fn publish(rest: &[String]) -> Result<i32> {
     let a = parse(rest, &["--sha", "--wait", "--tree", "--branch", "--repo"], &["--again", "-q", "--quiet"])?;
     let quiet = a.has("-q") || a.has("--quiet");
     let again = a.has("--again");
+    let wait = a.secs("--wait")?.unwrap_or(0);
     if let Some(tree) = a.one("--tree") {
         let branch = a.one("--branch").context("--tree goes with --branch")?;
-        return publish_tree(tree, branch, a.one("--repo"), a.secs("--wait")?, again, quiet);
+        return publish_tree(tree, branch, a.one("--repo"), wait, again, quiet);
     }
     let root = root_here()?;
-    let policy = Policy::load(&root)?;
-    let wait = a.secs("--wait")?;
     let db = Db::open_dir(&config::state_dir())?;
     let t0 = Instant::now();
     let explicit = a.all("--sha");
     if explicit.is_empty() {
         loop {
             let head = commit_of(&root, "HEAD")?;
-            let rs = unposted(&db, &policy, &root, &head, again)?;
-            let ready = !rs.is_empty() && on_github(&root, &head);
-            if ready {
+            let rs = unposted(&db, &root, &head, again)?;
+            if !rs.is_empty() && on_github(&root, &head) {
                 post_all(&db, &root, &head, rs, quiet)?;
                 return Ok(0);
             }
@@ -652,7 +637,7 @@ fn publish(rest: &[String]) -> Result<i32> {
     }
     for s in explicit {
         let sha = commit_of(&root, &s)?;
-        let rs = unposted(&db, &policy, &root, &sha, again)?;
+        let rs = unposted(&db, &root, &sha, again)?;
         if rs.is_empty() {
             if !quiet {
                 println!("{}: nothing to publish: no new receipt for its files", short(&sha));
@@ -670,8 +655,8 @@ fn publish(rest: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-/// The receipts for the files of `sha` that are not posted on it yet.
-fn unposted(db: &Db, policy: &Policy, root: &Path, sha: &str, again: bool) -> Result<Vec<Receipt>> {
+/// The newest receipt per id for the files of `sha` that is not posted on it yet.
+fn unposted(db: &Db, root: &Path, sha: &str, again: bool) -> Result<Vec<Receipt>> {
     let mut trees = vec![tree_of(root, sha)?];
     // CI checks out a merge of the PR head onto its base: what passed there
     // passed on the head merged with the newest base, which counts for the head.
@@ -680,11 +665,7 @@ fn unposted(db: &Db, policy: &Policy, root: &Path, sha: &str, again: bool) -> Re
     if sha != head && parents.lines().count() >= 2 && parents.lines().any(|p| p == sha) {
         trees.push(tree_of(root, "HEAD")?);
     }
-    Ok(strongest_per_id(receipts_for(db, &trees)?)
-        .into_iter()
-        .filter(|r| policy.receipt.contains_key(&r.receipt))
-        .filter(|r| again || !posted_to(db, r.row, sha))
-        .collect())
+    Ok(newest_per_id(receipts_for(db, &trees)?).into_iter().filter(|r| again || !posted_to(db, r.row, sha)).collect())
 }
 
 fn post_all(db: &Db, root: &Path, sha: &str, rs: Vec<Receipt>, quiet: bool) -> Result<()> {
@@ -699,10 +680,8 @@ fn post_all(db: &Db, root: &Path, sha: &str, rs: Vec<Receipt>, quiet: bool) -> R
     Ok(())
 }
 
-/// `proof publish --tree TREE --branch BRANCH [--repo OWNER/REPO] --wait SECS`:
-/// no checkout needed. Watch the branch on GitHub and post the receipts of
-/// TREE on its head once that head has those files. A pipeline that deletes
-/// its checkout right after the push (no-mistakes) can still publish.
+/// Watch the branch on GitHub and post the receipts of TREE on its head once
+/// that head has those files. Needs no checkout.
 fn publish_tree(tree: &str, branch: &str, repo: Option<&str>, wait: u64, again: bool, quiet: bool) -> Result<i32> {
     if let Some(r) = repo {
         // gh fills {owner}/{repo} from GH_REPO; nothing else runs yet.
@@ -720,7 +699,7 @@ fn publish_tree(tree: &str, branch: &str, repo: Option<&str>, wait: u64, again: 
             && let Some((sha, head_tree)) = line.trim().split_once(' ')
             && head_tree == tree
         {
-            let rs: Vec<Receipt> = strongest_per_id(receipts_for(&db, &[tree.to_string()])?)
+            let rs: Vec<Receipt> = newest_per_id(receipts_for(&db, &[tree.to_string()])?)
                 .into_iter()
                 .filter(|r| again || !posted_to(&db, r.row, sha))
                 .collect();
@@ -738,51 +717,8 @@ fn publish_tree(tree: &str, branch: &str, repo: Option<&str>, wait: u64, again: 
     }
 }
 
-/// `--receipt ID --publish SECS`: publish in the background, for up to SECS.
-/// On a branch it watches that branch on GitHub for the tested files, so the
-/// checkout may go away after the push; detached, it follows HEAD in the
-/// checkout. GH_REPO names the repo when the checkout's remote is not GitHub.
-/// The output goes to a log in the temp folder.
-fn spawn_publish(root: &Path, tree: &str, secs: u64) -> Result<(PathBuf, String)> {
-    use std::os::unix::process::CommandExt;
-    let log = std::env::temp_dir().join("taskguard-proof-publish.log");
-    let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
-    let exe = std::env::current_exe()?;
-    let mut cmd = Command::new(exe);
-    cmd.stdin(Stdio::null()).stdout(out.try_clone()?).stderr(out);
-    let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
-    let repo = std::env::var("GH_REPO").ok().filter(|r| !r.is_empty()).or_else(|| {
-        let o = Command::new(gh_bin())
-            .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
-            .current_dir(root)
-            .output()
-            .ok()?;
-        let r = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        (o.status.success() && !r.is_empty()).then_some(r)
-    });
-    let how = match (&branch, &repo) {
-        (Some(b), Some(r)) => {
-            cmd.args(["proof", "publish", "--tree", tree, "--branch", b, "--repo", r, "--wait", &secs.to_string()])
-                .current_dir(std::env::temp_dir());
-            format!("when {b} on {r} has these files")
-        }
-        _ => {
-            cmd.args(["proof", "publish", "--wait", &secs.to_string()]).current_dir(root);
-            "when HEAD has these files and is on GitHub".to_string()
-        }
-    };
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    cmd.spawn().context("starting the background publish")?;
-    Ok((log, how))
-}
-
 /// What CI does for one receipt id, given the newest status on the commit.
-pub fn decide(id: &str, rule: &Rule, status: Option<&Status>, labels: &[String]) -> (bool, String) {
+pub fn decide(id: &str, os: &str, status: Option<&Status>, labels: &[String]) -> (bool, String) {
     if labels.iter().any(|l| l == "taskguard:ci" || *l == format!("taskguard:ci:{id}")) {
         return (false, "forced by a taskguard:ci label".into());
     }
@@ -793,48 +729,39 @@ pub fn decide(id: &str, rule: &Rule, status: Option<&Status>, labels: &[String])
         "failure" | "error" => return (false, format!("red from {}: {desc}; CI runs it to see for itself", s.who())),
         other => return (false, format!("{other} from {}", s.who())),
     }
-    let Some((level, os)) = parse_description(&desc) else {
+    let Some(got) = parse_description(&desc) else {
         return (false, format!("a status this taskguard cannot read: {desc:?}"));
     };
-    if !rule.levels.contains(&level) {
-        return (false, format!("{level} proof, the policy accepts {}", rule.levels.join(", ")));
-    }
-    if rule.os != "any" && rule.os != os {
-        return (false, format!("proof on {os}, the policy wants {}", rule.os));
+    if os != "any" && os != got {
+        return (false, format!("proof on {got}, this check wants {os}"));
     }
     (true, format!("{desc} (posted by {})", s.who()))
 }
 
-/// `proof check [ID...] [--sha SHA] [--labels L,L] [--wait SECS] [--github-output]`
+/// `proof check ID... [--sha SHA] [--os OS] [--labels L,L] [--wait SECS] [--github-output]`
 fn check(rest: &[String]) -> Result<i32> {
-    let a = parse(rest, &["--sha", "--labels", "--wait"], &["--github-output"])?;
-    let root = root_here()?;
-    // With --github-output a missing policy or id is not an error: it means
-    // nothing is proven, so CI runs. A branch made before the policy has none.
-    let policy = match Policy::load(&root) {
-        Err(e) if a.has("--github-output") => {
-            eprintln!("taskguard: {e:#}; so CI runs");
-            Policy::default()
-        }
-        p => p?,
-    };
-    let ids: Vec<String> = if a.pos.is_empty() { policy.receipt.keys().cloned().collect() } else { a.pos.clone() };
-    for id in &ids {
-        if let Err(e) = policy.rule(id) {
-            if !a.has("--github-output") {
-                return Err(e);
-            }
-            eprintln!("taskguard: {e:#}; so CI runs {id}");
-        }
+    let a = parse(rest, &["--sha", "--labels", "--wait", "--os"], &["--github-output"])?;
+    if a.pos.is_empty() {
+        bail!("name the receipt ids to check: taskguard proof check unit-tests");
     }
-    let sha = match a.one("--sha") {
-        Some(s) if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) => s.to_string(),
-        Some(s) => commit_of(&root, s)?,
+    for id in &a.pos {
+        valid_id(id)?;
+    }
+    let os = a.one("--os").unwrap_or("any");
+    if !matches!(os, "any" | "linux" | "macos") {
+        bail!("--os is any, linux or macos, not {os:?}");
+    }
+    let root = root_here()?;
+    let event = if in_actions() { actions_event() } else { Event::default() };
+    let sha = match a.one("--sha").map(str::to_string).or(event.head_sha) {
+        Some(s) if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) => s,
+        Some(s) => commit_of(&root, &s)?,
         None => commit_of(&root, "HEAD")?,
     };
-    let labels: Vec<String> =
+    let mut labels: Vec<String> =
         a.all("--labels").iter().flat_map(|l| l.split(',')).map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    let wait = a.secs("--wait")?;
+    labels.extend(event.labels);
+    let wait = a.secs("--wait")?.unwrap_or(if in_actions() { CHECK_WAIT_CI_S } else { 0 });
     let t0 = Instant::now();
     let decisions = loop {
         let mut failed = false;
@@ -847,17 +774,15 @@ fn check(rest: &[String]) -> Result<i32> {
                 BTreeMap::new()
             }
         };
-        let d: Vec<(String, bool, String)> = ids
+        let d: Vec<(String, bool, String)> = a
+            .pos
             .iter()
             .map(|id| {
-                let (skip, why) = match policy.receipt.get(id) {
-                    Some(rule) => decide(id, rule, got.get(id), &labels),
-                    None => (false, format!("no receipt id {id} in {POLICY}")),
-                };
+                let (skip, why) = decide(id, os, got.get(id), &labels);
                 (id.clone(), skip, why)
             })
             .collect();
-        let missing = ids.iter().any(|id| policy.receipt.contains_key(id) && !got.contains_key(id));
+        let missing = a.pos.iter().any(|id| !got.contains_key(id));
         // A gh error means run; waiting longer would only delay that.
         if !missing || failed || t0.elapsed().as_secs() >= wait {
             break d;
@@ -883,7 +808,6 @@ fn check(rest: &[String]) -> Result<i32> {
 fn show(rest: &[String]) -> Result<i32> {
     let a = parse(rest, &[], &["--history"])?;
     let root = root_here()?;
-    let policy = Policy::load(&root).ok();
     let head = commit_of(&root, "HEAD")?;
     let head_tree = tree_of(&root, "HEAD")?;
     let work = work_tree(&root)?;
@@ -892,28 +816,19 @@ fn show(rest: &[String]) -> Result<i32> {
     if work != head_tree {
         println!("files on disk differ from HEAD (tree {}): commit them as they are to use their receipts", short(&work));
     }
-    let mut ids: Vec<String> = policy.as_ref().map(|p| p.receipt.keys().cloned().collect()).unwrap_or_default();
     let local = receipts_for(&db, &[head_tree.clone(), work.clone()])?;
-    for r in &local {
-        if !ids.contains(&r.receipt) {
-            ids.push(r.receipt.clone());
-        }
-    }
-    let remote = statuses(&root, &head);
+    let shown = if a.has("--history") { local } else { newest_per_id(local) };
     println!("\nlocal receipts:");
-    for id in &ids {
-        let mine: Vec<&Receipt> = local.iter().filter(|r| &r.receipt == id).collect();
-        if mine.is_empty() {
-            println!("  {id:<16} none");
-        }
-        for r in mine.iter().take(if a.has("--history") { usize::MAX } else { 1 }) {
-            let on = if r.tree == head_tree { "HEAD" } else { "files on disk" };
-            let posted = if posted_to(&db, r.row, &head) { ", posted" } else { "" };
-            println!("  {id:<16} {} on {on}: {}{posted}", r.state(), r.description());
-        }
+    if shown.is_empty() {
+        println!("  none");
+    }
+    for r in &shown {
+        let on = if r.tree == head_tree { "HEAD" } else { "files on disk" };
+        let posted = if posted_to(&db, r.row, &head) { ", posted" } else { "" };
+        println!("  {:<16} {} on {on}: {}{posted}\n  {:<16} {}", r.receipt, r.state(), r.description(), "", r.cmd);
     }
     println!("\nGitHub statuses on HEAD:");
-    match remote {
+    match statuses(&root, &head) {
         Err(e) => println!("  cannot read them: {e:#}"),
         Ok(all) if all.is_empty() => println!("  none"),
         Ok(all) => {
@@ -930,28 +845,28 @@ fn show(rest: &[String]) -> Result<i32> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Proof {
     None,
-    /// Proof on the PR head, whose tree is not the tree of the merge commit.
-    OtherTree(String),
     Failed,
-    Level(String),
+    /// Green on the PR head, whose tree is not the tree of the merge commit.
+    OtherTree,
+    Green,
 }
 
 impl Proof {
     fn of(s: Option<&Status>, same_tree: bool) -> Proof {
-        let Some(s) = s else { return Proof::None };
-        let level = s.description.as_deref().and_then(parse_description).map(|(l, _)| l).unwrap_or_else(|| "?".into());
-        if s.state != "success" {
-            return Proof::Failed;
+        match s {
+            None => Proof::None,
+            Some(s) if s.state != "success" => Proof::Failed,
+            Some(_) if same_tree => Proof::Green,
+            Some(_) => Proof::OtherTree,
         }
-        if same_tree { Proof::Level(level) } else { Proof::OtherTree(level) }
     }
 
-    fn text(&self) -> String {
+    fn text(&self) -> &'static str {
         match self {
-            Proof::None => "-".into(),
-            Proof::OtherTree(l) => format!("{l}~"),
-            Proof::Failed => "red".into(),
-            Proof::Level(l) => l.clone(),
+            Proof::None => "-",
+            Proof::Failed => "red",
+            Proof::OtherTree => "green~",
+            Proof::Green => "green",
         }
     }
 
@@ -960,29 +875,24 @@ impl Proof {
         match self {
             Proof::None => 0,
             Proof::Failed => 1,
-            Proof::OtherTree(_) => 2,
-            Proof::Level(l) if l == "partial" => 3,
-            Proof::Level(_) => 4,
+            Proof::OtherTree => 2,
+            Proof::Green => 3,
         }
     }
 }
 
-/// `proof log [--since SHA] [--id ID] [-n N] [--branch REF]`
+/// `proof log ID... [--since SHA] [-n N] [--branch REF]`
 fn log(rest: &[String]) -> Result<i32> {
-    let a = parse(rest, &["--since", "--id", "-n", "--branch"], &[])?;
+    let a = parse(rest, &["--since", "-n", "--branch"], &[])?;
+    if a.pos.is_empty() {
+        bail!("name the receipt ids: taskguard proof log unit-tests");
+    }
+    let ids = a.pos.clone();
     let root = root_here()?;
-    let policy = Policy::load(&root).ok();
     let branch = match a.one("--branch") {
         Some(b) => b.to_string(),
         None => git(&root, &["rev-parse", "--abbrev-ref", "origin/HEAD"]).unwrap_or_else(|_| "origin/main".into()),
     };
-    let ids: Vec<String> = match a.one("--id") {
-        Some(id) => vec![id.to_string()],
-        None => policy.map(|p| p.receipt.keys().cloned().collect()).unwrap_or_default(),
-    };
-    if ids.is_empty() {
-        bail!("no receipt ids: give --id ID, or add a {POLICY}");
-    }
     let n = a.one("-n").map(|v| v.parse::<usize>().context("-n needs a number")).transpose()?;
     let mut rl = vec!["rev-list".to_string(), "--first-parent".into()];
     if let Some(n) = n.or(if a.has("--since") { None } else { Some(20) }) {
@@ -1028,11 +938,11 @@ fn log(rest: &[String]) -> Result<i32> {
         let cells = ids.iter().map(|id| Proof::of(got.get(id), same)).collect();
         rows.push(Row { sha: sha.clone(), pr, subject, cells });
     }
-    if a.has("--id") {
+    if ids.len() == 1 {
         rows.sort_by_key(|r| r.cells[0].rank());
-        println!("suspects for {}, the least proven first (~ = proof on a different tree):", ids[0]);
+        println!("commits on {branch}, the least proven first (~ = green on a different tree, the PR head before the squash):");
     } else {
-        println!("proof per commit on {branch} (~ = proof on a different tree, the PR head before the squash):");
+        println!("proof per commit on {branch} (~ = green on a different tree, the PR head before the squash):");
     }
     println!("{:<10} {:<7} {} subject", "commit", "pr", ids.iter().map(|i| format!("{i:<12}")).collect::<String>());
     for r in rows {
@@ -1048,235 +958,9 @@ fn log(rest: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn hook_path(root: &Path) -> Result<PathBuf> {
-    Ok(PathBuf::from(git(root, &["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"])?))
-}
-
-fn hook_text() -> String {
-    format!(
-        "#!/bin/sh\n{HOOK_MARK}\n# Written by `taskguard proof install`; `taskguard proof uninstall` removes it.\n\
-command -v taskguard >/dev/null 2>&1 || exit 0\n\
-shas=\"\"\n\
-while read -r _ sha _ _; do\n  case \"$sha\" in *[!0]*) shas=\"$shas --sha $sha\" ;; esac\ndone\n\
-[ -n \"$shas\" ] || exit 0\n\
-# The commits reach GitHub only after this hook, so publish waits for them in the background.\n\
-nohup taskguard proof publish $shas --wait 120 >\"${{TMPDIR:-/tmp}}/taskguard-proof-publish.log\" 2>&1 &\n\
-exit 0\n"
-    )
-}
-
-/// `proof install [ID --command CMD [--os OS] [--levels L,L]]`
-fn install(rest: &[String]) -> Result<i32> {
-    let a = parse(rest, &["--command", "--os", "--levels"], &[])?;
-    let root = root_here()?;
-    let path = root.join(POLICY);
-    if let Some(cmd) = a.one("--command") {
-        let [id] = a.pos.as_slice() else { bail!("--command goes with exactly one receipt id") };
-        let text = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-            "# Proof receipts: what `taskguard --receipt ID` runs, and what proof CI accepts.\n# See `taskguard help proof`.\n".into()
-        });
-        let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("reading {}", path.display()))?;
-        let receipts = doc.entry("receipt").or_insert(toml_edit::table()).as_table_mut().context("receipt is not a table")?;
-        receipts.set_implicit(true);
-        let t = receipts.entry(id).or_insert(toml_edit::table()).as_table_mut().context("not a table")?;
-        t["command"] = toml_edit::value(cmd);
-        if let Some(os) = a.one("--os") {
-            t["os"] = toml_edit::value(os);
-        }
-        if let Some(l) = a.one("--levels") {
-            t["levels"] = toml_edit::value(l.split(',').map(str::trim).collect::<toml_edit::Array>());
-        }
-        Policy::parse(&doc.to_string(), POLICY)?;
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, doc.to_string())?;
-    } else if !a.pos.is_empty() {
-        bail!("give the command of a new receipt id: taskguard proof install ID --command \"CMD\"");
-    }
-
-    let mut todo = 0;
-    let policy = match Policy::load(&root) {
-        Ok(p) if !p.receipt.is_empty() => {
-            println!(
-                "✓ policy      {POLICY} ({} receipt ids: {})",
-                p.receipt.len(),
-                p.receipt.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-            p
-        }
-        Ok(p) => {
-            todo += 1;
-            println!("✗ policy      {POLICY} has no receipt ids; add one: taskguard proof install ID --command \"CMD\"");
-            p
-        }
-        Err(e) => {
-            todo += 1;
-            println!("✗ policy      {e:#}");
-            Policy::default()
-        }
-    };
-
-    let hook = hook_path(&root)?;
-    match std::fs::read_to_string(&hook) {
-        Ok(t) if t == hook_text() => println!("✓ push hook   {} publishes after each push", hook.display()),
-        Ok(t) if t.contains(HOOK_MARK) || t.trim().is_empty() => {
-            write_hook(&hook)?;
-            println!("✓ push hook   {} updated", hook.display());
-        }
-        Ok(_) => {
-            todo += 1;
-            println!(
-                "✗ push hook   {} is not taskguard's; run `taskguard proof publish` after each push, or call it from that hook",
-                hook.display()
-            );
-        }
-        Err(_) => {
-            write_hook(&hook)?;
-            println!("✓ push hook   {} written", hook.display());
-        }
-    }
-
-    match Command::new(gh_bin()).args(["auth", "status"]).stdout(Stdio::null()).stderr(Stdio::null()).status() {
-        Ok(s) if s.success() => println!("✓ gh          signed in"),
-        _ => {
-            todo += 1;
-            println!("✗ gh          the GitHub CLI is missing or not signed in: gh auth login");
-        }
-    }
-
-    let contexts: Vec<String> = policy.receipt.keys().map(|id| format!("{CONTEXT}{id}")).collect();
-    let rulesets = gh_api(&root, &["repos/{owner}/{repo}/rulesets", "--jq", ".[] | select(.name == \"taskguard\") | .id"]);
-    match rulesets.as_deref().map(str::trim) {
-        Ok(id) if !id.is_empty() => println!("✓ ruleset     taskguard (id {id}); check that it requires {}", contexts.join(", ")),
-        _ => {
-            println!("• ruleset     none named taskguard. Optional: make the statuses a merge gate. A repo admin runs:");
-            println!("{}", indent(&ruleset_command(&contexts), 16));
-        }
-    }
-
-    let workflows = read_workflows(&root);
-    if workflows.contains("taskguard proof check") {
-        println!("✓ CI check    a workflow runs `taskguard proof check`");
-    } else {
-        todo += 1;
-        println!("✗ CI check    no workflow runs `taskguard proof check`. A first job, then `if:` on the heavy ones:");
-        println!("{}", indent(&check_snippet(&policy), 16));
-    }
-    for id in policy.receipt.keys() {
-        if workflows.contains(&format!("--receipt {id}")) || workflows.contains(&format!("--receipt={id}")) {
-            println!("✓ CI {id:<9} runs `taskguard --receipt {id}`");
-        } else {
-            println!("• CI {id:<9} optional: let CI post {CONTEXT}{id} too, so a rerun skips what passed:");
-            println!(
-                "{}",
-                indent(
-                    &format!(
-                        "permissions:\n  statuses: write\n...\n- run: taskguard --receipt {id} && taskguard proof publish --sha \"$HEAD_SHA\"\n  env:\n    GH_TOKEN: ${{{{ github.token }}}}\n    HEAD_SHA: ${{{{ github.event.pull_request.head.sha || github.sha }}}}"
-                    ),
-                    16
-                )
-            );
-        }
-    }
-    if todo > 0 {
-        println!("\n{todo} to do. Run `taskguard proof install` again after you fix them.");
-    }
-    Ok(0)
-}
-
-fn write_hook(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(path, hook_text())?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    Ok(())
-}
-
-fn indent(s: &str, n: usize) -> String {
-    s.lines().map(|l| format!("{}{l}", " ".repeat(n))).collect::<Vec<_>>().join("\n")
-}
-
-fn read_workflows(root: &Path) -> String {
-    let dir = root.join(".github/workflows");
-    let mut all = String::new();
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.path().extension().is_some_and(|x| x == "yml" || x == "yaml") {
-            all.push_str(&std::fs::read_to_string(e.path()).unwrap_or_default());
-        }
-    }
-    all
-}
-
-fn ruleset_command(contexts: &[String]) -> String {
-    let checks: Vec<String> = contexts.iter().map(|c| format!("{{\"context\":\"{c}\"}}")).collect();
-    format!(
-        "gh api -X POST repos/{{owner}}/{{repo}}/rulesets --input - <<'JSON'\n\
-{{\"name\":\"taskguard\",\"target\":\"branch\",\"enforcement\":\"evaluate\",\n \
-\"conditions\":{{\"ref_name\":{{\"include\":[\"~DEFAULT_BRANCH\"],\"exclude\":[]}}}},\n \
-\"rules\":[{{\"type\":\"required_status_checks\",\"parameters\":{{\"strict_required_status_checks_policy\":false,\n   \
-\"required_status_checks\":[{}]}}}}]}}\nJSON",
-        checks.join(",")
-    )
-}
-
-fn check_snippet(policy: &Policy) -> String {
-    let ids: Vec<&String> = policy.receipt.keys().collect();
-    let first = ids.first().map(|s| s.as_str()).unwrap_or("ID");
-    format!(
-        "proof:\n  runs-on: ubuntu-latest\n  permissions: {{ contents: read, statuses: read }}\n  outputs:\n    {first}: ${{{{ steps.check.outputs['{first}'] }}}}\n  steps:\n    - uses: actions/checkout@v4\n      with: {{ sparse-checkout: .taskguard }}\n    - id: check\n      run: taskguard proof check --sha \"$HEAD_SHA\" --labels \"$LABELS\" --wait 30 --github-output\n      env:\n        GH_TOKEN: ${{{{ github.token }}}}\n        HEAD_SHA: ${{{{ github.event.pull_request.head.sha || github.sha }}}}\n        LABELS: ${{{{ join(github.event.pull_request.labels.*.name, ',') }}}}\n{first}-job:\n  needs: [proof]\n  if: needs.proof.outputs['{first}'] != 'skip'"
-    )
-}
-
-/// `proof uninstall [ID] [--purge-local]`
-fn uninstall(rest: &[String]) -> Result<i32> {
-    let a = parse(rest, &[], &["--purge-local"])?;
-    let root = root_here()?;
-    let path = root.join(POLICY);
-    let policy = Policy::load(&root).unwrap_or_default();
-    if let [id] = a.pos.as_slice() {
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let mut doc: toml_edit::DocumentMut = text.parse()?;
-        let removed = doc.get_mut("receipt").and_then(|r| r.as_table_mut()).and_then(|t| t.remove(id)).is_some();
-        if !removed {
-            bail!("no receipt id {id:?} in {POLICY}");
-        }
-        std::fs::write(&path, doc.to_string())?;
-        println!("removed [receipt.{id}] from {POLICY}");
-        println!("still to do by hand: drop {CONTEXT}{id} from the taskguard ruleset, and the CI lines that check or run {id}");
-    } else if a.pos.is_empty() {
-        if std::fs::remove_file(&path).is_ok() {
-            println!("removed {POLICY}");
-        }
-        let hook = hook_path(&root)?;
-        if std::fs::read_to_string(&hook).is_ok_and(|t| t.contains(HOOK_MARK)) {
-            std::fs::remove_file(&hook)?;
-            println!("removed the push hook {}", hook.display());
-        }
-        let ids: Vec<String> = policy.receipt.keys().map(|id| format!("{CONTEXT}{id}")).collect();
-        println!(
-            "still to do by hand: the taskguard ruleset{} and the CI lines that run `taskguard proof check` or `--receipt`",
-            if ids.is_empty() { String::new() } else { format!(" ({})", ids.join(", ")) }
-        );
-    } else {
-        bail!("uninstall takes at most one receipt id");
-    }
-    if a.has("--purge-local") {
-        let db = Db::open_dir(&config::state_dir())?;
-        let n = db.conn.execute("DELETE FROM receipts", [])?;
-        db.conn.execute("DELETE FROM receipt_posts", [])?;
-        println!("dropped {n} local receipts");
-    } else {
-        println!("local receipts stay; --purge-local drops them");
-    }
-    Ok(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn rule(cmd: &str) -> Rule {
-        Rule { command: cmd.into(), os: "any".into(), levels: vec!["full".into()], env_files: "deny".into(), env_allow: vec![] }
-    }
 
     fn status(state: &str, desc: &str) -> Status {
         Status {
@@ -1289,134 +973,69 @@ mod tests {
         }
     }
 
-    fn v(s: &str) -> Vec<String> {
-        matcher::split_shell(s)
-    }
-
-    #[test]
-    fn policy_defaults_and_checks() {
-        let p = Policy::parse("[receipt.unit]\ncommand = \"turbo run test:unit\"\n", "t").unwrap();
-        assert_eq!(p.rule("unit").unwrap(), &rule("turbo run test:unit"));
-        assert!(Policy::parse("[receipt.unit]\ncommand = \"x\"\nos = \"windows\"\n", "t").is_err());
-        assert!(Policy::parse("[receipt.unit]\ncommand = \"x\"\nlevels = [\"some\"]\n", "t").is_err());
-        assert!(Policy::parse("[receipt.\"a b\"]\ncommand = \"x\"\n", "t").is_err());
-        assert!(Policy::parse("[receipt.unit]\ncommand = \" \"\n", "t").is_err());
-        assert!(p.rule("e2e").unwrap_err().to_string().contains("it has: unit"));
-    }
-
-    #[test]
-    fn only_the_policy_command_is_full() {
-        let r = rule("turbo run test:unit --affected");
-        assert_eq!(level_of(&r, &[], None).unwrap().0, "full");
-        assert_eq!(level_of(&r, &v("turbo run test:unit --affected"), None).unwrap().0, "full");
-        assert_eq!(level_of(&r, &v("sh -c 'turbo run test:unit --affected'"), None).unwrap().0, "full");
-        assert!(level_of(&r, &v("turbo run test:unit --filter api"), None).is_err(), "a subset needs --partial");
-        let (l, why) = level_of(&r, &v("turbo run test:unit --filter api"), Some("only api changed")).unwrap();
-        assert_eq!((l, why.as_deref()), ("partial", Some("only api changed")));
-        assert!(level_of(&r, &[], Some(" ")).is_err(), "a partial says why");
-    }
-
     #[test]
     fn the_description_reads_back() {
-        let mut r = Receipt {
+        let r = Receipt {
             row: 1,
             receipt: "unit".into(),
             tree: "t".into(),
             head: None,
-            repo: None,
-            level: "full".into(),
-            reason: None,
             ok: true,
             exit: Some(0),
             cmd: "x".into(),
-            host: "mbp".into(),
+            fingerprint: "3fa1c0d2e4b1".into(),
+            host: "h".repeat(200),
             os: "macos".into(),
             arch: "aarch64".into(),
-            version: "0.8.0".into(),
             started_at: 0.0,
             duration_s: 723.0,
         };
-        assert_eq!(r.description(), "full, macos/aarch64, 12m03s, mbp");
-        assert_eq!(parse_description(&r.description()), Some(("full".into(), "macos".into())));
-        r.level = "partial".into();
-        r.reason = Some("changed the transfer form, ran the transfer specs, ".repeat(5));
         let d = r.description();
-        assert_eq!(d.chars().count(), DESC_MAX);
-        assert_eq!(parse_description(&d), Some(("partial".into(), "macos".into())));
+        assert!(d.starts_with("f:3fa1c0d2e4b1, macos/aarch64, 12m03s, hhh"), "{d}");
+        assert_eq!(d.chars().count(), DESC_MAX, "a long host is cut");
+        assert_eq!(parse_description(&d).as_deref(), Some("macos"));
+        // Statuses of the first demo builds read too.
+        assert_eq!(parse_description("full, linux/x86_64, 9m, ci").as_deref(), Some("linux"));
         assert_eq!(parse_description("Build passed"), None);
     }
 
     #[test]
-    fn ci_skips_only_accepted_green_proof() {
-        let mut r = rule("x");
-        let green = status("success", "full, macos/aarch64, 12m03s, mbp");
-        assert!(decide("unit", &r, Some(&green), &[]).0);
-        assert!(!decide("unit", &r, None, &[]).0, "no proof: run");
-        assert!(!decide("unit", &r, Some(&status("failure", "full, macos/aarch64, 1m, mbp")), &[]).0, "red: CI runs it");
-        assert!(!decide("unit", &r, Some(&status("pending", "")), &[]).0);
-        assert!(!decide("unit", &r, Some(&status("success", "all good")), &[]).0, "a status taskguard did not write");
-        assert!(!decide("unit", &r, Some(&status("success", "partial, macos/aarch64, 1m, mbp: api only")), &[]).0);
-        assert!(!decide("unit", &r, Some(&green), &["taskguard:ci".into()]).0, "forced for all");
-        assert!(!decide("unit", &r, Some(&green), &["taskguard:ci:unit".into()]).0, "forced for one");
-        assert!(decide("unit", &r, Some(&green), &["taskguard:ci:e2e".into()]).0, "another id's label");
-        r.os = "linux".into();
-        assert!(!decide("unit", &r, Some(&green), &[]).0, "the policy wants Linux");
-        assert!(decide("unit", &r, Some(&status("success", "full, linux/x86_64, 9m, ci")), &[]).0);
-        r.levels = vec!["full".into(), "partial".into()];
-        assert!(decide("unit", &r, Some(&status("success", "partial, linux/x86_64, 1m, box: api only")), &[]).0);
-    }
-
-    #[test]
-    fn a_partial_receipt_does_not_hide_a_full_one() {
-        let mk = |row: i64, level: &str, ok: bool| Receipt {
-            row,
-            receipt: "unit".into(),
-            tree: "t".into(),
-            head: None,
-            repo: None,
-            level: level.into(),
-            reason: None,
-            ok,
-            exit: Some(0),
-            cmd: "x".into(),
-            host: "h".into(),
-            os: "macos".into(),
-            arch: "aarch64".into(),
-            version: "v".into(),
-            started_at: row as f64,
-            duration_s: 1.0,
-        };
-        // Newest first, as receipts_for gives them.
-        let got = strongest_per_id(vec![mk(3, "partial", true), mk(2, "full", true), mk(1, "full", false)]);
-        assert_eq!(got.iter().map(|r| r.row).collect::<Vec<_>>(), [2]);
-        let got = strongest_per_id(vec![mk(3, "full", false), mk(2, "full", true)]);
-        assert_eq!(got[0].row, 3, "a newer full run counts, red too");
+    fn ci_skips_only_on_green_proof_from_an_accepted_os() {
+        let green = status("success", "f:3fa1c0d2e4b1, macos/aarch64, 12m03s, mbp");
+        assert!(decide("unit", "any", Some(&green), &[]).0);
+        assert!(!decide("unit", "any", None, &[]).0, "no proof: run");
+        assert!(!decide("unit", "any", Some(&status("failure", "f:1, macos/aarch64, 1m, mbp")), &[]).0, "red: CI runs it");
+        assert!(!decide("unit", "any", Some(&status("pending", "")), &[]).0);
+        assert!(!decide("unit", "any", Some(&status("success", "all good")), &[]).0, "a status taskguard did not write");
+        assert!(!decide("unit", "any", Some(&green), &["taskguard:ci".into()]).0, "forced for all");
+        assert!(!decide("unit", "any", Some(&green), &["taskguard:ci:unit".into()]).0, "forced for one");
+        assert!(decide("unit", "any", Some(&green), &["taskguard:ci:e2e".into()]).0, "another id's label");
+        assert!(!decide("unit", "linux", Some(&green), &[]).0, "the check wants Linux");
+        assert!(decide("unit", "linux", Some(&status("success", "f:1, linux/x86_64, 9m, ci")), &[]).0);
     }
 
     #[test]
     fn the_newest_status_per_context_counts() {
-        let mut old = status("failure", "full, macos/aarch64, 1m, mbp");
+        let mut old = status("failure", "f:1, macos/aarch64, 1m, mbp");
         old.created_at = "2026-10-09T09:00:00Z".into();
-        let new = status("success", "full, linux/x86_64, 9m, ci");
+        let new = status("success", "f:1, linux/x86_64, 9m, ci");
         let mut all = vec![old, new.clone()];
         all.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         assert_eq!(newest(&all).get("unit"), Some(&new));
     }
 
     #[test]
-    fn suspects_rank_least_proven_first() {
-        let mut v =
-            [Proof::Level("full".into()), Proof::Level("partial".into()), Proof::OtherTree("full".into()), Proof::None, Proof::Failed];
-        v.sort_by_key(Proof::rank);
-        assert_eq!(v.iter().map(Proof::text).collect::<Vec<_>>(), ["-", "red", "full~", "partial", "full"]);
+    fn the_event_gives_the_pr_head_and_labels() {
+        let e = read_event(r#"{"pull_request":{"head":{"sha":"abc"},"labels":[{"name":"bug"},{"name":"taskguard:ci"}]}}"#);
+        assert_eq!(e, Event { head_sha: Some("abc".into()), labels: vec!["bug".into(), "taskguard:ci".into()] });
+        assert_eq!(read_event(r#"{"ref":"refs/heads/main"}"#), Event::default(), "a push event has no PR");
+        assert_eq!(read_event("not json"), Event::default());
     }
 
     #[test]
-    fn the_ruleset_command_is_json() {
-        let c = ruleset_command(&["taskguard/unit".into(), "taskguard/e2e".into()]);
-        let json = c.split("<<'JSON'\n").nth(1).unwrap().trim_end_matches("JSON");
-        let v: serde_json::Value = serde_json::from_str(json).unwrap();
-        assert_eq!(v["enforcement"], "evaluate");
-        assert_eq!(v["rules"][0]["parameters"]["required_status_checks"][1]["context"], "taskguard/e2e");
+    fn suspects_rank_least_proven_first() {
+        let mut v = [Proof::Green, Proof::OtherTree, Proof::None, Proof::Failed];
+        v.sort_by_key(Proof::rank);
+        assert_eq!(v.iter().map(Proof::text).collect::<Vec<_>>(), ["-", "red", "green~", "green"]);
     }
 }

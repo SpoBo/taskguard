@@ -18,11 +18,10 @@ options (sem style; the default is to run in the foreground):
   --pipe                  with --bg: pass stdin to the command
   -q, --quiet             only print waits longer than the status interval
   --hints / --no-hints    agent hints on or off for this call
-  --receipt ID            run for a proof receipt (taskguard help proof); no
-                          COMMAND runs the policy command of ID
-  --partial REASON        with --receipt: a chosen subset, and why it is enough
-  --publish SECS          with --receipt: publish in the background once HEAD has
-                          these files and is on GitHub, for up to SECS
+  --receipt ID            run COMMAND as job ID and publish a proof that CI
+                          can skip on (taskguard help proof)
+  --allow-env-file GLOB   with --receipt: an ignored .env* file that may exist
+  --no-publish            with --receipt: keep the receipt on this machine
 ";
 
 const RUN: &str = "\
@@ -203,68 +202,59 @@ $TSC_QUEUE_DIR/history.tsv) into taskguard's history, once.
 ";
 
 const PROOF: &str = "\
-taskguard --receipt ID [--partial REASON] [--publish SECS] [-- COMMAND]
+taskguard --receipt ID [--allow-env-file GLOB]... [--no-publish] -- COMMAND
+taskguard proof check ID... [--os OS] [--github-output] [--sha SHA] [--labels L,L] [--wait SECS]
 taskguard proof publish [--sha SHA]... [--wait SECS] [--again] [-q]
 taskguard proof show [--history]
-taskguard proof check [ID...] [--sha SHA] [--labels L,L] [--wait SECS] [--github-output]
-taskguard proof log [--id ID] [--since SHA] [-n N] [--branch REF]
-taskguard proof install [ID --command \"CMD\" [--os OS] [--levels L,L]]
-taskguard proof uninstall [ID] [--purge-local]
+taskguard proof log ID... [--since SHA] [-n N] [--branch REF]
 
-Proof receipts: publish what passed on this machine as GitHub commit statuses
-(taskguard/ID), so CI can skip work that is already proven.
+Proof receipts: publish what passed on this machine as a GitHub commit status
+(taskguard/ID), so CI can skip a job that is already proven.
 
-1. Run. `taskguard --receipt ID` runs the command that .taskguard/proof.toml
-   names for ID. It hashes the files on disk before and after the run,
-   uncommitted and untracked files included, ignored files left out. When the
-   hash did not change, it keeps a receipt: passed or failed, on that tree.
-   A file that changed during the run means no receipt. The command runs at
-   once, outside the queue: it is mostly a task runner whose leaves queue.
-   Another command proves only a part: give --partial \"REASON\".
-2. Publish. After the push, `proof publish` posts each receipt whose tree is
-   the tree of the pushed commit, as status taskguard/ID: green or red, with
-   \"LEVEL, OS/ARCH, DURATION, HOST\" as its description. A commit of other
-   files gets nothing. The push hook from `proof install` does this.
-3. Check. In CI, `proof check` reads the statuses of the PR head and says per
-   ID: skip (green, at a level and on an OS the policy accepts) or run (no
-   proof, red, another level or OS, a taskguard:ci or taskguard:ci:ID label).
-   It cannot read the statuses: run. Exit 0 when all skip; with
-   --github-output it writes ID=skip|run to $GITHUB_OUTPUT and exits 0, and
-   a missing policy or ID means run, not an error.
+A repo adds three things:
 
-The policy, .taskguard/proof.toml:
+  1. Where the job's command runs, in CI and in the local pipeline:
+       taskguard --receipt unit-tests -- <the command, unchanged>
+  2. One step in a small first CI job:
+       taskguard proof check unit-tests --github-output
+  3. On the heavy job:
+       if: needs.<that job>.outputs.unit-tests != 'skip'
 
-  [receipt.unit-tests]
-  command = \"bun install --frozen-lockfile && turbo run test:unit\"
-  os = \"any\"             # any, linux or macos: whose proof CI accepts
-  levels = [\"full\"]      # full and/or partial: what lets a PR skip CI
-  env_files = \"deny\"     # deny: no receipt while an ignored .env* file exists
-  env_allow = []          # globs of ignored .env* files that may exist
+--receipt ID is the opt-in, per command; every other taskguard call stays as
+it was. The receipt name is the contract: a run under --receipt unit-tests
+says \"this is the Unit Tests job\".
 
-The command must rebuild what the hash cannot see: install dependencies from
-the lockfile, and let the task runner build dist and generated code.
+Run. taskguard hashes the files on disk before and after the command,
+uncommitted and untracked files included, ignored files left out. The same
+hash both times: a receipt, green or red, on that tree. A file that changed
+during the run, or an ignored .env* file, means no receipt. The command runs
+at once, outside the queue: it is mostly a task runner whose leaves queue.
+
+Publish. On a laptop a background process watches the branch on GitHub for an
+hour, and posts the status when the branch head has exactly the tested files;
+the checkout may be gone by then. In GitHub Actions the job posts at once, on
+the PR head (it needs statuses: write and GH_TOKEN). The description is
+\"f:FINGERPRINT, OS/ARCH, DURATION, HOST\"; the fingerprint is a hash of the
+command line.
+
+Check. In GitHub Actions, proof check reads the PR head and its labels from
+the event, and waits up to 30 s for a status that is still on its way. Per ID:
+skip for a green status from an OS that --os accepts (default any); run for no
+status, red, a taskguard:ci or taskguard:ci:ID label, or a gh error. Exit 0
+when all skip; --github-output writes ID=skip|run to $GITHUB_OUTPUT and
+exits 0.
 
 commands:
-  publish         post receipts for HEAD (or each --sha). --wait SECS waits
-                  for the commit to reach GitHub; without --sha it follows
-                  HEAD meanwhile, so later commits and the push may come
-                  after it starts. A full receipt wins over a partial one on
-                  the same files. CI checks out a merge of the PR head:
-                  --sha HEAD_SHA posts its receipts on the PR head.
+  check           skip or run per ID, for CI
+  publish         post receipts by hand: for HEAD (or each --sha) once it is
+                  on GitHub; --wait SECS waits for that
   show            this checkout: local receipts and the statuses on HEAD
-  check           CI: skip or run per ID. --wait SECS waits for statuses that
-                  are missing, for a push whose proof is still on its way.
-  log             proof per commit on the main branch; a squash merge reads
-                  the PR head (~ marks proof on a different tree). With --id,
-                  the least proven commits first: the suspects when a full
-                  run goes red.
-  install         write a policy entry, the pre-push hook, and print what
-                  else is missing: the CI check job, and the ruleset that
-                  makes the statuses a merge gate.
-  uninstall       remove one ID from the policy, or the policy and the hook.
+  log             each ID per commit on the main branch, the least proven
+                  first when one ID is given; a squash merge reads the PR head
+                  (~ marks a different tree)
 
-GitHub is reached through the gh CLI (GH_TOKEN in CI). TASKGUARD_GH names
-another gh.
+GitHub is reached through the gh CLI (GH_TOKEN in CI, GH_REPO to name the
+repo). TASKGUARD_GH names another gh.
 ";
 
 const VERSION: &str = "\

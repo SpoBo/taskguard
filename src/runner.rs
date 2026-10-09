@@ -43,10 +43,10 @@ pub struct Opts {
     pub priority: Option<i32>,
     /// --receipt ID: run the command for a proof receipt (see `proof.rs`).
     pub receipt: Option<String>,
-    /// --partial REASON: the receipt covers a chosen subset.
-    pub partial: Option<String>,
-    /// --publish SECS: with --receipt, publish in the background after the push.
-    pub publish: Option<u64>,
+    /// --allow-env-file GLOB: with --receipt, an ignored .env file that may exist.
+    pub allow_env_files: Vec<String>,
+    /// --no-publish: with --receipt, keep the receipt here only.
+    pub no_publish: bool,
     pub cmd: Vec<String>,
 }
 

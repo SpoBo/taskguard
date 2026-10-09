@@ -42,10 +42,8 @@ usage:
                                                drop runs from the history, or put them back (a dry run without --apply)
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
-  taskguard --receipt ID [--partial WHY] [-- COMMAND]
-                                               run a command for a proof receipt that CI can skip on
-  taskguard proof publish|show|check|log|install|uninstall
-                                               publish receipts as commit statuses, and read them back
+  taskguard --receipt ID -- COMMAND            run COMMAND as job ID, and publish a proof that CI can skip on
+  taskguard proof check|publish|show|log       skip or run in CI, publish by hand, and read proofs back
   taskguard run [options] -- COMMAND           the same as the first form, for a command named like a subcommand
   taskguard help COMMAND                       more about one command; COMMAND --help shows the same
   taskguard help --all                         every command in full, in one text (for LLM agents)
@@ -136,11 +134,8 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
             "--no-hints" => o.hints = Some(false),
             "--wait" => o.wait = true,
             "--receipt" => o.receipt = Some(take_value(args, &mut i, name)?),
-            "--partial" => o.partial = Some(take_value(args, &mut i, name)?),
-            "--publish" => {
-                let v = take_value(args, &mut i, name)?;
-                o.publish = Some(v.parse().map_err(|_| anyhow::anyhow!("--publish needs a number of seconds"))?);
-            }
+            "--allow-env-file" => o.allow_env_files.push(take_value(args, &mut i, name)?),
+            "--no-publish" => o.no_publish = true,
             "-h" | "--help" => o.help = true,
             _ if a.starts_with('-') && o.cmd.is_empty() => bail!("unknown option {a}\n\n{}", usage()),
             _ => break,
@@ -216,10 +211,11 @@ fn dispatch(args: &[String]) -> Result<i32> {
         if o.jobs.is_some() || o.id.is_some() || o.bg || o.wait {
             bail!("--receipt runs the command outside the queue; put taskguard inside the command for that");
         }
-        return proof::run_receipt(id, o.partial.as_deref(), o.publish, &o.cmd);
+        let ro = proof::ReceiptOpts { id: id.clone(), allow_env_files: o.allow_env_files.clone(), no_publish: o.no_publish };
+        return proof::run_receipt(&ro, &o.cmd);
     }
-    if o.partial.is_some() || o.publish.is_some() {
-        bail!("--partial and --publish go with --receipt ID");
+    if !o.allow_env_files.is_empty() || o.no_publish {
+        bail!("--allow-env-file and --no-publish go with --receipt ID");
     }
     if o.wait && o.cmd.is_empty() {
         return runner::wait_pool(o.id.as_deref());
@@ -271,11 +267,11 @@ mod tests {
         assert_eq!(o.cmd, v("tsc --watch"), "options after the command belong to it");
 
         assert!(parse_opts(&v("--bogus tsc")).is_err());
-        let o = parse_opts(&v("--receipt e2e --partial 'transfer specs only' -- bunx playwright test transfer")).unwrap();
-        assert_eq!((o.receipt.as_deref(), o.partial.as_deref()), (Some("e2e"), Some("transfer specs only")));
-        assert_eq!(o.cmd, v("bunx playwright test transfer"));
-        let o = parse_opts(&v("--receipt=unit")).unwrap();
-        assert!(o.receipt.is_some() && o.cmd.is_empty(), "no command: the policy command");
+        let o = parse_opts(&v("--receipt unit-tests --allow-env-file '**/.env.test' --no-publish -- bun run ci")).unwrap();
+        assert_eq!(o.receipt.as_deref(), Some("unit-tests"));
+        assert_eq!(o.allow_env_files, ["**/.env.test"]);
+        assert!(o.no_publish);
+        assert_eq!(o.cmd, v("bun run ci"));
         let o = parse_opts(&v("--wait --id build")).unwrap();
         assert!(o.wait && o.cmd.is_empty());
     }

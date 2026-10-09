@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS receipts (
   arch TEXT,
   version TEXT,
   started_at REAL NOT NULL,
-  duration_s REAL NOT NULL
+  duration_s REAL NOT NULL,
+  fingerprint TEXT
 );
 CREATE INDEX IF NOT EXISTS receipts_tree ON receipts(tree);
 -- Each commit status a receipt was posted as.
@@ -556,6 +557,11 @@ impl Db {
             if !has {
                 conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {col} {kind}"))?;
             }
+        }
+        // Receipt tables of the 0.9.0 pre-releases: the command fingerprint.
+        let has_fp: bool = conn.prepare("SELECT 1 FROM pragma_table_info('receipts') WHERE name = 'fingerprint'")?.exists([])?;
+        if !has_fp {
+            conn.execute_batch("ALTER TABLE receipts ADD COLUMN fingerprint TEXT")?;
         }
         Ok(Db { conn })
     }

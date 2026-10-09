@@ -540,42 +540,44 @@ fn every_command_has_help_and_help_all_has_them_all() {
     assert_eq!(out(&["--now", "--", "sh", "-c", "echo got $1", "x", "--help"]), "got --help\n");
 }
 
-/// A real git repo with a proof policy, and a fake `gh` that logs its calls
-/// and answers from files: `statuses.json` for a commit's statuses.
+/// A real git repo, and a fake `gh` that logs its calls and answers from
+/// files: `statuses.json` for a commit's statuses, `branch.txt` for the head
+/// of a branch on GitHub ("SHA TREE").
 struct Proof {
     e: Env,
     gh_log: PathBuf,
 }
 
 impl Proof {
-    fn new(command: &str) -> Proof {
+    fn new() -> Proof {
         let e = Env::new("");
         std::fs::remove_dir_all(e.cwd.join(".git")).unwrap();
         let p = Proof { gh_log: e.cwd.parent().unwrap().join("gh.log"), e };
         p.git(&["init", "-q", "-b", "main"]);
         p.git(&["config", "user.email", "t@t"]);
         p.git(&["config", "user.name", "t"]);
-        std::fs::create_dir_all(p.e.cwd.join(".taskguard")).unwrap();
-        std::fs::write(p.e.cwd.join(".taskguard/proof.toml"), format!("[receipt.unit]\ncommand = {command:?}\n")).unwrap();
         std::fs::write(p.e.cwd.join(".gitignore"), "out/\n.env\n").unwrap();
         std::fs::write(p.e.cwd.join("a.txt"), "one\n").unwrap();
         p.git(&["add", "-A"]);
         p.git(&["commit", "-qm", "first"]);
-        let gh = p.e.cwd.parent().unwrap().join("gh");
-        let statuses = p.e.cwd.parent().unwrap().join("statuses.json");
-        std::fs::write(&statuses, "").unwrap();
+        std::fs::write(p.side("statuses.json"), "").unwrap();
         std::fs::write(
-            &gh,
+            p.side("gh"),
             format!(
-                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$*\" in\n  *statuses\\ --jq*) cat {st} ;;\n  *-X\\ POST*) ;;\n  *branches/*) cat {br} 2>/dev/null ;;\n  *commits/*) echo sha ;;\nesac\n",
+                "#!/bin/sh\necho \"$*\" >> {log}\ncase \"$*\" in\n  *statuses\\ --jq*) cat {st} ;;\n  *-X\\ POST*) ;;\n  *branches/*) cat {br} 2>/dev/null ;;\n  *commits/*) echo sha ;;\n  repo\\ view*) echo o/r ;;\nesac\n",
                 log = p.gh_log.display(),
-                st = statuses.display(),
-                br = p.e.cwd.parent().unwrap().join("branch.txt").display()
+                st = p.side("statuses.json").display(),
+                br = p.side("branch.txt").display()
             ),
         )
         .unwrap();
-        Command::new("chmod").arg("+x").arg(&gh).status().unwrap();
+        Command::new("chmod").arg("+x").arg(p.side("gh")).status().unwrap();
         p
+    }
+
+    /// A file next to the repo.
+    fn side(&self, name: &str) -> PathBuf {
+        self.e.cwd.parent().unwrap().join(name)
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -584,33 +586,51 @@ impl Proof {
         String::from_utf8_lossy(&o.stdout).trim().to_string()
     }
 
-    fn tg(&self, args: &[&str]) -> Output {
-        self.e.cmd(args).env("TASKGUARD_GH", self.e.cwd.parent().unwrap().join("gh")).env_remove("GITHUB_ACTIONS").output().unwrap()
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut c = self.e.cmd(args);
+        c.env("TASKGUARD_GH", self.side("gh"))
+            .env("TMPDIR", self.e.cwd.parent().unwrap())
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("GITHUB_EVENT_PATH")
+            .env_remove("GH_REPO");
+        c
     }
 
-    fn receipts(&self) -> Vec<(String, String, String, i64)> {
+    fn tg(&self, args: &[&str]) -> Output {
+        self.cmd(args).output().unwrap()
+    }
+
+    fn receipts(&self) -> Vec<(String, String, i64)> {
         if !self.e.dir.join("taskguard.db").exists() {
             return Vec::new();
         }
         let db = self.e.db();
-        let mut st = db.prepare("SELECT receipt, tree, level, ok FROM receipts ORDER BY id").unwrap();
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap().map(|r| r.unwrap()).collect()
+        let mut st = db.prepare("SELECT receipt, tree, ok FROM receipts ORDER BY id").unwrap();
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap().map(|r| r.unwrap()).collect()
     }
 
     fn gh_calls(&self) -> String {
         std::fs::read_to_string(&self.gh_log).unwrap_or_default()
     }
+
+    fn wait_for_call(&self, part: &str) {
+        let t0 = Instant::now();
+        while !self.gh_calls().contains(part) {
+            assert!(t0.elapsed() < Duration::from_secs(30), "no {part:?} in: {}", self.gh_calls());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
 }
 
 #[test]
 fn a_receipt_proves_the_files_on_disk_and_publishes_on_the_commit_of_those_files() {
-    let p = Proof::new("mkdir -p out && echo built > out/x");
+    let p = Proof::new();
     // An uncommitted edit and a new file are part of what ran.
     std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
     std::fs::write(p.e.file("b.txt"), "new\n").unwrap();
-    let o = p.tg(&["--receipt", "unit"]);
+    let o = p.tg(&["--receipt", "unit", "--no-publish", "--", "sh", "-c", "mkdir -p out && echo built > out/x"]);
     assert!(o.status.success(), "{}", stderr(&o));
-    assert!(stderr(&o).contains("receipt unit: full passed"), "{}", stderr(&o));
+    assert!(stderr(&o).contains("receipt unit: passed"), "{}", stderr(&o));
     assert_eq!(p.git(&["status", "--porcelain"]).lines().count(), 2, "the real index is untouched");
     let r = p.receipts();
     assert_eq!(r.len(), 1);
@@ -630,122 +650,132 @@ fn a_receipt_proves_the_files_on_disk_and_publishes_on_the_commit_of_those_files
     let calls = p.gh_calls();
     assert!(
         calls.contains(&format!(
-            "-X POST repos/{{owner}}/{{repo}}/statuses/{head} -f state=success -f context=taskguard/unit -f description=full, "
+            "-X POST repos/{{owner}}/{{repo}}/statuses/{head} -f state=success -f context=taskguard/unit -f description=f:"
         )),
         "{calls}"
     );
-    // Posted once: a second publish has nothing new.
     let o = p.tg(&["proof", "publish"]);
-    assert!(String::from_utf8_lossy(&o.stdout).contains("nothing to publish"));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("nothing to publish"), "posted once");
 }
 
 #[test]
-fn no_receipt_when_files_change_during_the_run_or_for_another_command() {
-    let p = Proof::new("echo changed >> a.txt");
-    let o = p.tg(&["--receipt", "unit"]);
+fn no_receipt_when_files_change_during_the_run_or_an_env_file_exists() {
+    let p = Proof::new();
+    let o = p.tg(&["--receipt", "unit", "--no-publish", "--", "sh", "-c", "echo changed >> a.txt"]);
     assert!(o.status.success());
     assert!(stderr(&o).contains("files changed while it ran"), "{}", stderr(&o));
     assert!(p.receipts().is_empty());
+    p.git(&["checkout", "a.txt"]);
 
-    let o = p.tg(&["--receipt", "unit", "--", "true"]);
-    assert!(!o.status.success() && stderr(&o).contains("--partial"), "{}", stderr(&o));
-    let o = p.tg(&["--receipt", "unit", "--partial", "only the fast part", "--", "true"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    let o = p.tg(&["--receipt", "unit", "--partial", "fails", "--", "sh", "-c", "exit 3"]);
+    let o = p.tg(&["--receipt", "unit"]);
+    assert!(!o.status.success() && stderr(&o).contains("needs the command"), "{}", stderr(&o));
+    let o = p.tg(&["--receipt", "unit", "--no-publish", "--", "sh", "-c", "exit 3"]);
     assert_eq!(o.status.code(), Some(3), "the command's exit code");
-    let r = p.receipts();
-    assert_eq!(r.iter().map(|r| (r.2.as_str(), r.3)).collect::<Vec<_>>(), [("partial", 1), ("partial", 0)]);
+    assert_eq!(p.receipts().iter().map(|r| r.2).collect::<Vec<_>>(), [0], "a red receipt");
 
     // An ignored .env file can change a result that the hash cannot see.
     std::fs::write(p.e.file(".env"), "FLAG=1\n").unwrap();
-    let o = p.tg(&["--receipt", "unit", "--partial", "x", "--", "true"]);
+    let o = p.tg(&["--receipt", "unit", "--no-publish", "--", "true"]);
     assert!(!o.status.success() && stderr(&o).contains(".env"), "{}", stderr(&o));
+    let o = p.tg(&["--receipt", "unit", "--no-publish", "--allow-env-file", ".env", "--", "true"]);
+    assert!(o.status.success(), "{}", stderr(&o));
 }
 
 #[test]
-fn check_skips_on_green_full_proof_and_runs_otherwise() {
-    let p = Proof::new("true");
-    let statuses = p.e.cwd.parent().unwrap().join("statuses.json");
+fn a_laptop_receipt_publishes_when_the_branch_on_github_has_its_files() {
+    let p = Proof::new();
+    std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
+    let o = p.tg(&["--receipt", "unit", "--", "true"]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains("when main on o/r has these files"), "{}", stderr(&o));
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(!p.gh_calls().contains("POST"));
+    // The push: the branch on GitHub now has the tested files. The checkout
+    // itself may be gone by then.
+    p.git(&["commit", "-qam", "second"]);
     let head = p.git(&["rev-parse", "HEAD"]);
-    let o = p.tg(&["proof", "check", "--sha", &head]);
+    std::fs::write(p.side("branch.txt"), format!("{head} {}\n", p.git(&["rev-parse", "HEAD^{tree}"]))).unwrap();
+    p.wait_for_call(&format!("statuses/{head}"));
+}
+
+#[test]
+fn in_github_actions_the_receipt_posts_on_the_pr_head_at_once() {
+    let p = Proof::new();
+    let head = p.git(&["rev-parse", "HEAD"]);
+    std::fs::write(p.side("event.json"), format!(r#"{{"pull_request":{{"head":{{"sha":"{head}"}},"labels":[]}}}}"#)).unwrap();
+    let o = p
+        .cmd(&["--receipt", "unit", "--", "true"])
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_EVENT_PATH", p.side("event.json"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains("Posted taskguard/unit"), "{}", stderr(&o));
+    assert!(
+        p.gh_calls().contains(&format!("statuses/{head} -f state=success -f context=taskguard/unit -f description=f:")),
+        "{}",
+        p.gh_calls()
+    );
+    assert!(p.gh_calls().contains(", ci"), "the host is ci");
+}
+
+#[test]
+fn check_skips_on_green_proof_and_runs_otherwise() {
+    let p = Proof::new();
+    let head = p.git(&["rev-parse", "HEAD"]);
+    let o = p.tg(&["proof", "check", "unit", "--sha", &head]);
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stdout).contains("unit: run - no proof yet"));
 
     std::fs::write(
-        &statuses,
-        r#"{"context":"taskguard/unit","state":"success","description":"full, macos/aarch64, 2m03s, mbp","created_at":"2026-10-09T10:00:00Z","creator":{"login":"vincent"}}
+        p.side("statuses.json"),
+        r#"{"context":"taskguard/unit","state":"success","description":"f:3fa1c0d2e4b1, macos/aarch64, 2m03s, mbp","created_at":"2026-10-09T10:00:00Z","creator":{"login":"vincent"}}
 {"context":"ci/other","state":"failure","description":"x","created_at":"2026-10-09T11:00:00Z"}
 "#,
     )
     .unwrap();
-    let out = p.e.cwd.parent().unwrap().join("gh_output");
-    let o = p.tg(&["proof", "check", "--sha", &head]);
+    let o = p.tg(&["proof", "check", "unit", "--sha", &head]);
     assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stdout));
-    let o =
-        p.e.cmd(&["proof", "check", "unit", "--sha", &head, "--labels", "bug,taskguard:ci:unit", "--github-output"])
-            .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
-            .env("GITHUB_OUTPUT", &out)
-            .output()
-            .unwrap();
-    assert_eq!(o.status.code(), Some(0));
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "unit=run\n", "the label forces CI");
-}
+    let o = p.tg(&["proof", "check", "unit", "--sha", &head, "--os", "linux"]);
+    assert_eq!(o.status.code(), Some(1), "macOS proof, a Linux check");
 
-#[test]
-fn publish_follows_head_until_a_commit_has_the_receipt_files() {
-    let p = Proof::new("true");
-    std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
-    // --publish starts the background publish; HEAD has other files for now.
-    let o = p.tg(&["--receipt", "unit", "--publish", "30"]);
-    assert!(o.status.success(), "{}", stderr(&o));
-    std::thread::sleep(Duration::from_secs(1));
-    assert!(!p.gh_calls().contains("POST"));
-    p.git(&["commit", "-qam", "second"]);
-    let head = p.git(&["rev-parse", "HEAD"]);
-    let t0 = Instant::now();
-    while !p.gh_calls().contains(&format!("statuses/{head}")) {
-        assert!(t0.elapsed() < Duration::from_secs(20), "no post: {}", p.gh_calls());
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-#[test]
-fn check_with_github_output_runs_ids_it_does_not_know() {
-    let p = Proof::new("true");
-    let head = p.git(&["rev-parse", "HEAD"]);
-    let out = p.e.cwd.parent().unwrap().join("gh_output");
-    let o =
-        p.e.cmd(&["proof", "check", "e2e", "--sha", &head, "--github-output"])
-            .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
-            .env("GITHUB_OUTPUT", &out)
-            .output()
-            .unwrap();
+    // In GitHub Actions the PR head and its labels come from the event.
+    std::fs::write(
+        p.side("event.json"),
+        format!(r#"{{"pull_request":{{"head":{{"sha":"{head}"}},"labels":[{{"name":"bug"}},{{"name":"taskguard:ci:unit"}}]}}}}"#),
+    )
+    .unwrap();
+    let out = p.side("gh_output");
+    let o = p
+        .cmd(&["proof", "check", "unit", "--github-output"])
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_EVENT_PATH", p.side("event.json"))
+        .env("GITHUB_OUTPUT", &out)
+        .output()
+        .unwrap();
     assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "e2e=run\n");
-    // Without --github-output it is an error.
-    assert_eq!(p.tg(&["proof", "check", "e2e", "--sha", &head]).status.code(), Some(2));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "unit=run\n", "the label forces CI");
+    assert!(p.gh_calls().contains(&format!("commits/{head}/statuses")));
 }
 
 #[test]
 fn publish_by_tree_needs_no_checkout() {
-    let p = Proof::new("true");
+    let p = Proof::new();
     std::fs::write(p.e.file("a.txt"), "two\n").unwrap();
-    assert!(p.tg(&["--receipt", "unit"]).status.success());
+    assert!(p.tg(&["--receipt", "unit", "--no-publish", "--", "true"]).status.success());
     let tree = p.receipts()[0].1.clone();
-    // The checkout goes away; the publish watches the branch on GitHub.
-    let elsewhere = p.e.cwd.parent().unwrap().join("elsewhere");
+    let elsewhere = p.side("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let child =
-        p.e.cmd(&["proof", "publish", "--tree", &tree, "--branch", "main", "--repo", "o/r", "--wait", "30"])
-            .current_dir(&elsewhere)
-            .env("TASKGUARD_GH", p.e.cwd.parent().unwrap().join("gh"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+    let child = p
+        .cmd(&["proof", "publish", "--tree", &tree, "--branch", "main", "--repo", "o/r", "--wait", "30"])
+        .current_dir(&elsewhere)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     std::thread::sleep(Duration::from_millis(500));
     let sha = "0123456789abcdef0123456789abcdef01234567";
-    std::fs::write(p.e.cwd.parent().unwrap().join("branch.txt"), format!("{sha} {tree}\n")).unwrap();
+    std::fs::write(p.side("branch.txt"), format!("{sha} {tree}\n")).unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(p.gh_calls().contains(&format!("-X POST repos/{{owner}}/{{repo}}/statuses/{sha}")), "{}", p.gh_calls());
