@@ -28,8 +28,10 @@ and the versions follow [semver](https://semver.org).
   hints off too; `--quiet` hides them.
 - `taskguard start JOB` starts a waiting job now, whatever the limits say, as
   `g` in `taskguard top` does. JOB is a pid, a ticket, a key, or a unique
-  part of a key. `start` is now a subcommand: to run a program named
-  `start`, use `taskguard run -- start`.
+  part of a key. A job that CPU keeps out and starts this way (or at a
+  `--st` timeout) books only the cores that were free, so the jobs behind it
+  keep moving. `start` is now a subcommand: to run a program named `start`,
+  use `taskguard run -- start`.
 
 ### Changed
 
@@ -37,8 +39,10 @@ and the versions follow [semver](https://semver.org).
   0. Small jobs that fit pass a reserved job that cannot start yet. After 10
   minutes only jobs that end before the reserved job could start still pass,
   so the machine drains for it, and it starts at the latest once no other job
-  runs, also when its need is above the whole limit. Set `max_backfill = 0`
-  for the old behavior.
+  runs, also when its need is above the whole limit. The same holds for a
+  waiting job with a higher priority: for its first 10 minutes, jobs with a
+  lower priority that fit start while it cannot. Set `max_backfill = 0` for
+  the old behavior.
 
 ### Fixed
 

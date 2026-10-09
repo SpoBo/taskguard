@@ -173,7 +173,9 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
 /// outcome. Empty for any other job.
 pub fn cpu_advice(m: &MachineSample, lim: &Limits, e: &Entry, d: &Decision, running: &[Entry], waiting: &[Entry], now: f64) -> Vec<String> {
     let Decision::Wait { blockers } = d else { return Vec::new() };
-    if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) {
+    // Only CPU, which only makes a job slower: a start by hand also skips
+    // the memory check, and that is never advice to give.
+    if !blockers.iter().any(|b| matches!(b, Blocker::Cpu { .. })) || blockers.iter().any(|b| matches!(b, Blocker::Memory { .. })) {
         return Vec::new();
     }
     let limit = crate::queue::cpu_limit(m, lim);
@@ -712,6 +714,36 @@ mod tests {
         let d = crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(&mid), &mid, 1060.0, &[]);
         assert!(matches!(d, Decision::Wait { .. }));
         assert!(cpu_advice(&m, &lim, &mid, &d, std::slice::from_ref(&lint), &waiting, 1060.0).is_empty());
+    }
+
+    /// Starting a job by hand skips the memory check. A job that memory keeps
+    /// out too gets no advice to do that.
+    #[test]
+    fn a_job_short_of_memory_too_gets_no_advice_to_start_it_by_hand() {
+        let lim = advice_limits();
+        let m = MachineSample::fixed(20.0, 18, 100 * GB, 128 * GB);
+        let me = Entry {
+            ticket: 2,
+            pid: 4242,
+            key: "web:typecheck".into(),
+            need_cpu: 30.0,
+            need_mem_kb: 20 * GB,
+            known: true,
+            queued_at: 1000.0,
+            ..Default::default()
+        };
+        let d = crate::queue::decide(&m, &lim, &[], std::slice::from_ref(&me), &me, 1060.0, &[]);
+        let d = match d {
+            // Nothing runs, so it would start; add a running job to keep it waiting.
+            Decision::Admit { .. } => {
+                let mut lint = Entry { ticket: 1, pid: 11, key: "web:lint".into(), need_cpu: 15.0, known: true, ..Default::default() };
+                lint.started_at = Some(900.0);
+                crate::queue::decide(&m, &lim, std::slice::from_ref(&lint), std::slice::from_ref(&me), &me, 1060.0, &[])
+            }
+            w => w,
+        };
+        assert!(matches!(&d, Decision::Wait { blockers } if blockers.iter().any(|b| matches!(b, Blocker::Memory { .. }))), "{d:?}");
+        assert!(cpu_advice(&m, &lim, &me, &d, &[], std::slice::from_ref(&me), 1060.0).is_empty());
     }
 
     #[test]

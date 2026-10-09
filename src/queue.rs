@@ -745,8 +745,8 @@ pub fn decide(
         }
         if partial_fit_due(lim, w, now, room.cpu_limit) {
             for b in &mut theirs {
-                if let Blocker::Cpu { short, need, .. } = b {
-                    *short = (*short - (1.0 - lim.partial_fit) * *need).max(0.0);
+                if let Blocker::Cpu { short, .. } = b {
+                    *short = short_of_partial_fit(lim, w, *short);
                 }
             }
         }
@@ -1104,7 +1104,7 @@ impl Room {
                             "CPU short by {short:.1} cores, but only because programs outside taskguard keep cores busy (outside_admit)"
                         ));
                     } else if partial_fit_due(lim, job, now, self.cpu_limit)
-                        && job.need_cpu - short >= lim.partial_fit * job.need_cpu - 1e-9
+                        && short_of_partial_fit(lim, job, short) <= 1e-9
                         && m.near_cpu_low()
                     {
                         let free = job.need_cpu - short;
@@ -1232,6 +1232,32 @@ pub fn cannot_fit_now(lim: &Limits, job: &Entry, now: f64, cpu_limit: f64) -> bo
 /// fit now.
 pub fn partial_fit_due(lim: &Limits, job: &Entry, now: f64, cpu_limit: f64) -> bool {
     lim.partial_fit > 0.0 && !short(lim, job) && cannot_fit_now(lim, job, now, cpu_limit)
+}
+
+/// The CPU a job of `need` cores books when it starts on decision `d`. A
+/// job that fits books its need. A partial fit books the cores it got. A job
+/// that CPU keeps out and starts anyway (by hand, or at a `--st` timeout)
+/// books only the cores that were free: it runs on what it gets, and booking
+/// its whole need would hold every other job out while it runs. From there
+/// it follows what it uses.
+pub fn cpu_to_book(d: &Decision, need: f64) -> f64 {
+    match d {
+        Decision::Admit { booked_cpu: Some(b), .. } => *b,
+        Decision::Admit { .. } => need,
+        Decision::Wait { blockers } => blockers
+            .iter()
+            .find_map(|b| match *b {
+                Blocker::Cpu { limit, busy, reserve, .. } => Some((limit - busy - reserve).clamp(0.0, need)),
+                _ => None,
+            })
+            .unwrap_or(need),
+    }
+}
+
+/// How many cores `job` still lacks to start on its `partial_fit` share, when
+/// it lacks `short` of its whole need.
+pub fn short_of_partial_fit(lim: &Limits, job: &Entry, short: f64) -> f64 {
+    (short - (1.0 - lim.partial_fit) * job.need_cpu).max(0.0)
 }
 
 /// A job that usually ends within a few seconds is over before the CPU
@@ -1473,6 +1499,37 @@ mod tests {
         assert_eq!(blockers(decide(&machine(5.0, 4), &lim, r, std::slice::from_ref(&big), &big, 1010.0, &[])), vec!["memory", "cpu"]);
         // partial_fit = 0 turns it off.
         assert_eq!(blockers(decide(&machine(5.0, 4), &LIM, r, w, &head, 1010.0, &[])), vec!["cpu"]);
+    }
+
+    /// A start by hand (`taskguard start`, `g` in top) of a job that cannot
+    /// fit books the cores that were free, not its whole need: it runs on the
+    /// cores it gets, and the jobs behind it keep moving.
+    #[test]
+    fn a_job_started_by_hand_books_the_free_cores_and_keeps_no_job_out() {
+        let mut lint = job(1, "lint", 4.0, 2);
+        lint.started_at = Some(990.0);
+        lint.live_cpu = 4.0;
+        let head = job(2, "typecheck", 30.0, 2);
+        let d = decide(&machine(5.0, 4), &LIM, std::slice::from_ref(&lint), std::slice::from_ref(&head), &head, 1010.0, &[]);
+        assert_eq!(blockers(d.clone()), vec!["cpu"]);
+        // 12 cores - 5 busy = 7 free.
+        assert_eq!(cpu_to_book(&d, head.need_cpu), 7.0);
+
+        // Running on those 7 cores, it leaves room for a 1-core test.
+        let small = job(3, "test", 1.0, 1);
+        let mut started = Entry { need_cpu: 7.0, started_at: Some(1010.0), live_cpu: 7.0, ..head.clone() };
+        let ran =
+            |s: &Entry| decide(&machine(11.0, 4), &LIM, &[lint.clone(), s.clone()], std::slice::from_ref(&small), &small, 1020.0, &[]);
+        assert!(blockers(ran(&started)).is_empty());
+        // Had it booked its whole need, nothing could start beside it.
+        started.need_cpu = 30.0;
+        assert_eq!(blockers(ran(&started)), vec!["cpu"]);
+
+        // A job that fits books its need; a partial fit books what it got.
+        let fits = decide(&machine(1.0, 4), &LIM, &[], std::slice::from_ref(&small), &small, 1010.0, &[]);
+        assert_eq!(cpu_to_book(&fits, 1.0), 1.0);
+        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0) };
+        assert_eq!(cpu_to_book(&partial, 14.0), 6.0);
     }
 
     #[test]

@@ -1219,6 +1219,21 @@ mod tests {
         assert_eq!(cpu(&db), 17.0);
     }
 
+    fn cpu_runs(spec: &[(f64, bool)]) -> Vec<CpuRun> {
+        spec.iter().map(|&(used, starved)| CpuRun { used, starved, failed: false }).collect()
+    }
+
+    #[test]
+    fn starved_runs_are_left_out_while_three_runs_that_were_not_starved_remain() {
+        let rules = Learn::default();
+        // Newest first: four starved runs at 2 cores, then three at 8.
+        let three = cpu_runs(&[(2.0, true), (2.0, true), (2.0, true), (2.0, true), (8.0, false), (8.0, false), (8.0, false)]);
+        assert_eq!(cpu_need(&three, &rules), Some(8.0), "what a starved run got does not pull the need down");
+        // With only two runs that were not starved, the starved ones count.
+        let two = cpu_runs(&[(2.0, true), (2.0, true), (2.0, true), (2.0, true), (8.0, false), (8.0, false)]);
+        assert_eq!(cpu_need(&two, &rules), Some(2.0));
+    }
+
     #[test]
     fn recent_runs_weigh_more_than_old_ones() {
         let tmp = tempfile::tempdir().unwrap();

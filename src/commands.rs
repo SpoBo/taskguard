@@ -6,7 +6,7 @@ use crate::db::{self, Db};
 use crate::key;
 use crate::machine;
 use crate::matcher;
-use crate::queue::{Limits, Queue};
+use crate::queue::{Entry, Limits, Queue};
 use crate::report::{self, Snapshot, dur, gb};
 use crate::sys;
 use anyhow::Result;
@@ -74,21 +74,7 @@ pub fn pause(args: &[String], pause: bool) -> Result<i32> {
         q.reap();
         q.running()
     };
-    let exact: Vec<&crate::queue::Entry> =
-        running.iter().filter(|e| target.parse::<i32>().is_ok_and(|p| p == e.pid || p == e.child_pid) || &e.key == target).collect();
-    let found = if exact.is_empty() { running.iter().filter(|e| e.key.contains(target.as_str())).collect() } else { exact };
-    let e = match found.as_slice() {
-        [e] => *e,
-        [] => {
-            let keys: Vec<String> = running.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect();
-            anyhow::bail!("no running job matches {target:?}; running: {}", if keys.is_empty() { "none".into() } else { keys.join(", ") })
-        }
-        many => anyhow::bail!(
-            "{target:?} matches {} jobs: {}; give the pid",
-            many.len(),
-            many.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect::<Vec<_>>().join(", ")
-        ),
-    };
+    let e = pick(&running, target, "running", |e| target.parse::<i32>().is_ok_and(|p| p == e.pid || p == e.child_pid) || &e.key == target)?;
     if !e.pausable {
         anyhow::bail!("{} runs an older taskguard (before 0.2.0); it cannot be paused from here", e.key);
     }
@@ -104,28 +90,58 @@ pub fn pause(args: &[String], pause: bool) -> Result<i32> {
         _ => {}
     }
     q.nudge(e.pid, |n| n.pause = Some(pause))?;
+    let done = wait_for(|| match q.running().into_iter().find(|r| r.pid == e.pid) {
+        None => {
+            println!("{} ended", e.key);
+            Some(0)
+        }
+        Some(r) if pause && r.paused_by_hand => {
+            println!("paused {} (pid {}); it stays paused until: taskguard resume {}", r.key, r.pid, r.pid);
+            Some(0)
+        }
+        Some(r) if !pause && r.paused_since.is_none() => {
+            println!("resumed {} (pid {})", r.key, r.pid);
+            Some(0)
+        }
+        _ => None,
+    });
+    Ok(done.unwrap_or_else(|| {
+        eprintln!("taskguard: {} did not {verb} within 10 s; is its process stuck?", e.key);
+        1
+    }))
+}
+
+/// The one job in `jobs` that the user's `target` names: those `exact`
+/// matches, or else those whose key contains it. `what` names the list in
+/// the error when none or several match.
+fn pick<'a>(jobs: &'a [Entry], target: &str, what: &str, exact: impl Fn(&Entry) -> bool) -> Result<&'a Entry> {
+    let exact: Vec<&Entry> = jobs.iter().filter(|e| exact(e)).collect();
+    let found = if exact.is_empty() { jobs.iter().filter(|e| e.key.contains(target)).collect() } else { exact };
+    match found.as_slice() {
+        [e] => Ok(*e),
+        [] => {
+            let keys: Vec<String> = jobs.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect();
+            anyhow::bail!("no {what} job matches {target:?}; {what}: {}", if keys.is_empty() { "none".into() } else { keys.join(", ") })
+        }
+        many => anyhow::bail!(
+            "{target:?} matches {} jobs: {}; give the pid",
+            many.len(),
+            many.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Wait for a job's own process to act on a nudge: ask `done` every 100 ms
+/// for up to 10 s. Its exit code, or None when the job did not act in time.
+fn wait_for(mut done: impl FnMut() -> Option<i32>) -> Option<i32> {
     let t = std::time::Instant::now();
     while t.elapsed() < std::time::Duration::from_secs(10) {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let now = q.running().into_iter().find(|r| r.pid == e.pid);
-        match now {
-            None => {
-                println!("{} ended", e.key);
-                return Ok(0);
-            }
-            Some(r) if pause && r.paused_by_hand => {
-                println!("paused {} (pid {}); it stays paused until: taskguard resume {}", r.key, r.pid, r.pid);
-                return Ok(0);
-            }
-            Some(r) if !pause && r.paused_since.is_none() => {
-                println!("resumed {} (pid {})", r.key, r.pid);
-                return Ok(0);
-            }
-            _ => {}
+        if let Some(code) = done() {
+            return Some(code);
         }
     }
-    eprintln!("taskguard: {} did not {verb} within 10 s; is its process stuck?", e.key);
-    Ok(1)
+    None
 }
 
 /// `taskguard start JOB`: start a waiting job now, whatever the limits say,
@@ -143,36 +159,24 @@ pub fn start(args: &[String]) -> Result<i32> {
     let number = target.parse::<i64>().ok();
     // A pid comes first: tickets count up past the pids of a busy machine, and
     // the advice names the pid, so it must never start another job.
-    let by_pid: Vec<&crate::queue::Entry> = waiting.iter().filter(|e| number == Some(e.pid as i64)).collect();
-    let exact =
-        if by_pid.is_empty() { waiting.iter().filter(|e| number == Some(e.ticket as i64) || &e.key == target).collect() } else { by_pid };
-    let found = if exact.is_empty() { waiting.iter().filter(|e| e.key.contains(target.as_str())).collect() } else { exact };
-    let e = match found.as_slice() {
-        [e] => *e,
-        [] => {
-            let keys: Vec<String> = waiting.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect();
-            anyhow::bail!("no waiting job matches {target:?}; waiting: {}", if keys.is_empty() { "none".into() } else { keys.join(", ") })
-        }
-        many => anyhow::bail!(
-            "{target:?} matches {} jobs: {}; give the pid",
-            many.len(),
-            many.iter().map(|e| format!("{} (pid {})", e.key, e.pid)).collect::<Vec<_>>().join(", ")
-        ),
-    };
+    let pid_named = waiting.iter().any(|e| number == Some(e.pid as i64));
+    let e = pick(&waiting, target, "waiting", |e| {
+        if pid_named { number == Some(e.pid as i64) } else { number == Some(e.ticket as i64) || &e.key == target }
+    })?;
     if e.version.is_none() {
         anyhow::bail!("{} runs an older taskguard (before 0.1.3); it cannot be started from here", e.key);
     }
     q.nudge(e.pid, |n| n.start = true)?;
-    let t = std::time::Instant::now();
-    while t.elapsed() < std::time::Duration::from_secs(10) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if !q.waiting().iter().any(|w| w.pid == e.pid) {
+    let done = wait_for(|| {
+        (!q.waiting().iter().any(|w| w.pid == e.pid)).then(|| {
             println!("started {} (pid {}); it runs on the cores it gets, and no limit holds it back, memory included", e.key, e.pid);
-            return Ok(0);
-        }
-    }
-    eprintln!("taskguard: {} did not start within 10 s; is its process stuck?", e.key);
-    Ok(1)
+            0
+        })
+    });
+    Ok(done.unwrap_or_else(|| {
+        eprintln!("taskguard: {} did not start within 10 s; is its process stuck?", e.key);
+        1
+    }))
 }
 
 pub fn status(json: bool) -> Result<i32> {

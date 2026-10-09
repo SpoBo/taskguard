@@ -46,7 +46,8 @@ resume_at = 80        # percent of RAM in use; kept at least 2 under pause_at
 
 # -------------------------------------------------------------- priority ----
 # A waiting job with a higher priority starts before jobs with a lower one:
-# they wait while it waits, unless its own pool is full. Jobs with the same
+# they wait while it waits, unless its own pool is full. With backfill
+# (max_backfill), jobs that fit start while it cannot, as for a reserved job. Jobs with the same
 # priority keep the order they came in. Set it per directory, per repository,
 # per command ([[job]] below), or for one call with --priority N.
 priority = 0

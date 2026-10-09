@@ -130,7 +130,9 @@ below).
   start. Twenty pipelines that each move a little all finish late; twenty in
   turn finish one after the other, and the last one no later. A job of the
   older run that does not fit holds nothing back, so no room is left idle.
-  Priorities still come first.
+  Priorities still come first. A waiting job with a higher priority holds the
+  others back as a reserved job does: while it could start, and with backfill
+  (below) not while it cannot use the room.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
   has started, except by backfill (below).

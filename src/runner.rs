@@ -484,11 +484,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     if !me.known && !queue::short(&limits, &me) {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
-                    // A partial fit books the cores it got; it follows what it
-                    // uses from there.
-                    if let Decision::Admit { booked_cpu: Some(b), .. } = decision {
-                        me.need_cpu = b;
-                    }
+                    me.need_cpu = queue::cpu_to_book(&decision, me.need_cpu);
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);
                     me.start_need_mem_kb = Some(me.need_mem_kb);
