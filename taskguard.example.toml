@@ -30,6 +30,7 @@
 cpu_max = 100         # percent of all cores
 mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
+warn_admit = true     # macOS warning: jobs still start while memory fits and no first run grows; false = warning stops all
 
 # ------------------------------------------------------------ auto pause ----
 # Off by default. When memory in use reaches pause_at, taskguard pauses a

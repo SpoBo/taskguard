@@ -21,6 +21,8 @@ pub fn limits(cfg: &Config) -> Limits {
         max_backfill: cfg.max_backfill as f64,
         cpu_min_duration: cfg.cpu_min_duration,
         pressure_max: cfg.pressure_max,
+        // Only macOS has a warning level; Linux reports a share of time.
+        warn_admit: cfg!(target_os = "macos") && cfg.warn_admit,
         noise_mem_pct: cfg.noise_mem,
         noise_cpu: cfg.noise_cpu,
         outside_admit: cfg.outside_admit,
