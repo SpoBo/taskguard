@@ -660,25 +660,26 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         }
     };
     let t = app.queue_tree();
-    let indent = |depth: u8| "  ".repeat(depth as usize);
     let mut rows: Vec<Row> = Vec::new();
-    for r in &t.rows {
+    for (n, r) in t.rows.iter().enumerate() {
+        let lead = t.lead[n].as_str();
+        let room = 44usize.saturating_sub(lead.chars().count());
         match *r {
             super::tree::Row::Group(g) => {
                 let g = &t.groups[g];
                 rows.push(
                     Row::new(vec![
-                        Cell::from(if g.folded { "▸" } else { "▾" }),
-                        Cell::from(trunc(&g.label, 44)),
+                        Cell::from(""),
+                        Cell::from(format!("{} {}", if g.folded { "▸" } else { "▾" }, trunc(&g.label, 42))),
                         Cell::from(g.id.clone()),
                         Cell::from(dur(s.now - g.since)),
-                        Cell::from(format!("{:.1}c {} now", g.cpu, gb(g.mem_kb))),
+                        Cell::from(if g.running > 0 { format!("{:.1}c {} now", g.cpu.max(0.0), gb(g.mem_kb)) } else { String::new() }),
                         Cell::from(format!("{} run  {} wait", g.running, g.waiting)),
                     ])
                     .style(BOLD),
                 );
             }
-            super::tree::Row::Job { waiting: false, i, depth } => {
+            super::tree::Row::Job { waiting: false, i, .. } => {
                 let e = &s.running[i];
                 let over = e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05
                     || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
@@ -693,7 +694,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
                         (None, true) => Cell::from("NOW").style(Style::default().fg(Color::Green)),
                         (None, false) => Cell::from("RUN").style(Style::default().fg(Color::Green)),
                     },
-                    Cell::from(format!("{}{fold}{}", indent(depth), report::job_name(e, 44 - 2 * depth as usize - fold.chars().count()))),
+                    Cell::from(format!("{lead}{fold}{}", report::job_name(e, room.saturating_sub(fold.chars().count())))),
                     Cell::from(e.ns.clone()),
                     Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
                     Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))).style(if over {
@@ -704,14 +705,14 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(format!("needs {:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
                 ]));
             }
-            super::tree::Row::Job { waiting: true, i, depth } => {
+            super::tree::Row::Job { waiting: true, i, .. } => {
                 let w = &s.waiting[i];
                 let e = &w.entry;
                 let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into())
                     + &w.eta_s.map(|t| format!("  ~{}", dur(t.max(1.0)))).unwrap_or_default();
                 rows.push(Row::new(vec![
                     Cell::from("WAIT").style(Style::default().fg(Color::Yellow)),
-                    Cell::from(format!("{}{}", indent(depth), report::job_name(e, 44 - 2 * depth as usize))),
+                    Cell::from(format!("{lead}{}", report::job_name(e, room))),
                     Cell::from(e.ns.clone()),
                     Cell::from(dur(s.now - e.queued_at)),
                     Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
@@ -720,12 +721,12 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
                     ),
                 ]));
             }
-            super::tree::Row::Sub { outer, i, depth } => {
+            super::tree::Row::Sub { outer, i, .. } => {
                 let Some(sub) = app.data.subs.get(&s.running[outer].pid).and_then(|v| v.get(i)) else { continue };
                 rows.push(
                     Row::new(vec![
                         Cell::from(""),
-                        Cell::from(format!("{}└ {}", indent(depth), trunc(&sub.key, 42 - 2 * depth as usize))),
+                        Cell::from(format!("{lead}{}", trunc(&sub.key, room))),
                         Cell::from(""),
                         Cell::from(dur(s.now - sub.since)),
                         Cell::from(format!("{:.1}c {} now", sub.cpu, gb(sub.mem_kb))),
@@ -1811,6 +1812,7 @@ mod tests {
         let s = screen(&mut app, 150, 30);
         let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t} missing:\n{s}"));
         assert!(at("dev-env:stack") < at("└ dalp:prepare"), "the nested call follows its job:\n{s}");
+        assert!(at("├ web/dapp:oxlint") < at("└ web/dapp:bun_check"), "jobs of a run get tree lines:\n{s}");
         assert!(at("sleep 101") < at("web/dapp:oxlint"), "the run is named by its command:\n{s}");
         assert!(at("web/dapp:oxlint") < at("web/dapp:bun_check"), "{s}");
         assert!(s.contains("in 1 task-runner run"), "{s}");

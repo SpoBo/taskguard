@@ -56,6 +56,42 @@ pub struct Sub {
 pub struct Tree {
     pub rows: Vec<Row>,
     pub groups: Vec<Group>,
+    /// The tree lines in front of each row's name: "├ ", "└ ", and "│ " for
+    /// a row above that still has rows below it.
+    pub lead: Vec<String>,
+}
+
+impl Row {
+    pub fn depth(&self) -> u8 {
+        match self {
+            Row::Group(_) => 0,
+            Row::Job { depth, .. } | Row::Sub { depth, .. } => *depth,
+        }
+    }
+}
+
+/// The tree lines for rows at these depths. A row is the last of its
+/// parent's when no later row at its depth comes before one above it.
+fn leads(depths: &[u8]) -> Vec<String> {
+    let last = |r: usize| depths[r + 1..].iter().find(|&&d| d <= depths[r]).is_none_or(|&d| d < depths[r]);
+    // For each depth: whether the row that opened it was the last one.
+    let mut open: Vec<bool> = Vec::new();
+    (0..depths.len())
+        .map(|r| {
+            let d = depths[r] as usize;
+            open.truncate(d);
+            let mut lead = String::new();
+            if d > 0 {
+                for &was_last in &open[1..] {
+                    lead.push_str(if was_last { "  " } else { "│ " });
+                }
+                lead.push_str(if last(r) { "└ " } else { "├ " });
+            }
+            open.resize(d, false);
+            open.push(last(r));
+            lead
+        })
+        .collect()
 }
 
 /// What folds a row: a group by its run id (`Group::id`), a job by its pid.
@@ -141,22 +177,33 @@ pub fn build(
             job(&mut tree, true, j, 1);
         }
     }
+    tree.lead = leads(&tree.rows.iter().map(Row::depth).collect::<Vec<_>>());
     tree
 }
 
-/// The command a task-runner run stands for, as people typed it. A run that
-/// a package script started (`bun run ci:local` around `turbo run ...`)
-/// is named by that script; otherwise by the runner's own command line.
+/// The command a task-runner run stands for, as people typed it: the first
+/// package script above the runner (`bun run ci:local` around `turbo run
+/// ...`), else the runner's own command line. A `node .../turbo` shim
+/// between them is skipped.
 pub fn label(id: &str, procs: &[sys::ProcInfo]) -> Option<String> {
     let pid: i32 = id.split_once(':')?.1.parse().ok()?;
-    let parent = procs.iter().find(|p| p.pid == pid).map(|p| p.ppid);
-    let script_runner = |p: i32| matches!(sys::proc_name(p).as_str(), "bun" | "npm" | "pnpm" | "yarn" | "node" | "npx" | "bunx");
-    let from = parent.filter(|&p| p > 1 && script_runner(p)).unwrap_or(pid);
-    let args = sys::proc_args(from)?;
-    let mut words = args.into_iter();
-    let first = words.next()?;
-    let first = first.rsplit('/').next().unwrap_or(&first).to_string();
-    Some(std::iter::once(first).chain(words).collect::<Vec<_>>().join(" "))
+    let ups = std::iter::once(pid).chain(sys::ancestors(pid, procs).into_iter().skip(1)).take(6);
+    let script = ups.filter(|&p| p > 1).filter_map(sys::proc_args).find(|a| is_script_run(a));
+    let args = script.or_else(|| sys::proc_args(pid))?;
+    Some(command_text(&args))
+}
+
+/// `bun run ci:local`, `npm run test`, `pnpm run lint`, `yarn run x`.
+fn is_script_run(args: &[String]) -> bool {
+    let tool = |a: &String| a.rsplit('/').next().unwrap_or(a).to_string();
+    args.len() >= 3 && matches!(tool(&args[0]).as_str(), "bun" | "npm" | "pnpm" | "yarn") && args[1] == "run"
+}
+
+/// A command line with the program's directory left out.
+fn command_text(args: &[String]) -> String {
+    let mut words = args.iter();
+    let first = words.next().map(|a| a.rsplit('/').next().unwrap_or(a)).unwrap_or_default();
+    std::iter::once(first).chain(words.map(String::as_str)).collect::<Vec<_>>().join(" ")
 }
 
 /// The calls nested in each running job, by the job's pid, measured now.
@@ -240,6 +287,20 @@ mod tests {
         );
         let g = &t.groups[0];
         assert_eq!((g.label.as_str(), g.running, g.waiting, g.since), ("bun run ci:local", 2, 1, 100.0));
+    }
+
+    #[test]
+    fn rows_get_tree_lines() {
+        let l = leads(&[0, 1, 2, 2, 1, 2, 0, 1]);
+        assert_eq!(l, ["", "├ ", "│ ├ ", "│ └ ", "└ ", "  └ ", "", "└ "]);
+    }
+
+    #[test]
+    fn a_run_is_named_by_the_script_above_it() {
+        let a = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        assert!(is_script_run(&a("/opt/bin/bun run ci:local")));
+        assert!(!is_script_run(&a("node /w/node_modules/turbo/bin/turbo run lint")), "the shim is skipped");
+        assert_eq!(command_text(&a("/opt/bin/bun run ci:local")), "bun run ci:local");
     }
 
     #[test]
