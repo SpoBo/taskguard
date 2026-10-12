@@ -12,6 +12,16 @@ and the versions follow [semver](https://semver.org).
 
 ### Changed
 
+- A command that wraps other taskguard jobs, such as `taskguard bun run
+  ci:local` around a turbo run, runs straight through from its second run on,
+  and the jobs inside it queue on their own. Queued as one job, it booked its
+  biggest run, up to 20 GB, also when turbo's cache left almost nothing to do;
+  on one machine such wrappers waited 995 minutes in 17 days. A long-lived
+  job, a job in a pool, and a job with a minimum stay queued.
+  `taskguard prune 'KEY' --apply` queues the command again. (#24)
+- A run starved of memory raises the next run's need by 25% only when it
+  reached 90% of its need. One starved far below its need was squeezed by
+  other programs, and the extra room went unused. (#24)
 - macOS: the kernel's memory warning level no longer stops every new job.
   At warning, jobs start while memory fits without any leeway, and not while
   a first run still grows (at most two minutes). A dev stack kept the level

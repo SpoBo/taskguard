@@ -97,6 +97,16 @@ fn held_by_ancestor(q: &Queue) -> bool {
     sys::ancestors(me, &procs).iter().skip(1).any(|p| q.run_path(*p).exists())
 }
 
+/// Tell the running job this nested call runs inside that it wraps other
+/// taskguard jobs: see `queue::Queue::note_nested`.
+fn note_nested(q: &Queue) {
+    let procs = sys::list_procs();
+    let me = std::process::id() as i32;
+    if let Some(outer) = sys::ancestors(me, &procs).into_iter().skip(1).find(|p| q.run_path(*p).exists()) {
+        q.note_nested(outer, me);
+    }
+}
+
 /// Task runners whose run groups the jobs it starts. A job belongs to the
 /// nearest one above it.
 const LAUNCHERS: &[&str] = &["turbo", "nx", "make", "gmake", "moon", "lage", "just"];
@@ -182,7 +192,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
     }
     let dir = config::state_dir();
     let q = Queue::open(&dir)?;
-    if std::env::var("TASKGUARD_DISABLE").is_ok_and(|v| v == "1") || held_by_ancestor(&q) {
+    if std::env::var("TASKGUARD_DISABLE").is_ok_and(|v| v == "1") {
+        exec(&o.cmd);
+    }
+    if held_by_ancestor(&q) {
+        note_nested(&q);
         exec(&o.cmd);
     }
 
@@ -238,6 +252,27 @@ pub fn run(mut o: Opts) -> Result<i32> {
         }
         _ => learned,
     };
+    // A command whose recent runs started other taskguard jobs inside it, such
+    // as `bun run ci:local` around a turbo run, is a wrapper. Queued as one
+    // job, it books its biggest run, a full build, also when turbo's cache
+    // leaves almost nothing to do, and the jobs inside it run straight through
+    // under its claim. So it runs straight through instead, and the jobs
+    // inside it queue on their own, each by its own need. Not a long-lived job,
+    // whose start-up builds belong to its claim, nor a job in a pool or with a
+    // minimum, which someone gave it on purpose.
+    if let Some(n) = learned.nested_jobs
+        && startup.is_none()
+        && pool.is_none()
+        && min_mem.is_none()
+        && min_cpu.is_none()
+    {
+        if !o.quiet {
+            say(&format!(
+                "straight through {jkey} - its recent runs started up to {n} taskguard jobs inside it, and those queue on their own (taskguard prune '{jkey}' --apply queues it again)"
+            ));
+        }
+        exec(&o.cmd);
+    }
     let learned_mem = learned.mem_kb.map(|m| if learned.mem_boosted { (m as f64 * 1.25) as u64 } else { m });
     // A job that once wanted more cores than the machine has is capped at the
     // limit; otherwise it could only ever start on an empty machine.
@@ -295,6 +330,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
         real.strip_prefix(&real_checkout).map(|r| r.display().to_string()).unwrap_or(p)
     });
     let me_pid = std::process::id() as i32;
+    // Notes left for an earlier job with the same pid.
+    q.take_nested(me_pid);
     let run_id = database
         .as_ref()
         .and_then(|d| {
@@ -810,6 +847,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 measured,
                 paused_s: me.paused_s,
                 steady: tracker.steady(ended, me.paused_s - paused_before_steady),
+                nested_jobs: q.take_nested(me_pid),
             },
         );
     }
