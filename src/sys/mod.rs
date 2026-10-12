@@ -159,7 +159,15 @@ mod tests {
     #[test]
     fn proc_args_reads_a_command_line() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-        let args = proc_args(child.id() as i32);
+        // Right after the fork the child still has the parent's command line,
+        // until it execs sleep.
+        let read = || proc_args(child.id() as i32).filter(|a| a.last().is_some_and(|l| l == "30"));
+        let t0 = std::time::Instant::now();
+        let mut args = read();
+        while args.is_none() && t0.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            args = read();
+        }
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(args.map(|a| a[1..].to_vec()), Some(vec!["30".to_string()]));
