@@ -312,6 +312,18 @@ straight through, unqueued and unmeasured. A call nested inside a
 running job starts at once and takes no second slot, even when a task runner in
 between drops environment variables.
 
+A command that wraps other taskguard jobs, such as `taskguard bun run ci:local`
+around a turbo run whose package scripts start with `taskguard`, runs straight
+through from its second run on. Queued as one job, it booked the memory of its
+biggest run, a full build, also when turbo's cache left almost nothing to do,
+and the jobs inside it ran unqueued under its claim. Now each nested call
+leaves a note for the job it runs in, and a command whose recent runs started
+taskguard jobs inside them runs straight through, with one line saying so. The
+jobs inside it then queue on their own, each by its own need. A long-lived job,
+a job in a pool and a job with a minimum stay queued: their claim is on
+purpose. `taskguard prune 'KEY' --apply` forgets the history, so the command
+queues again.
+
 Long-running commands are never queued: watch modes, dev servers, `--version`
 and `--help` run straight through (the list is in `src/builtin.rs`). Add your
 own with `passthrough = ["storybook", "my-dev-server"]` in a config file; it
@@ -359,7 +371,9 @@ instructions, so it knows the whole tool at once. `taskguard help COMMAND`, or
 taskguard also measures whether a job was held back while it ran: its threads
 waited for a core more than half as long as they ran, it paged memory in while the machine was under memory pressure, or it
 took 1.5 times its usual time while the machine was full. A run starved of
-memory teaches a higher need for the next run; a run starved of CPU does not
+memory that reached 90% of its need teaches a higher need for the next run
+(+25%); one starved far below its need was squeezed by others, and more room
+would not have helped it. A run starved of CPU does not
 raise the CPU need (see "Needs are learned"). With hints on it prints advice
 that can be pasted:
 

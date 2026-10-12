@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS runs (
   paused_s REAL,
   package TEXT,
   steady_cores_wanted REAL,
-  steady_mem_kb INTEGER
+  steady_mem_kb INTEGER,
+  nested_jobs INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS pruned_runs (
   package TEXT,
   steady_cores_wanted REAL,
   steady_mem_kb INTEGER,
+  nested_jobs INTEGER,
   pruned_at REAL NOT NULL,
   prune_reason TEXT NOT NULL
 );
@@ -186,7 +188,7 @@ CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
 const RUN_COLUMNS: &str = "id, ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, started_at, ended_at, exit,
   waited_s, main_blocker, now, min_cpu, min_mem_kb, need_cpu, need_mem_kb, peak_mem_kb, cores_used, cores_wanted, cpu_seconds,
   runnable_seconds, pageins, starved, starved_detail, machine_full_frac, imported, paused_s, package, steady_cores_wanted,
-  steady_mem_kb";
+  steady_mem_kb, nested_jobs";
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -235,7 +237,14 @@ pub struct Learned {
     /// peaks and the median of the cores wanted on average. None for others.
     pub steady_mem_kb: Option<u64>,
     pub steady_cpu: Option<f64>,
+    /// The most taskguard jobs one of the recent runs started inside itself,
+    /// when any did: the command wraps other taskguard jobs. None otherwise.
+    pub nested_jobs: Option<u64>,
 }
+
+/// A run starved of memory raises the need when its peak reached this share
+/// of the need it started with.
+pub const BOOST_REACHED: f64 = 0.9;
 
 /// How history turns into needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -477,6 +486,8 @@ pub struct RunResult {
     /// A long-lived job after its start-up: cores wanted on average, and
     /// the memory peak. None for other jobs.
     pub steady: Option<(f64, u64)>,
+    /// How many taskguard calls ran nested inside this run.
+    pub nested_jobs: u64,
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -529,6 +540,14 @@ impl Db {
                 conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {col} {kind}"))?;
             }
         }
+        // Databases made before wrapper jobs were learned: how many taskguard
+        // jobs a run started inside itself. Both tables, so a prune keeps it.
+        for table in ["runs", "pruned_runs"] {
+            let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'nested_jobs'"))?.exists([])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nested_jobs INTEGER"))?;
+            }
+        }
         Ok(Db { conn })
     }
 
@@ -536,17 +555,18 @@ impl Db {
         let (keep, boost_runs) = (rules.keep, rules.boost_runs);
         let mut stmt = self.conn.prepare_cached(
             "SELECT peak_mem_kb, coalesce(cores_used, cores_wanted), ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb,
-                    steady_cores_wanted, id, ended_at, exit
+                    steady_cores_wanted, id, ended_at, exit, need_mem_kb, nested_jobs
              FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC, id DESC LIMIT ?2",
         )?;
-        // peak memory, cores used, duration, starved, and after the start-up: memory peak, cores wanted
-        type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>);
+        // peak memory, cores used, duration, starved, after the start-up: memory peak and cores wanted,
+        // then the memory need it started with and the jobs nested inside it
+        type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>, Option<i64>, Option<i64>);
         let rows: Vec<(Row, Outlier)> = stmt
             .query_map(params![key, keep.max(boost_runs) as i64], |r| {
                 let peak: i64 = r.get(0)?;
                 let run = Outlier { run_id: r.get(6)?, peak_kb: peak as u64, ended_at: r.get(7)?, exit: r.get(8)? };
-                Ok(((peak, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?), run))
+                Ok(((peak, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(9)?, r.get(10)?), run))
             })?
             .collect::<std::result::Result<_, _>>()?;
         let (rows, runs): (Vec<Row>, Vec<Outlier>) = rows.into_iter().unzip();
@@ -566,10 +586,28 @@ impl Db {
             .collect();
         let cpu = cpu_need(&cpu_runs, rules);
         let dur = median_of(recent.iter().filter_map(|r| r.2).collect());
-        let boosted = rows.iter().take(boost_runs).any(|r| r.3.as_deref() == Some("memory"));
+        // A run starved of memory raises the need only when it reached what it
+        // was given: then its need was too small. One that starved far below
+        // its need was squeezed by others, and more room for it would have
+        // gone unused. A run from before the need was recorded still counts.
+        let boosted = rows
+            .iter()
+            .take(boost_runs)
+            .any(|r| r.3.as_deref() == Some("memory") && r.6.is_none_or(|need| r.0 as f64 >= need as f64 * BOOST_REACHED));
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
         let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
-        Ok(Learned { runs: recent.len(), mem_kb: mem, outliers, cpu, dur_s: dur, mem_boosted: boosted, steady_mem_kb, steady_cpu })
+        let nested_jobs = recent.iter().filter_map(|r| r.7).filter(|n| *n > 0).max().map(|n| n as u64);
+        Ok(Learned {
+            runs: recent.len(),
+            mem_kb: mem,
+            outliers,
+            cpu,
+            dur_s: dur,
+            mem_boosted: boosted,
+            steady_mem_kb,
+            steady_cpu,
+            nested_jobs,
+        })
     }
 
     /// Every key with finished runs, or those that match `pattern`: a key, or
@@ -737,7 +775,7 @@ impl Db {
         self.conn.execute(
             "UPDATE runs SET ended_at = ?2, exit = ?3, peak_mem_kb = ?4, cores_used = ?5, cores_wanted = ?6,
                 cpu_seconds = ?7, runnable_seconds = ?8, pageins = ?9, starved = ?10, starved_detail = ?11,
-                machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15
+                machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15, nested_jobs = ?16
              WHERE id = ?1",
             params![
                 id,
@@ -754,7 +792,8 @@ impl Db {
                 r.machine_full_frac,
                 (r.paused_s > 0.0).then_some(r.paused_s),
                 r.steady.filter(|_| r.measured).map(|s| s.0),
-                r.steady.filter(|_| r.measured).map(|s| s.1 as i64)
+                r.steady.filter(|_| r.measured).map(|s| s.1 as i64),
+                r.nested_jobs as i64
             ],
         )?;
         Ok(())
@@ -1182,6 +1221,42 @@ mod tests {
         run(&db, "k", 3000, 2.0, 11.0, Some("memory"));
         assert!(db.learned("k", &Learn::default()).unwrap().mem_boosted);
         assert_eq!(db.starved_streak("k").unwrap(), 1);
+    }
+
+    #[test]
+    fn a_starved_run_raises_the_need_only_when_it_reached_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        let starved = |peak: u64, need: u64| {
+            let id = db.insert_run(&NewRun { ns: "n", key: "k", need_mem_kb: need, ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+            let r = RunResult { ended_at: now(), peak_mem_kb: peak, measured: true, starved: Some("memory".into()), ..Default::default() };
+            db.finish_run(id, &r).unwrap();
+        };
+        // Squeezed by others at a third of its need: more room would have gone unused.
+        starved(1000, 3000);
+        assert!(!db.learned("k", &Learn::default()).unwrap().mem_boosted);
+        // It reached its need: the need was too small.
+        starved(2900, 3000);
+        assert!(db.learned("k", &Learn::default()).unwrap().mem_boosted);
+    }
+
+    #[test]
+    fn a_run_with_jobs_inside_it_makes_its_command_a_wrapper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        let finish = |nested: u64| {
+            let id = db.insert_run(&NewRun { ns: "n", key: "ci", ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+            db.finish_run(id, &RunResult { ended_at: now(), peak_mem_kb: 1000, measured: true, nested_jobs: nested, ..Default::default() })
+                .unwrap();
+        };
+        finish(0);
+        assert_eq!(db.learned("ci", &Learn::default()).unwrap().nested_jobs, None);
+        finish(37);
+        // A later run with turbo's cache full starts none; the command still wraps.
+        finish(0);
+        assert_eq!(db.learned("ci", &Learn::default()).unwrap().nested_jobs, Some(37));
     }
 
     /// A run that used `used` cores while it wanted `wanted`.

@@ -258,7 +258,7 @@ pub struct Guard {
 
 impl Queue {
     pub fn open(dir: &Path) -> Result<Queue> {
-        for d in ["wait", "run", "viewers", "nudge", "pipeline", "stall"] {
+        for d in ["wait", "run", "viewers", "nudge", "pipeline", "stall", "nested"] {
             fs::create_dir_all(dir.join(d)).with_context(|| format!("creating {}", dir.join(d).display()))?;
         }
         Ok(Queue { dir: dir.to_path_buf() })
@@ -283,6 +283,24 @@ impl Queue {
 
     pub fn run_path(&self, pid: i32) -> PathBuf {
         self.dir.join("run").join(pid.to_string())
+    }
+
+    /// A taskguard call nested inside the running job of `outer` (a pid)
+    /// leaves `nested/<outer>.<pid>`, so that job learns that it wraps other
+    /// taskguard jobs.
+    pub fn note_nested(&self, outer: i32, pid: i32) {
+        let _ = fs::write(self.dir.join("nested").join(format!("{outer}.{pid}")), "");
+    }
+
+    /// How many nested calls left a note for the job of `owner`. The notes
+    /// are removed, so a later job with the same pid starts from none.
+    pub fn take_nested(&self, owner: i32) -> u64 {
+        let prefix = format!("{owner}.");
+        let Ok(rd) = fs::read_dir(self.dir.join("nested")) else { return 0 };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&prefix)))
+            .filter(|e| fs::remove_file(e.path()).is_ok())
+            .count() as u64
     }
 
     /// When the task-runner run `id` ("turbo:4242", owned by `pid`) queued
@@ -2264,6 +2282,18 @@ mod tests {
         assert_eq!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["pressure"]);
         m.mem_pressure = Some(0.0);
         assert!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty(), "it eases: the job starts");
+    }
+
+    #[test]
+    fn nested_calls_leave_notes_for_their_outer_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = Queue::open(tmp.path()).unwrap();
+        q.note_nested(100, 201);
+        q.note_nested(100, 202);
+        q.note_nested(1000, 203);
+        assert_eq!(q.take_nested(100), 2, "only its own notes, not those of pid 1000");
+        assert_eq!(q.take_nested(100), 0, "taken once");
+        assert_eq!(q.take_nested(1000), 1);
     }
 
     #[test]
