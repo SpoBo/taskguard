@@ -1088,7 +1088,14 @@ impl App {
             KeyCode::Home => self.sel = 0,
             KeyCode::End => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(k) = self.selected_key() {
+                if let (View::Queue, Some(tree::Row::Group(g))) = (self.view, self.queue_tree().rows.get(self.sel).copied()) {
+                    // A run's row has no details of its own: Enter folds or unfolds it.
+                    let t = self.queue_tree();
+                    let id = t.groups[g].id.clone();
+                    if !self.folded.remove(&id) {
+                        self.folded.insert(id);
+                    }
+                } else if let Some(k) = self.selected_key() {
                     self.open_job(k);
                 }
             }

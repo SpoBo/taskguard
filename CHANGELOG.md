@@ -16,7 +16,8 @@ and the versions follow [semver](https://semver.org).
   run sit under one row, named by the command that started it, with their
   counts, CPU and memory. The taskguard calls running inside a job, such as a
   dev stack's start-up builds, show under that job with their own CPU and
-  memory. `←` folds a row, `→` unfolds it. Running jobs keep their place,
+  memory. `←` folds a row, `→` unfolds it, and `Enter` on a run's row does
+  both. Running jobs keep their place,
   oldest first.
 - `--wraps`: a command that runs other taskguard jobs runs straight through
   from its first run, and the jobs inside it queue on their own. A queued run

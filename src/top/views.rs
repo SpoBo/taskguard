@@ -174,7 +174,7 @@ fn view_keys(app: &App) -> Vec<KeyItem> {
         }
         View::Queue => vec![
             ("↑/↓".into(), "select", None),
-            ("Enter".into(), "details", Some(KeyCode::Enter)),
+            ("Enter".into(), "details; on a run: fold", Some(KeyCode::Enter)),
             ("g".into(), "start now", Some(KeyCode::Char('g'))),
             ("e".into(), "edit needs", Some(KeyCode::Char('e'))),
             ("p".into(), "pause/resume", Some(KeyCode::Char('p'))),
@@ -844,7 +844,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             let parts: Vec<String> = why.iter().map(|(k, n)| format!("{n} for {k}")).collect();
             lines.push(Line::raw(format!("Its waiting jobs wait: {}.", parts.join(", "))));
         }
-        lines.push(Line::styled("Each job queues on its own, by its own needs.   ← fold   → unfold", DIM));
+        lines.push(Line::styled("Each job queues on its own, by its own needs.   Enter fold or unfold   ← fold   → unfold", DIM));
     } else if let Some(super::tree::Row::Sub { outer, i, .. }) = t.rows.get(app.sel)
         && let Some(sub) = app.data.subs.get(&s.running[*outer].pid).and_then(|v| v.get(*i))
     {
@@ -1521,6 +1521,7 @@ KEYS   (? lists the keys of the view you are in)
             Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
          ← fold a task-runner run or a job's nested calls (on a row inside one, folds that)   → unfold
+         Enter on a task-runner run folds or unfolds it
          p pause or resume a running job by hand (or: taskguard pause JOB / taskguard resume JOB)
          PAUSE: a paused job. Paused for memory (auto_pause, in Config): nothing new starts before it
          resumes. Paused by hand, or with kill -STOP: it stays paused until resumed by hand
@@ -1831,6 +1832,11 @@ mod tests {
         let s = screen(&mut app, 150, 30);
         assert!(!s.contains("web/dapp:oxlint") && s.contains("▸"), "{s}");
         assert!(s.contains("1 run  1 wait"), "{s}");
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 150, 30).contains("web/dapp:oxlint"), "Enter unfolds the run");
+        press(&mut app, KeyCode::Enter);
+        assert!(!screen(&mut app, 150, 30).contains("web/dapp:oxlint"), "and folds it again");
+        assert_eq!(app.view, View::Queue, "a run's row opens no details");
         app.sel = 0;
         press(&mut app, KeyCode::Left);
         let s = screen(&mut app, 150, 30);
