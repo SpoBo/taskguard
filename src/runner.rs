@@ -34,6 +34,9 @@ pub struct Opts {
     pub min_cpu: Option<f64>,
     pub min_mem_kb: Option<u64>,
     pub now: bool,
+    /// The command wraps other taskguard jobs: it runs straight through, and
+    /// the jobs inside it queue on their own.
+    pub wraps: bool,
     pub bg: bool,
     pub pipe: bool,
     pub quiet: bool,
@@ -99,12 +102,32 @@ fn held_by_ancestor(q: &Queue) -> bool {
 
 /// Tell the running job this nested call runs inside that it wraps other
 /// taskguard jobs: see `queue::Queue::note_nested`.
-fn note_nested(q: &Queue) {
+fn note_nested(q: &Queue, o: &Opts) {
     let procs = sys::list_procs();
     let me = std::process::id() as i32;
     if let Some(outer) = sys::ancestors(me, &procs).into_iter().skip(1).find(|p| q.run_path(*p).exists()) {
-        q.note_nested(outer, me);
+        let key = match (&o.key, std::env::current_dir()) {
+            (Some(k), _) => k.clone(),
+            (None, Ok(cwd)) => key::run_key(&cwd, &o.cmd),
+            (None, Err(_)) => String::new(),
+        };
+        q.note_nested(outer, me, &key);
     }
+}
+
+/// A command as one line to paste into a shell: words with spaces or
+/// shell characters in single quotes.
+fn shell_words(cmd: &[String]) -> String {
+    cmd.iter()
+        .map(|w| {
+            if !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,".contains(c)) {
+                w.clone()
+            } else {
+                format!("'{}'", w.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Task runners whose run groups the jobs it starts. A job belongs to the
@@ -196,7 +219,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         exec(&o.cmd);
     }
     if held_by_ancestor(&q) {
-        note_nested(&q);
+        note_nested(&q, &o);
         exec(&o.cmd);
     }
 
@@ -206,6 +229,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let jkey = o.key.clone().unwrap_or_else(|| key::run_key(&cwd, &o.cmd));
     let cls = cfg.classify(&o.cmd, &jkey)?;
     if !cfg.enabled || cls.passthrough {
+        exec(&o.cmd);
+    }
+    if o.wraps {
+        if !o.quiet {
+            say(&format!("straight through {jkey} - --wraps: the taskguard jobs inside it queue on their own"));
+        }
         exec(&o.cmd);
     }
     if o.bg {
@@ -268,7 +297,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     {
         if !o.quiet {
             say(&format!(
-                "straight through {jkey} - its recent runs started up to {n} taskguard jobs inside it, and those queue on their own (taskguard prune '{jkey}' --apply queues it again)"
+                "straight through {jkey} - its recent runs started up to {n} taskguard jobs inside it, and those queue on their own; pass --wraps to say so up front (taskguard prune '{jkey}' --apply queues it again)"
             ));
         }
         exec(&o.cmd);
@@ -829,6 +858,13 @@ pub fn run(mut o: Opts) -> Result<i32> {
     } else {
         None
     };
+    let nested_jobs = q.take_nested(me_pid);
+    if nested_jobs > 0 && startup.is_none() && pool.is_none() && min_mem.is_none() && min_cpu.is_none() {
+        lines.advice(&[format!(
+            "{jkey} started {nested_jobs} taskguard jobs inside it, which ran under its claim instead of queuing on their own. Next time it runs straight through by itself; to say so up front, run: taskguard --wraps {}",
+            shell_words(&o.cmd)
+        )]);
+    }
     if let Some(d) = &database {
         let _ = d.finish_run(
             run_id,
@@ -847,7 +883,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 measured,
                 paused_s: me.paused_s,
                 steady: tracker.steady(ended, me.paused_s - paused_before_steady),
-                nested_jobs: q.take_nested(me_pid),
+                nested_jobs,
             },
         );
     }

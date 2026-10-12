@@ -296,17 +296,31 @@ fn a_command_that_wraps_taskguard_jobs_runs_straight_through_next_time() {
     let inner = format!("{} -- sh -c 'echo inner'", env!("CARGO_BIN_EXE_taskguard"));
     let first = e.run(&["--", "sh", "-c", &inner]);
     assert!(first.status.success(), "{}", stderr(&first));
-    assert!(!stderr(&first).contains("straight through"), "{}", stderr(&first));
+    assert!(!stderr(&first).contains("] straight through"), "{}", stderr(&first));
+    assert!(stderr(&first).contains("taskguard --wraps sh -c"), "it advises the flag: {}", stderr(&first));
     let nested: i64 = e.db().query_row("SELECT nested_jobs FROM runs", [], |r| r.get(0)).unwrap();
     assert_eq!(nested, 1);
 
     let second = e.run(&["--", "sh", "-c", &inner]);
     assert!(second.status.success(), "{}", stderr(&second));
-    assert!(stderr(&second).contains("straight through"), "{}", stderr(&second));
+    assert!(stderr(&second).contains("] straight through"), "{}", stderr(&second));
     let keys: Vec<String> =
         e.db().prepare("SELECT key FROM runs ORDER BY id").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
     assert_eq!(keys.len(), 2, "the wrapper once, then the job inside it: {keys:?}");
     assert_ne!(keys[0], keys[1]);
+}
+
+#[test]
+fn wraps_runs_straight_through_from_the_first_run() {
+    let e = Env::new("");
+    let inner = format!("{} -- sh -c 'echo inner'", env!("CARGO_BIN_EXE_taskguard"));
+    let o = e.run(&["--wraps", "--", "sh", "-c", &inner]);
+    assert!(o.status.success(), "{}", stderr(&o));
+    assert!(stderr(&o).contains("straight through") && stderr(&o).contains("--wraps"), "{}", stderr(&o));
+    let keys: Vec<String> =
+        e.db().prepare("SELECT key FROM runs").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(keys.len(), 1, "only the job inside it is recorded: {keys:?}");
+    assert!(!keys[0].contains("taskguard"), "{keys:?}");
 }
 
 /// Wait until a waiting entry exists for `pid`, so a nudge reaches a job that waits.

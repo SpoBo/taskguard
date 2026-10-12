@@ -174,11 +174,13 @@ fn view_keys(app: &App) -> Vec<KeyItem> {
         }
         View::Queue => vec![
             ("↑/↓".into(), "select", None),
-            ("Enter".into(), "details", Some(KeyCode::Enter)),
+            ("Enter".into(), "details; on a run: fold", Some(KeyCode::Enter)),
             ("g".into(), "start now", Some(KeyCode::Char('g'))),
             ("e".into(), "edit needs", Some(KeyCode::Char('e'))),
             ("p".into(), "pause/resume", Some(KeyCode::Char('p'))),
             ("k".into(), "stop", Some(KeyCode::Char('k'))),
+            ("←".into(), "fold", Some(KeyCode::Left)),
+            ("→".into(), "unfold", Some(KeyCode::Right)),
         ],
         View::Runs => vec![
             ("↑/↓".into(), "select", None),
@@ -645,7 +647,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" limit", DIM),
         ]),
     ];
-    let n_rows = s.waiting.len() + s.running.len();
+    let n_rows = app.queue_tree().rows.len();
     let [top, list, why] =
         Layout::vertical([Constraint::Length(4), Constraint::Length((n_rows as u16 + 2).clamp(3, 14)), Constraint::Min(6)]).areas(area);
     f.render_widget(Paragraph::new(bars), top);
@@ -659,40 +661,83 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             " est"
         }
     };
+    let t = app.queue_tree();
     let mut rows: Vec<Row> = Vec::new();
-    for e in &s.running {
-        let over =
-            e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05 || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
-        rows.push(Row::new(vec![
-            match (e.paused_since, e.now) {
-                (Some(_), _) => Cell::from("PAUSE").style(Style::default().fg(Color::LightMagenta)),
-                (None, true) => Cell::from("NOW").style(Style::default().fg(Color::Green)),
-                (None, false) => Cell::from("RUN").style(Style::default().fg(Color::Green)),
-            },
-            Cell::from(report::job_name(e, 44)),
-            Cell::from(e.ns.clone()),
-            Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
-            Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))).style(if over {
-                Style::default().fg(Color::Red)
-            } else {
-                Style::default()
-            }),
-            Cell::from(format!("needs {:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
-        ]));
-    }
-    for w in &s.waiting {
-        let e = &w.entry;
-        let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into())
-            + &w.eta_s.map(|t| format!("  ~{}", dur(t.max(1.0)))).unwrap_or_default();
-        rows.push(Row::new(vec![
-            Cell::from("WAIT").style(Style::default().fg(Color::Yellow)),
-            Cell::from(report::job_name(e, 44)),
-            Cell::from(e.ns.clone()),
-            Cell::from(dur(s.now - e.queued_at)),
-            Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
-            Cell::from(blocked)
-                .style(Style::default().fg(chart::blocker_color(report::main_blocker(&w.decision).map(|b| b.name()).unwrap_or("")))),
-        ]));
+    for (n, r) in t.rows.iter().enumerate() {
+        let lead = t.lead[n].as_str();
+        let room = 44usize.saturating_sub(lead.chars().count());
+        match *r {
+            super::tree::Row::Group(g) => {
+                let g = &t.groups[g];
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format!("{} {}", if g.folded { "▸" } else { "▾" }, trunc(&g.label, 42))),
+                        Cell::from(g.id.clone()),
+                        Cell::from(dur(s.now - g.since)),
+                        Cell::from(if g.running > 0 { format!("{:.1}c {} now", g.cpu.max(0.0), gb(g.mem_kb)) } else { String::new() }),
+                        Cell::from(format!("{} run  {} wait", g.running, g.waiting)),
+                    ])
+                    .style(BOLD),
+                );
+            }
+            super::tree::Row::Job { waiting: false, i, .. } => {
+                let e = &s.running[i];
+                let over = e.live_cpu > e.start_need_cpu.unwrap_or(e.need_cpu) + 0.05
+                    || e.live_mem_kb > e.start_need_mem_kb.unwrap_or(e.need_mem_kb);
+                let fold = match app.data.subs.get(&e.pid) {
+                    Some(_) if app.folded.contains(&super::tree::fold_id_of_job(e)) => "▸ ",
+                    Some(_) => "▾ ",
+                    None => "",
+                };
+                rows.push(Row::new(vec![
+                    match (e.paused_since, e.now) {
+                        (Some(_), _) => Cell::from("PAUSE").style(Style::default().fg(Color::LightMagenta)),
+                        (None, true) => Cell::from("NOW").style(Style::default().fg(Color::Green)),
+                        (None, false) => Cell::from("RUN").style(Style::default().fg(Color::Green)),
+                    },
+                    Cell::from(format!("{lead}{fold}{}", report::job_name(e, room.saturating_sub(fold.chars().count())))),
+                    Cell::from(e.ns.clone()),
+                    Cell::from(dur(s.now - e.started_at.unwrap_or(s.now))),
+                    Cell::from(format!("{:.1}c {} now", e.live_cpu, gb(e.live_mem_kb))).style(if over {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default()
+                    }),
+                    Cell::from(format!("needs {:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
+                ]));
+            }
+            super::tree::Row::Job { waiting: true, i, .. } => {
+                let w = &s.waiting[i];
+                let e = &w.entry;
+                let blocked = report::main_blocker(&w.decision).map(|b| b.name().to_uppercase()).unwrap_or_else(|| "starting".into())
+                    + &w.eta_s.map(|t| format!("  ~{}", dur(t.max(1.0)))).unwrap_or_default();
+                rows.push(Row::new(vec![
+                    Cell::from("WAIT").style(Style::default().fg(Color::Yellow)),
+                    Cell::from(format!("{lead}{}", report::job_name(e, room))),
+                    Cell::from(e.ns.clone()),
+                    Cell::from(dur(s.now - e.queued_at)),
+                    Cell::from(format!("{:.1}c {}{}", e.need_cpu, gb(e.need_mem_kb), est(e))),
+                    Cell::from(blocked).style(
+                        Style::default().fg(chart::blocker_color(report::main_blocker(&w.decision).map(|b| b.name()).unwrap_or(""))),
+                    ),
+                ]));
+            }
+            super::tree::Row::Sub { outer, i, .. } => {
+                let Some(sub) = app.data.subs.get(&s.running[outer].pid).and_then(|v| v.get(i)) else { continue };
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(""),
+                        Cell::from(format!("{lead}{}", trunc(&sub.key, room))),
+                        Cell::from(""),
+                        Cell::from(dur(s.now - sub.since)),
+                        Cell::from(format!("{:.1}c {} now", sub.cpu, gb(sub.mem_kb))),
+                        Cell::from("inside, not queued"),
+                    ])
+                    .style(DIM),
+                );
+            }
+        }
     }
     let table = Table::new(
         rows,
@@ -707,7 +752,16 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
     )
     .header(Row::new(vec!["", "job", "namespace", "time", "needs / now", "blocked by"]).style(BOLD))
     .row_highlight_style(Style::default().bg(Color::DarkGray))
-    .block(Block::new().borders(Borders::TOP).title(format!(" {} running, {} waiting ", s.running.len(), s.waiting.len())));
+    .block(Block::new().borders(Borders::TOP).title(format!(
+        " {} running, {} waiting{}   ←/→ fold ",
+        s.running.len(),
+        s.waiting.len(),
+        match t.groups.len() {
+            0 => String::new(),
+            1 => ", in 1 task-runner run".into(),
+            n => format!(", in {n} task-runner runs"),
+        }
+    )));
     render_list(f, app, table, list, 2, n_rows);
 
     // The Why panel.
@@ -767,6 +821,47 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             ));
         }
         lines.push(Line::styled("g start it now   e change its needs for this run   Enter details", DIM));
+    } else if let Some(super::tree::Row::Group(g)) = t.rows.get(app.sel) {
+        let g = &t.groups[*g];
+        lines.push(Line::styled(format!("{} ({})", g.label, g.id), BOLD));
+        lines.push(Line::raw(format!(
+            "One task-runner run: {} of its jobs run and {} wait. It queued its first job {} ago.",
+            g.running,
+            g.waiting,
+            dur(s.now - g.since)
+        )));
+        lines.push(Line::raw(format!(
+            "Its running jobs use {:.1} cores and {} now, and need {} in all.",
+            g.cpu,
+            gb(g.mem_kb),
+            gb(g.need_mem_kb)
+        )));
+        let mut why: std::collections::BTreeMap<&str, usize> = Default::default();
+        for w in s.waiting.iter().filter(|w| w.entry.pipeline.as_deref() == Some(g.id.as_str())) {
+            *why.entry(report::main_blocker(&w.decision).map(|b| b.name()).unwrap_or("starting")).or_default() += 1;
+        }
+        if !why.is_empty() {
+            let parts: Vec<String> = why.iter().map(|(k, n)| format!("{n} for {k}")).collect();
+            lines.push(Line::raw(format!("Its waiting jobs wait: {}.", parts.join(", "))));
+        }
+        lines.push(Line::styled("Each job queues on its own, by its own needs.   Enter fold or unfold   ← fold   → unfold", DIM));
+    } else if let Some(super::tree::Row::Sub { outer, i, .. }) = t.rows.get(app.sel)
+        && let Some(sub) = app.data.subs.get(&s.running[*outer].pid).and_then(|v| v.get(*i))
+    {
+        let outer = &s.running[*outer];
+        lines.push(Line::styled(format!("{} runs inside {}", sub.key, outer.key), BOLD));
+        lines.push(Line::raw(format!(
+            "now {:.1} cores, {}; started {} ago (pid {})",
+            sub.cpu,
+            gb(sub.mem_kb),
+            dur(s.now - sub.since),
+            sub.pid
+        )));
+        lines.push(Line::raw(format!(
+            "A taskguard call nested in a running job is not queued: it runs under {}'s claim, and its use counts as that job's.",
+            outer.key
+        )));
+        lines.push(Line::styled("Enter details of this key   ← fold", DIM));
     } else if let Some((e, _)) = app.queue_row(app.sel) {
         lines.push(Line::styled(format!("{} is running", e.key), BOLD));
         lines.push(Line::raw(format!(
@@ -1405,7 +1500,8 @@ fn help(f: &mut Frame, area: Rect) {
     let text = "\
 VIEWS
   1 Overview    machine load over time, with taskguard's jobs stacked per namespace
-  2 Queue       what runs and what waits, and a Why panel for the selected job
+  2 Queue       what runs and what waits, and a Why panel for the selected job; the jobs of one
+                task-runner run under one row, and calls nested in a job under that job
   3 Runs        past runs; the panel below shows why the selected run waited
   4 Tasks       every task taskguard knows, per namespace: filter them, and prune their history
   5 Trends      commands whose memory, CPU or duration grows
@@ -1424,6 +1520,8 @@ KEYS   (? lists the keys of the view you are in)
   Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
             Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
+         ← fold a task-runner run or a job's nested calls (on a row inside one, folds that)   → unfold
+         Enter on a task-runner run folds or unfolds it
          p pause or resume a running job by hand (or: taskguard pause JOB / taskguard resume JOB)
          PAUSE: a paused job. Paused for memory (auto_pause, in Config): nothing new starts before it
          resumes. Paused by hand, or with kill -STOP: it stays paused until resumed by hand
@@ -1679,6 +1777,77 @@ mod tests {
         app.sel = 1;
         let s = screen(&mut app, 150, 30);
         assert!(s.contains("Why is packages/small:tsc waiting?"), "{s}");
+    }
+
+    #[test]
+    fn queue_shows_task_runner_runs_and_nested_calls_as_a_tree() {
+        let (_t, mut app) = fixture();
+        let sleep = |s: &str| std::process::Command::new("sleep").arg(s).spawn().unwrap();
+        // A stand-in for turbo, a call nested in the stack, and the owner of a turbo job.
+        let mut kids = [sleep("101"), sleep("102"), sleep("103")];
+        let (turbo, nested, owner) = (kids[0].id() as i32, kids[1].id() as i32, kids[2].id() as i32);
+        let q = crate::queue::Queue::open(&app.dir).unwrap();
+        let me = std::process::id() as i32;
+        let base = crate::queue::Entry { ns: "dalp".into(), known: true, version: Some("0.9.0".into()), ..Default::default() };
+        let run = format!("turbo:{turbo}");
+        let stack = crate::queue::Entry { pid: me, key: "dev-env:stack".into(), started_at: Some(now() - 60.0), ..base.clone() };
+        let lint = crate::queue::Entry {
+            pid: owner,
+            key: "web/dapp:oxlint".into(),
+            started_at: Some(now() - 20.0),
+            pipeline: Some(run.clone()),
+            pipeline_since: Some(now() - 30.0),
+            ..base.clone()
+        };
+        let check = crate::queue::Entry {
+            pid: me,
+            ticket: 2,
+            key: "web/dapp:bun_check".into(),
+            queued_at: now() - 10.0,
+            pipeline: Some(run),
+            pipeline_since: Some(now() - 30.0),
+            ..base
+        };
+        q.write(&q.run_path(me), &stack).unwrap();
+        q.write(&q.run_path(owner), &lint).unwrap();
+        q.write(&q.wait_path(&check), &check).unwrap();
+        q.note_nested(me, nested, "dalp:prepare");
+        app.view = View::Queue;
+        app.load().unwrap();
+        let s = screen(&mut app, 150, 30);
+        let at = |t: &str| s.find(t).unwrap_or_else(|| panic!("{t} missing:\n{s}"));
+        assert!(at("dev-env:stack") < at("└ dalp:prepare"), "the nested call follows its job:\n{s}");
+        assert!(at("├ web/dapp:oxlint") < at("└ web/dapp:bun_check"), "jobs of a run get tree lines:\n{s}");
+        assert!(at("sleep 101") < at("web/dapp:oxlint"), "the run is named by its command:\n{s}");
+        assert!(at("web/dapp:oxlint") < at("web/dapp:bun_check"), "{s}");
+        assert!(s.contains("in 1 task-runner run"), "{s}");
+
+        let press = |app: &mut App, code| {
+            app.key(crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE));
+        };
+        // Rows: the stack, its nested call, the run, its two jobs. ← on a job inside the run folds the run.
+        app.sel = 3;
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.sel, 2, "the fold selects the run");
+        let s = screen(&mut app, 150, 30);
+        assert!(!s.contains("web/dapp:oxlint") && s.contains("▸"), "{s}");
+        assert!(s.contains("1 run  1 wait"), "{s}");
+        press(&mut app, KeyCode::Enter);
+        assert!(screen(&mut app, 150, 30).contains("web/dapp:oxlint"), "Enter unfolds the run");
+        press(&mut app, KeyCode::Enter);
+        assert!(!screen(&mut app, 150, 30).contains("web/dapp:oxlint"), "and folds it again");
+        assert_eq!(app.view, View::Queue, "a run's row opens no details");
+        app.sel = 0;
+        press(&mut app, KeyCode::Left);
+        let s = screen(&mut app, 150, 30);
+        assert!(!s.contains("dalp:prepare"), "{s}");
+        press(&mut app, KeyCode::Right);
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("dalp:prepare"), "→ unfolds:\n{s}");
+        for k in &mut kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
     }
 
     #[test]

@@ -174,6 +174,33 @@ pub fn proc_name(pid: i32) -> String {
     String::from_utf8_lossy(&buf[..n as usize]).into_owned()
 }
 
+/// The command line of a process, from KERN_PROCARGS2: the argument count,
+/// the executable path, padding, then the arguments, each ending in a NUL.
+/// None when the process is gone or belongs to another user.
+pub fn proc_args(pid: i32) -> Option<Vec<String>> {
+    let mut argmax: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let r = unsafe { libc::sysctl(mib.as_mut_ptr(), 2, &mut argmax as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+    if r != 0 || argmax <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; argmax as usize];
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let r = unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+    if r != 0 || len < size_of::<libc::c_int>() {
+        return None;
+    }
+    let argc = i32::from_ne_bytes(buf[..4].try_into().ok()?) as usize;
+    let rest = &buf[4..len];
+    // Skip the executable path and the NULs after it.
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let start = path_end + rest[path_end..].iter().position(|b| *b != 0)?;
+    let args: Vec<String> = rest[start..].split(|b| *b == 0).take(argc).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    (!args.is_empty()).then_some(args)
+}
+
 /// The program's path. Some programs have a name that says little: Claude
 /// Code's process is named after its version, for example "2.1.282".
 pub fn proc_path(pid: i32) -> Option<String> {

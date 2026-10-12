@@ -1,6 +1,7 @@
 //! `taskguard top`: the dashboard.
 
 mod chart;
+mod tree;
 mod views;
 
 use crate::commands;
@@ -13,7 +14,7 @@ use crate::report::Snapshot;
 use crate::runner;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -132,6 +133,10 @@ pub struct Data {
     pub cursor_runs: Vec<dash::RunAt>,
     pub job: Option<JobData>,
     pub run_spans: Vec<(f64, String, String)>,
+    /// The Queue view's tree: the taskguard calls running inside each job,
+    /// by the job's pid, and the command each task-runner run stands for.
+    pub subs: HashMap<i32, Vec<tree::Sub>>,
+    pub labels: HashMap<String, String>,
 }
 
 pub struct JobData {
@@ -206,6 +211,10 @@ pub struct App {
     /// The pool whose match patterns the Config view lists, and the row of
     /// that pool to return to.
     pub pool_edit: Option<(String, usize)>,
+    /// Folded Queue rows: task-runner runs by id, jobs as "pid:<pid>".
+    pub folded: HashSet<String>,
+    /// CPU time of each nested call at the last load, for its cores.
+    sub_cpu: HashMap<i32, (f64, u64)>,
     /// Kept open between loads.
     db: Option<Db>,
     history: Option<History>,
@@ -271,6 +280,8 @@ impl App {
             checkout: PathBuf::new(),
             save_to: None,
             pool_edit: None,
+            folded: HashSet::new(),
+            sub_cpu: HashMap::new(),
             db: None,
             history: None,
         }
@@ -408,11 +419,24 @@ impl App {
         };
         let mut namespaces = dash::namespaces(db, live_to - span, self.cfg.sample_every)?;
         sort_ns(&mut namespaces, self.sort, self.reverse);
+        let snap = commands::queue_snapshot(&self.dir, &self.cfg, Some(db)).ok();
+        // The tree reads the process table, so only while the Queue shows.
+        let (subs, labels) = match (&snap, self.view) {
+            (Some(s), View::Queue) => {
+                let procs = crate::sys::list_procs();
+                let subs = tree::subtasks(&Queue { dir: self.dir.clone() }, &s.running, &procs, now, &mut self.sub_cpu);
+                let ids: HashSet<&String> =
+                    s.running.iter().chain(s.waiting.iter().map(|w| &w.entry)).filter_map(|e| e.pipeline.as_ref()).collect();
+                let labels = ids.into_iter().filter_map(|id| Some((id.clone(), tree::label(id, &procs)?))).collect();
+                (subs, labels)
+            }
+            _ => Default::default(),
+        };
         self.data = Data {
             now,
             from,
             to,
-            snap: commands::queue_snapshot(&self.dir, &self.cfg, Some(db)).ok(),
+            snap,
             machine,
             ncpu,
             mem_total_kb: mem_total,
@@ -433,6 +457,8 @@ impl App {
             cursor_runs,
             job,
             run_spans,
+            subs,
+            labels,
         };
         self.pick = self.pick.map(|p| p.min(self.data.cursor_runs.len().saturating_sub(1))).filter(|_| !self.data.cursor_runs.is_empty());
         Ok(())
@@ -440,7 +466,7 @@ impl App {
 
     fn list_len(&self) -> usize {
         match self.view {
-            View::Queue => self.data.snap.as_ref().map(|s| s.waiting.len() + s.running.len()).unwrap_or(0),
+            View::Queue => self.queue_tree().rows.len(),
             View::Runs => self.data.runs.len(),
             View::Trends => self.data.trends.len(),
             View::Tasks => self.data.tasks.len(),
@@ -569,7 +595,12 @@ impl App {
             View::Trends => self.data.trends.get(self.sel).map(|t| t.key.clone()),
             View::Tasks => self.data.tasks.get(self.sel).map(|t| t.key.clone()),
             View::Warnings => self.data.warnings.get(self.sel).map(|w| w.key.clone()),
-            View::Queue => self.queue_row(self.sel).map(|(e, _)| e.key.clone()),
+            View::Queue => match self.queue_tree().rows.get(self.sel) {
+                Some(tree::Row::Sub { outer, i, .. }) => {
+                    self.data.subs.get(&self.data.snap.as_ref()?.running.get(*outer)?.pid)?.get(*i).map(|s| s.key.clone())
+                }
+                _ => self.queue_row(self.sel).map(|(e, _)| e.key.clone()),
+            },
             View::Namespaces => {
                 let ns = self.data.namespaces.get(self.sel)?;
                 ns.top_keys.first().map(|k| k.0.clone())
@@ -578,17 +609,67 @@ impl App {
         }
     }
 
-    /// Queue view rows: running jobs first, then waiting ones in queue
-    /// order. The bool is true for a waiting job.
+    /// The Queue view's rows: see `tree::build`.
+    pub fn queue_tree(&self) -> tree::Tree {
+        let Some(s) = self.data.snap.as_ref() else { return tree::Tree::default() };
+        let waiting: Vec<&crate::queue::Entry> = s.waiting.iter().map(|w| &w.entry).collect();
+        tree::build(&s.running, &waiting, &self.data.subs, &self.data.labels, &self.folded)
+    }
+
+    /// The job on Queue row `i`; the bool is true for a waiting job. None
+    /// on a group header or a nested call.
     pub fn queue_row(&self, i: usize) -> Option<(&crate::queue::Entry, bool)> {
         let s = self.data.snap.as_ref()?;
-        if i < s.running.len() { Some((&s.running[i], false)) } else { s.waiting.get(i - s.running.len()).map(|w| (&w.entry, true)) }
+        match self.queue_tree().rows.get(i)? {
+            tree::Row::Job { waiting: false, i, .. } => s.running.get(*i).map(|e| (e, false)),
+            tree::Row::Job { waiting: true, i, .. } => s.waiting.get(*i).map(|w| (&w.entry, true)),
+            _ => None,
+        }
     }
 
     /// The waiting job on the selected Queue row, with its decision.
     pub fn queue_waiting(&self) -> Option<&crate::report::Waiting> {
         let s = self.data.snap.as_ref()?;
-        self.sel.checked_sub(s.running.len()).and_then(|i| s.waiting.get(i))
+        match self.queue_tree().rows.get(self.sel)? {
+            tree::Row::Job { waiting: true, i, .. } => s.waiting.get(*i),
+            _ => None,
+        }
+    }
+
+    /// ← folds the selected group or job, or, on a row inside one, folds
+    /// that and selects it. → unfolds.
+    fn fold(&mut self, fold: bool) {
+        let Some(s) = self.data.snap.as_ref() else { return };
+        let t = self.queue_tree();
+        let id_at = |r: usize| match t.rows.get(r) {
+            Some(tree::Row::Group(g)) => t.groups.get(*g).map(|g| g.id.clone()),
+            Some(tree::Row::Job { waiting: false, i, .. }) => {
+                s.running.get(*i).filter(|e| self.data.subs.contains_key(&e.pid)).map(tree::fold_id_of_job)
+            }
+            _ => None,
+        };
+        if !fold {
+            if let Some(id) = id_at(self.sel) {
+                self.folded.remove(&id);
+            }
+            return;
+        }
+        if let Some(id) = id_at(self.sel).filter(|id| !self.folded.contains(id)) {
+            self.folded.insert(id);
+            return;
+        }
+        // Inside a group or a job: fold the nearest row above that holds it.
+        let depth = |r: &tree::Row| match r {
+            tree::Row::Group(_) => 0,
+            tree::Row::Job { depth, .. } | tree::Row::Sub { depth, .. } => *depth,
+        };
+        let Some(here) = t.rows.get(self.sel).map(depth).filter(|d| *d > 0) else { return };
+        if let Some(up) = (0..self.sel).rev().find(|&r| depth(&t.rows[r]) < here && id_at(r).is_some()) {
+            if let Some(id) = id_at(up) {
+                self.folded.insert(id);
+            }
+            self.sel = up;
+        }
     }
 
     /// A job from an older taskguard does not read nudges.
@@ -996,6 +1077,7 @@ impl App {
             KeyCode::Char('s') => self.sort += 1,
             KeyCode::Char('r') => self.reverse = !self.reverse,
             KeyCode::Char(' ') => self.paused = !self.paused,
+            KeyCode::Left | KeyCode::Right if self.view == View::Queue => self.fold(k.code == KeyCode::Left),
             KeyCode::PageUp | KeyCode::PageDown => self.page_list(k.code == KeyCode::PageDown),
             KeyCode::Up => self.sel = self.sel.saturating_sub(1),
             KeyCode::Down => {
@@ -1006,7 +1088,14 @@ impl App {
             KeyCode::Home => self.sel = 0,
             KeyCode::End => self.sel = self.list_len().saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(k) = self.selected_key() {
+                if let (View::Queue, Some(tree::Row::Group(g))) = (self.view, self.queue_tree().rows.get(self.sel).copied()) {
+                    // A run's row has no details of its own: Enter folds or unfolds it.
+                    let t = self.queue_tree();
+                    let id = t.groups[g].id.clone();
+                    if !self.folded.remove(&id) {
+                        self.folded.insert(id);
+                    }
+                } else if let Some(k) = self.selected_key() {
                     self.open_job(k);
                 }
             }

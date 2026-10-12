@@ -13,6 +13,8 @@ options (sem style; the default is to run in the foreground):
   --min-mem SIZE          never start with less than SIZE free (6G, 512M)
   --priority N            higher starts first (default 0; negative is allowed)
   --now                   skip the queue, but still measure and learn
+  --wraps                 COMMAND runs other taskguard jobs (turbo, a package
+                          script): run it straight through and let them queue
   --bg                    wait for room, then return and let the job run on
   --fg                    run in the foreground (the default)
   --pipe                  with --bg: pass stdin to the command
@@ -51,8 +53,12 @@ taskguard top [--view NAME] [--range RANGE] [--job KEY] [--print [--width N] [--
 
 The dashboard: the machine, the queue, past runs, every known task, trends
 and warnings. Inside it, ? lists the keys of the view you are in. In the
-Tasks view (tab 4), filter tasks and prune their history: x one task, X every
-task shown.
+Queue view (tab 2), the jobs of one task-runner run (a `turbo run`) sit under
+one row named by the command that started it, and the taskguard calls running
+inside a job sit under that job: ← folds a row, → unfolds it, and Enter on a
+run's row folds or unfolds it. In the Tasks
+view (tab 4), filter tasks and prune their history: x one task, X every task
+shown.
 
 options:
   --view NAME     open on a view: overview, queue, runs, tasks, trends,

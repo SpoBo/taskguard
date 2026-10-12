@@ -322,7 +322,9 @@ taskguard jobs inside them runs straight through, with one line saying so. The
 jobs inside it then queue on their own, each by its own need. A long-lived job,
 a job in a pool and a job with a minimum stay queued: their claim is on
 purpose. `taskguard prune 'KEY' --apply` forgets the history, so the command
-queues again.
+queues again. When a queued run had jobs inside it, taskguard prints advice to
+pass `--wraps`: `taskguard --wraps bun run ci:local` runs straight through
+from the first run, with nothing to learn first.
 
 Long-running commands are never queued: watch modes, dev servers, `--version`
 and `--help` run straight through (the list is in `src/builtin.rs`). Add your
@@ -420,7 +422,7 @@ run, and the minimum to pin when a job starves again and again.
 | View | What it shows |
 | --- | --- |
 | 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace. The load it did not start is split into groups: agents (with everything they started), browsers, editors, dev services such as databases, containers, and chat and other apps. The legend names the biggest programs in each group, so you can see what to close to make room. A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
-| 2 Queue | Running jobs, then waiting ones. The bars show in red the load that running jobs have above their estimates. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. `g` starts a waiting job now, and `e` sets a job's needs for this run only (for example `2 4G`), so it can fit into room you know it will not outgrow. |
+| 2 Queue | Running jobs, then waiting ones, as a tree: the jobs of one task-runner run sit under one row named by the command that started it (`bun run ci:local`), and the taskguard calls running inside a job (a dev stack's start-up builds) under that job, with their CPU and memory. `←` folds a row, `→` unfolds it, and `Enter` on a run's row does both. The bars show in red the load that running jobs have above their estimates. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. `g` starts a waiting job now, and `e` sets a job's needs for this run only (for example `2 4G`), so it can fit into room you know it will not outgrow. |
 | 3 Runs | Past runs, sortable and filterable, with the reasons each one waited. |
 | 4 Tasks | Every task taskguard knows, with its namespace, runs, last run, and what it learned. `n` (namespace), `/` (text) and `a` (not run for 1, 7, 30 or 90 days) filter the list. `x` prunes every run of the selected task; `X` prunes every task the filters leave, and needs a filter. Both ask first. Pruned runs move aside, as with `taskguard prune`, and `taskguard prune --undo --apply` puts them back. In a job's view, `x` prunes the selected run. |
 | 5 Trends | Commands whose memory, CPU or duration grows: the last 10 runs against the 10 before. |

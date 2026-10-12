@@ -12,6 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+/// A taskguard call that runs inside a running job, under its claim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Nested {
+    pub outer: i32,
+    pub pid: i32,
+    pub since: f64,
+    pub key: String,
+}
+
 /// One waiting or running job, as a JSON file in `wait/` or `run/`.
 ///
 /// Every taskguard version on the machine reads these files, and DALP pins a
@@ -287,9 +296,29 @@ impl Queue {
 
     /// A taskguard call nested inside the running job of `outer` (a pid)
     /// leaves `nested/<outer>.<pid>`, so that job learns that it wraps other
-    /// taskguard jobs.
-    pub fn note_nested(&self, outer: i32, pid: i32) {
-        let _ = fs::write(self.dir.join("nested").join(format!("{outer}.{pid}")), "");
+    /// taskguard jobs. The note holds the call's job key, for the tree in
+    /// `taskguard top`; when it was written is when the call started.
+    pub fn note_nested(&self, outer: i32, pid: i32, key: &str) {
+        let _ = fs::write(self.dir.join("nested").join(format!("{outer}.{pid}")), key);
+    }
+
+    /// Every nested call with a note: the outer job's pid, the call's pid,
+    /// when it started, and its key (empty from a note without one).
+    pub fn nested(&self) -> Vec<Nested> {
+        let Ok(rd) = fs::read_dir(self.dir.join("nested")) else { return Vec::new() };
+        rd.filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                let (outer, pid) = name.split_once('.')?;
+                let since = e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64();
+                Some(Nested {
+                    outer: outer.parse().ok()?,
+                    pid: pid.parse().ok()?,
+                    since,
+                    key: fs::read_to_string(e.path()).unwrap_or_default(),
+                })
+            })
+            .collect()
     }
 
     /// How many nested calls left a note for the job of `owner`. The notes
@@ -2288,9 +2317,13 @@ mod tests {
     fn nested_calls_leave_notes_for_their_outer_job() {
         let tmp = tempfile::tempdir().unwrap();
         let q = Queue::open(tmp.path()).unwrap();
-        q.note_nested(100, 201);
-        q.note_nested(100, 202);
-        q.note_nested(1000, 203);
+        q.note_nested(100, 201, "a:tsc");
+        q.note_nested(100, 202, "b:tsc");
+        q.note_nested(1000, 203, "c:lint");
+        let mut seen: Vec<(i32, i32, String)> = q.nested().into_iter().map(|n| (n.outer, n.pid, n.key)).collect();
+        seen.sort();
+        assert_eq!(seen[0], (100, 201, "a:tsc".to_string()));
+        assert_eq!(seen.len(), 3);
         assert_eq!(q.take_nested(100), 2, "only its own notes, not those of pid 1000");
         assert_eq!(q.take_nested(100), 0, "taken once");
         assert_eq!(q.take_nested(1000), 1);
