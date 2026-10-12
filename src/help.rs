@@ -53,8 +53,11 @@ taskguard top [--view NAME] [--range RANGE] [--job KEY] [--print [--width N] [--
 
 The dashboard: the machine, the queue, past runs, every known task, trends
 and warnings. Inside it, ? lists the keys of the view you are in. In the
-Tasks view (tab 4), filter tasks and prune their history: x one task, X every
-task shown.
+Queue view (tab 2), the jobs of one task-runner run (a `turbo run`) sit under
+one row named by the command that started it, and the taskguard calls running
+inside a job sit under that job: ← folds a row, → unfolds it. In the Tasks
+view (tab 4), filter tasks and prune their history: x one task, X every task
+shown.
 
 options:
   --view NAME     open on a view: overview, queue, runs, tasks, trends,

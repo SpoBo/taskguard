@@ -265,7 +265,7 @@ pub enum SettingKind {
     Size(u64, u64, u64),
 }
 
-pub const SETTINGS: [Setting; 13] = [
+pub const SETTINGS: [Setting; 14] = [
     Setting {
         key: "enabled",
         what: "off: every command runs straight through, unqueued and unmeasured (as TASKGUARD_DISABLE=1)",
@@ -283,8 +283,13 @@ pub const SETTINGS: [Setting; 13] = [
     },
     Setting {
         key: "pressure_max",
-        what: "Linux: no new job while memory pressure (PSI) is above this",
+        what: "no new job at this memory pressure (Linux: PSI share; macOS: 50 warning, 100 critical)",
         kind: SettingKind::Number(5.0, 5.0, 90.0, "%"),
+    },
+    Setting {
+        key: "warn_admit",
+        what: "macOS warning level: jobs still start while memory fits and no first run still grows",
+        kind: SettingKind::Bool,
     },
     Setting {
         key: "auto_pause",
@@ -335,6 +340,7 @@ impl Config {
             "enabled" => (if self.enabled { "on" } else { "off" }).into(),
             "hints" => (if self.hints { "on" } else { "off" }).into(),
             "auto_pause" => (if self.auto_pause { "on" } else { "off" }).into(),
+            "warn_admit" => (if self.warn_admit { "on" } else { "off" }).into(),
             "pause_at" => format!("{:.0}%", self.pause_at),
             "resume_at" => format!("{:.0}%", self.resume_at),
             "max_bypass" => format!("{}s", self.max_bypass),
@@ -351,6 +357,7 @@ impl Config {
             "enabled" => self.enabled,
             "hints" => self.hints,
             "auto_pause" => self.auto_pause,
+            "warn_admit" => self.warn_admit,
             _ => false,
         }
     }

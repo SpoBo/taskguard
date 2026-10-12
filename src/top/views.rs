@@ -179,6 +179,8 @@ fn view_keys(app: &App) -> Vec<KeyItem> {
             ("e".into(), "edit needs", Some(KeyCode::Char('e'))),
             ("p".into(), "pause/resume", Some(KeyCode::Char('p'))),
             ("k".into(), "stop", Some(KeyCode::Char('k'))),
+            ("←".into(), "fold", Some(KeyCode::Left)),
+            ("→".into(), "unfold", Some(KeyCode::Right)),
         ],
         View::Runs => vec![
             ("↑/↓".into(), "select", None),
@@ -1498,7 +1500,8 @@ fn help(f: &mut Frame, area: Rect) {
     let text = "\
 VIEWS
   1 Overview    machine load over time, with taskguard's jobs stacked per namespace
-  2 Queue       what runs and what waits, and a Why panel for the selected job
+  2 Queue       what runs and what waits, and a Why panel for the selected job; the jobs of one
+                task-runner run under one row, and calls nested in a job under that job
   3 Runs        past runs; the panel below shows why the selected run waited
   4 Tasks       every task taskguard knows, per namespace: filter them, and prune their history
   5 Trends      commands whose memory, CPU or duration grows
@@ -1517,6 +1520,7 @@ KEYS   (? lists the keys of the view you are in)
   Overview: PgDn / PgUp move the chart back / forward in time; l (or End) goes back to live
             Enter picks a job at the time cursor, ↑/↓ select it, Enter opens that run, Esc back to the chart
   Queue: g start a waiting job now   e change a job's needs for this run   k stop a job
+         ← fold a task-runner run or a job's nested calls (on a row inside one, folds that)   → unfold
          p pause or resume a running job by hand (or: taskguard pause JOB / taskguard resume JOB)
          PAUSE: a paused job. Paused for memory (auto_pause, in Config): nothing new starts before it
          resumes. Paused by hand, or with kill -STOP: it stays paused until resumed by hand
