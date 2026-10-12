@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-12
+
 ### Added
 
 - `taskguard top`: the Queue view is a tree. The jobs of one task-runner
@@ -22,6 +24,7 @@ and the versions follow [semver](https://semver.org).
 - `--wraps`: a command that runs other taskguard jobs runs straight through
   from its first run, and the jobs inside it queue on their own. A queued run
   that had jobs inside it prints advice to pass it.
+- The Config view of `taskguard top` lists `warn_admit`.
 
 ### Changed
 
@@ -301,7 +304,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/SpoBo/taskguard/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/SpoBo/taskguard/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/SpoBo/taskguard/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/SpoBo/taskguard/compare/v0.6.0...v0.7.0
