@@ -32,6 +32,7 @@ pub struct Layer {
     pub learn_stagger: Option<f64>,
     pub cpu_min_duration: Option<f64>,
     pub pressure_max: Option<f64>,
+    pub warn_admit: Option<bool>,
     pub priority: Option<i32>,
     pub auto_pause: Option<bool>,
     pub pause_at: Option<f64>,
@@ -125,6 +126,9 @@ pub struct Config {
     pub learn_stagger: f64,
     pub cpu_min_duration: f64,
     pub pressure_max: f64,
+    /// macOS: at the kernel's warning level, jobs still start while memory
+    /// fits and no first run still grows. Off: warning stops every new job.
+    pub warn_admit: bool,
     /// The priority of a job that no rule or flag gives one.
     pub priority: i32,
     /// Pause running jobs when memory fills up, and resume them when it frees
@@ -187,6 +191,7 @@ impl Default for Config {
             learn_stagger: 5.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            warn_admit: true,
             priority: 0,
             auto_pause: false,
             pause_at: 92.0,
@@ -607,6 +612,7 @@ impl Config {
         set!(learn_stagger);
         set!(cpu_min_duration);
         set!(pressure_max);
+        set!(warn_admit);
         set!(priority);
         set!(auto_pause);
         set!(pause_at);

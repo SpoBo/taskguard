@@ -46,6 +46,17 @@ pub fn blocker_text(b: &Blocker) -> String {
                 wait_s.ceil()
             )
         }
+        Blocker::Pressure { level, after: Some(key), next_in, .. } => format!(
+            "memory pressure: the kernel reports {} ({level:.0}); jobs still start while memory fits, the next once the first run {key} has shown what it takes (at most {:.0}s)",
+            pressure_word(*level),
+            next_in.unwrap_or(0.0).ceil()
+        ),
+        Blocker::Pressure { level, paced: true, .. } => {
+            format!(
+                "memory pressure: the kernel reports {} ({level:.0}); jobs still start, but only while memory fits",
+                pressure_word(*level)
+            )
+        }
         Blocker::Pressure { level, .. } => {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
@@ -146,6 +157,10 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         },
         Blocker::LearnStagger { wait_s } => (format!("starts in about {:.0}s", wait_s.ceil()), Some(*wait_s)),
         Blocker::Settling { key, wait_s } => (format!("starts when {key} stops growing (at most {:.0}s)", wait_s.ceil()), Some(*wait_s)),
+        Blocker::Pressure { after: Some(key), next_in, .. } => {
+            (format!("starts when {key} has shown what it takes, if memory fits"), *next_in)
+        }
+        Blocker::Pressure { paced: true, .. } => ("starts when memory fits".into(), None),
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
         Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
         Blocker::Memory { short_kb, .. } => {
@@ -665,6 +680,7 @@ mod tests {
             max_backfill: 600.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            warn_admit: false,
             noise_mem_pct: 0.0,
             noise_cpu: 0.0,
             outside_admit: false,
@@ -806,6 +822,7 @@ mod tests {
             max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            warn_admit: false,
             noise_mem_pct: 0.0,
             noise_cpu: 0.0,
             outside_admit: false,
@@ -833,6 +850,7 @@ mod tests {
             max_backfill: 0.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            warn_admit: false,
             noise_mem_pct: 0.0,
             noise_cpu: 0.0,
             outside_admit: false,

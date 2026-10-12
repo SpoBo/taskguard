@@ -532,6 +532,10 @@ pub struct Limits {
     pub cpu_min_duration: f64,
     /// Memory pressure (0-100) at which nothing new starts.
     pub pressure_max: f64,
+    /// At the kernel's warning level (under 100), jobs still start while
+    /// memory fits, and while no first run still grows. Off: warning stops
+    /// every new job, as critical always does.
+    pub warn_admit: bool,
     /// A job short of memory by at most this share of RAM (0-100) starts.
     pub noise_mem_pct: f64,
     /// A job short of CPU by at most this many cores starts.
@@ -583,10 +587,19 @@ pub enum Blocker {
         key: String,
         wait_s: f64,
     },
-    /// The kernel reports memory pressure: nothing new starts.
+    /// The kernel reports memory pressure: nothing new starts. At the
+    /// warning level with `warn_admit` on (`paced`), jobs still start, but
+    /// not while the first run `after` still grows: for at most `next_in`
+    /// seconds.
     Pressure {
         level: f64,
         limit: f64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        paced: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_in: Option<f64>,
     },
     /// A running job is paused for memory: it resumes before anything new starts.
     Paused {
@@ -701,8 +714,32 @@ pub fn decide(
     // taskguard runs nothing: then the pressure comes from other programs, and
     // one more job only makes it worse. This cannot deadlock the queue: jobs
     // start again as soon as the pressure eases, and --now still skips it.
+    //
+    // macOS keeps its warning level for a long time, also with half of memory
+    // free: a running dev stack holds it there, and the job that needs that
+    // stack waited behind it. So at warning (`warn_admit`), jobs still start,
+    // only while memory fits without any leeway. A job with a history has its
+    // whole need booked from its first second, so the next job may start at
+    // once. A first run books a guess, so nothing new starts until it has
+    // shown what it takes (`settling_for`). Critical stops every new job.
     if let Some(p) = m.mem_pressure.filter(|p| *p >= lim.pressure_max) {
-        return Decision::Wait { blockers: vec![Blocker::Pressure { level: p, limit: lim.pressure_max }] };
+        let paced = p < 100.0 && lim.warn_admit;
+        let growing = running.iter().filter_map(|e| e.settling_for(now).map(|w| (e, w))).max_by(|a, b| a.1.total_cmp(&b.1));
+        let pressure = Blocker::Pressure {
+            level: p,
+            limit: lim.pressure_max,
+            paced,
+            after: growing.filter(|_| paced).map(|(e, _)| e.key.clone()),
+            next_in: growing.filter(|_| paced).map(|(_, w)| w),
+        };
+        if !paced || growing.is_some() {
+            return Decision::Wait { blockers: vec![pressure] };
+        }
+        let room = Room::new(m, lim, running);
+        if let Some(mem) = room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
+        {
+            return Decision::Wait { blockers: vec![mem, pressure] };
+        }
     }
 
     // A job paused for memory gets its room back before anything new starts.
@@ -1284,6 +1321,7 @@ mod tests {
         max_backfill: 0.0,
         cpu_min_duration: 5.0,
         pressure_max: 20.0,
+        warn_admit: false,
         noise_mem_pct: 0.0,
         noise_cpu: 0.0,
         outside_admit: false,
@@ -2226,6 +2264,51 @@ mod tests {
         assert_eq!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["pressure"]);
         m.mem_pressure = Some(0.0);
         assert!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty(), "it eases: the job starts");
+    }
+
+    #[test]
+    fn at_warning_jobs_start_while_memory_fits_and_no_first_run_grows() {
+        // A dev stack past its start-up holds macOS at warning with half of
+        // memory free. The browser proof that needs it starts at once.
+        let lim = Limits { warn_admit: true, ..LIM };
+        let stack = Entry { started_at: Some(100.0), steady_since: Some(220.0), live_mem_kb: 8 * GB, ..job(1, "stack", 1.0, 8) };
+        let proof = job(2, "proof", 2.2, 3);
+        let mut m = machine(2.0, 16);
+        m.mem_pressure = Some(50.0);
+        let d = decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&proof), &proof, 1000.0, &[]);
+        assert!(blockers(d).is_empty(), "the proof starts next to its stack");
+
+        // A job with a history has its whole need booked: the next starts at once.
+        let started = Entry { started_at: Some(999.0), ..proof.clone() };
+        let lint = job(3, "lint", 1.0, 1);
+        let d = decide(&m, &lim, &[stack.clone(), started], std::slice::from_ref(&lint), &lint, 1000.0, &[]);
+        assert!(blockers(d).is_empty(), "known jobs need no gap");
+
+        // A first run books a guess: nothing new starts while it still grows.
+        let first = Entry { known: false, started_at: Some(990.0), mem_grew_at: Some(995.0), ..job(4, "first", 1.0, 1) };
+        let both = [stack.clone(), first];
+        let d = decide(&m, &lim, &both, std::slice::from_ref(&lint), &lint, 1000.0, &[]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Pressure { after: Some(k), next_in: Some(t), .. } if k == "first" && *t == 15.0))
+        );
+        assert!(blockers(decide(&m, &lim, &both, std::slice::from_ref(&lint), &lint, 1015.0, &[])).is_empty(), "it has settled");
+
+        // At warning, memory has no leeway, also when only long-lived jobs run.
+        let big = job(5, "big", 1.0, 12);
+        let d = decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&big), &big, 1000.0, &[]);
+        assert_eq!(blockers(d), vec!["memory", "pressure"]);
+
+        // Critical stops every new job, and warn_admit off keeps the old rule.
+        m.mem_pressure = Some(100.0);
+        assert_eq!(
+            blockers(decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&proof), &proof, 1000.0, &[])),
+            vec!["pressure"]
+        );
+        m.mem_pressure = Some(50.0);
+        assert_eq!(
+            blockers(decide(&m, &LIM, std::slice::from_ref(&stack), std::slice::from_ref(&proof), &proof, 1000.0, &[])),
+            vec!["pressure"]
+        );
     }
 
     #[test]

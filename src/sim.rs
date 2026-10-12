@@ -306,6 +306,7 @@ mod tests {
         max_backfill: 0.0,
         cpu_min_duration: 5.0,
         pressure_max: 20.0,
+        warn_admit: false,
         noise_mem_pct: 0.0,
         noise_cpu: 0.0,
         outside_admit: false,

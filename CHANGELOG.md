@@ -10,6 +10,15 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- macOS: the kernel's memory warning level no longer stops every new job.
+  At warning, jobs start while memory fits without any leeway, and not while
+  a first run still grows (at most two minutes). A dev stack kept the level
+  at warning with half of memory free, and the browser proof that needed the
+  stack waited behind it for up to an hour. Critical still stops every new
+  job. `warn_admit = false` brings back the old rule. (#22)
+
 ## [0.8.0] - 2026-10-09
 
 ### Added

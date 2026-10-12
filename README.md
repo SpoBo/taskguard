@@ -94,8 +94,16 @@ below).
   it still promises to take keeps up with what it takes. The Queue shows in red
   how far jobs are above the needs they started with.
 - **Memory pressure stops everything new.** When the kernel reports memory
-  pressure (macOS: warning or critical; Linux: PSI above 20%), nothing new
-  starts until it eases, whatever the estimates say.
+  pressure (macOS: critical; Linux: PSI above 20%), nothing new starts until
+  it eases, whatever the estimates say. macOS keeps its warning level for a
+  long time, also with half of memory free, for example while a dev stack
+  runs. At warning, jobs still start, but only while memory fits without any
+  leeway, and not while a first run still grows: a first run books a guess,
+  so the next job waits until it has shown what it takes (at most two
+  minutes). A job with a history has its whole need booked from its first
+  second, so the next job may start at once. So the job that needs that
+  stack does not wait behind it. `warn_admit = false` makes warning stop
+  every new job again.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
