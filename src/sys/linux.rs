@@ -139,6 +139,13 @@ pub fn proc_name(pid: i32) -> String {
     fs::read_to_string(format!("/proc/{pid}/comm")).map(|s| s.trim().to_string()).unwrap_or_else(|_| format!("pid {pid}"))
 }
 
+/// The command line of a process. None when it is gone or a kernel thread.
+pub fn proc_args(pid: i32) -> Option<Vec<String>> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    (!args.is_empty()).then_some(args)
+}
+
 /// The program's path, for grouping processes that share a name.
 pub fn proc_path(pid: i32) -> Option<String> {
     fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.display().to_string())

@@ -13,6 +13,8 @@ options (sem style; the default is to run in the foreground):
   --min-mem SIZE          never start with less than SIZE free (6G, 512M)
   --priority N            higher starts first (default 0; negative is allowed)
   --now                   skip the queue, but still measure and learn
+  --wraps                 COMMAND runs other taskguard jobs (turbo, a package
+                          script): run it straight through and let them queue
   --bg                    wait for room, then return and let the job run on
   --fg                    run in the foreground (the default)
   --pipe                  with --bg: pass stdin to the command

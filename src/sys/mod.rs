@@ -157,6 +157,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proc_args_reads_a_command_line() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let args = proc_args(child.id() as i32);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(args.map(|a| a[1..].to_vec()), Some(vec!["30".to_string()]));
+        assert_eq!(proc_args(-1), None);
+    }
+
+    #[test]
     fn descendants_walks_the_whole_tree() {
         let procs = [
             ProcInfo { pid: 10, ppid: 1 },

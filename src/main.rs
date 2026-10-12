@@ -122,6 +122,7 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
                 o.priority = Some(v.parse().map_err(|_| anyhow::anyhow!("--priority needs a whole number"))?);
             }
             "--now" => o.now = true,
+            "--wraps" => o.wraps = true,
             "--bg" => o.bg = true,
             "--fg" => o.bg = false,
             "--pipe" => o.pipe = true,
