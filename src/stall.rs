@@ -21,7 +21,7 @@
 //! `cargo test stall -- --nocapture --test-threads 1` prints the tables.
 
 use crate::machine::{MachineSample, PEAK_WINDOW};
-use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, link_work};
+use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, link_lapsed, link_work};
 
 const GB: u64 = 1024 * 1024;
 const TICK: f64 = 1.0;
@@ -495,7 +495,16 @@ pub fn run(s: &Scenario) -> Outcome {
             let run_now: Vec<Entry> = running.iter().map(|r| r.e.clone()).collect();
             let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
             // As the runner does: work links to the stack that expects it,
-            // and goes one priority above it.
+            // and goes one priority above it, until the stack is gone or only
+            // guessed it and the guess has expired or come true.
+            let me = waiting[i].0.clone();
+            if link_lapsed(&me, &run_now, &all, |w| me.pool.as_deref() == Some(w)) {
+                waiting[i].0.work_for = None;
+                waiting[i].0.priority = match waiting[i].1 {
+                    Kind::Job(n) => s.jobs[n].priority,
+                    _ => 0,
+                };
+            }
             if waiting[i].0.work_for.is_none() {
                 let me = waiting[i].0.clone();
                 if let Some((link, p)) = link_work(&me, &run_now, &all, |w| me.pool.as_deref() == Some(w)) {
@@ -761,7 +770,7 @@ mod tests {
             assert_eq!(declared.runs_given_up, 0, "{outside} GB declared: {declared:?}");
             assert!(declared.runs_done >= 10, "{outside} GB declared: {declared:?}");
             assert!(declared.worst_mem_pct <= 95.0 && declared.over_limit_s == 0.0, "{outside} GB declared: {declared:?}");
-            // Nor does one whose run the history infers.
+            // Nor does one that does not declare, whose run the history infers.
             assert_eq!(inferred.runs_given_up, 0, "{outside} GB inferred: {inferred:?}");
             assert!(inferred.worst_mem_pct <= 95.0, "{outside} GB inferred: {inferred:?}");
             // A caller that does not declare: the progress rule alone clears
@@ -826,8 +835,9 @@ mod tests {
             // or take a minute, though fewer run while a guess books room.
             assert!(guessed.worst_lint_wait <= plain.worst_lint_wait + 60.0, "{outside} GB: {guessed:?} vs {plain:?}");
             assert!(guessed.lints_done * 10 >= plain.lints_done * 7, "{outside} GB: {guessed:?} vs {plain:?}");
-            // It never keeps a stack started with no work out.
-            assert!(guessed.worst_stack_wait <= plain.worst_stack_wait + 60.0, "{outside} GB: {guessed:?} vs {plain:?}");
+            // A stack started with no work respects the other stack's open
+            // guess: it waits at most until that guess expires.
+            assert!(guessed.worst_stack_wait <= plain.worst_stack_wait + 600.0 + 60.0, "{outside} GB: {guessed:?} vs {plain:?}");
         }
     }
 

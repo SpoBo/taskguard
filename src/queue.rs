@@ -835,6 +835,12 @@ fn booking_taken_over(job: &Entry, running: &[Entry]) -> u64 {
     stack.expects.get(*i as usize).filter(|x| x.open() && !taken).map_or(0, |x| x.mem_kb)
 }
 
+/// The part of `booking_taken_over` that only the history guessed.
+fn guess_taken_over(job: &Entry, running: &[Entry]) -> u64 {
+    let item = job.work_for.as_ref().and_then(|w| running.iter().find(|e| e.pid == w.pid)?.expects.get(w.item? as usize));
+    if item.is_some_and(|x| x.implied) { booking_taken_over(job, running) } else { 0 }
+}
+
 /// Is `job` work for a long-lived job that does not run yet? It waits for
 /// it: the work needs it up.
 pub fn waits_for_stack(job: &Entry, running: &[Entry]) -> bool {
@@ -858,7 +864,7 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
     let stacks = running.iter().chain(waiting).filter(|e| e.long_lived && e.pid != me.pid && e.checkout == me.checkout);
     let mut best: Option<(u8, WorkFor, i32)> = None;
     for e in stacks {
-        for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work)) {
+        for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work) && still_expected(x)) {
             let free = x.open() && !claimed(e.pid, i);
             // A stack that waits takes only work that can take over a booking.
             if e.started_at.is_none() && !free {
@@ -872,6 +878,23 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
         }
     }
     best.map(|(_, w, p)| (w, p))
+}
+
+/// Is this work still expected: declared, or a guess that has neither
+/// expired nor come true? Only then does work link to it and go first.
+fn still_expected(x: &Expect) -> bool {
+    !x.implied || x.open()
+}
+
+/// Has `me`'s link to its long-lived job lapsed: that job is gone, or what
+/// it expected of `me` was a guess that has expired or come true?
+pub fn link_lapsed(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> bool {
+    let Some(w) = &me.work_for else { return false };
+    running
+        .iter()
+        .chain(waiting)
+        .find(|e| e.pid == w.pid)
+        .is_none_or(|e| !e.expects.iter().any(|x| matches(&x.work) && still_expected(x)))
 }
 
 /// Does `a` belong to an older task-runner run than `b`? Only jobs that are
@@ -977,6 +1000,8 @@ pub fn decide(
     // fit under `mem_max`: it does not end by itself, so starting it over the
     // limit is no progress but load that stays, and a second dev stack
     // started that way kept the first one's run out until it was given up.
+    // Only when programs outside taskguard alone keep it out may it go up to
+    // the ceiling of `outside_admit`: nothing taskguard runs would free that.
     let room = Room::new(m, lim, running);
     if running.iter().all(Entry::steady) {
         let fits = |w: &Entry| room.fits_on_progress(m, lim, running, w);
@@ -1338,23 +1363,32 @@ impl Room {
     }
 
     /// As `mem_would`, by the progress rule (`progress`) or not. A guess of
-    /// the history never keeps a job out by the progress rule, so it cannot
-    /// stop the queue. Nor does it keep out a long-lived job started with no
-    /// declared work, its own guess included: such a stack starts as it
-    /// would without the history, and books its guess from then on.
+    /// the history never keeps a job that ends by itself out by the progress
+    /// rule, so it cannot stop the queue; the part of it that job takes over
+    /// counts once. A long-lived job respects the guesses of others while
+    /// they are open, but one started with no declared work leaves its own
+    /// guess out: such a stack starts as it would without the history, and
+    /// books its guess from then on.
     fn mem_would_on(&self, job: &Entry, progress: bool) -> f64 {
         let undeclared = job.long_lived && !job.expects.iter().any(|x| !x.implied);
-        let guess = if (progress && !job.long_lived) || undeclared { self.res_guessed } else { 0 };
+        let guess = if progress && !job.long_lived { self.res_guessed.saturating_sub(guess_taken_over(job, &self.running)) } else { 0 };
         let own = if undeclared && job.started_at.is_none() { guessed(job, &[]) } else { 0 };
         (self.mem_used + self.res_mem - guess.min(self.res_mem) + need_with_booking(job, &self.running) - own) as f64
     }
 
     /// The most memory a job may take the machine to by the progress rule:
     /// all of RAM, as nothing else of taskguard's would come after it; a
-    /// long-lived job, which stays, only `mem_max` (with `noise_mem`).
+    /// long-lived job, which stays, only `mem_max` (with `noise_mem`), or
+    /// when only programs outside taskguard keep it out, the ceiling of
+    /// `outside_admit`: nothing taskguard runs would free that.
     fn progress_ceiling(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> f64 {
         let total = m.mem_total_kb as f64;
-        if job.long_lived { self.mem_limit + total * lim.noise_mem_pct / 100.0 } else { total }
+        if !job.long_lived {
+            return total;
+        }
+        let ceiling = self.mem_limit + total * lim.noise_mem_pct / 100.0;
+        let ours = self.mem_would_on(job, true) - self.mem_used.saturating_sub(self.ours_mem) as f64;
+        if lim.outside_admit && ours <= self.mem_limit { ceiling.max(total * lim.outside_mem_max_pct / 100.0).min(total) } else { ceiling }
     }
 
     /// May `job` start by the progress rule now: its pool has a free slot
@@ -1374,6 +1408,7 @@ impl Room {
         let lasting: Vec<Entry> = running.iter().filter(|e| e.lasting()).cloned().collect();
         let drained = Room {
             mem_used: self.mem_used.saturating_sub(self.passing_live),
+            ours_mem: self.ours_mem.saturating_sub(self.passing_live),
             res_mem: self.res_mem.saturating_sub(self.passing_res),
             ..self.clone()
         };
@@ -2696,21 +2731,72 @@ mod tests {
         // While a job that ends by itself runs, the guess holds like a booking.
         let busy = [stack.clone(), Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 0) }];
         assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&lint), &lint, 1000.0, &[])), vec!["memory"]);
-        // A second stack whose caller declared work respects the guess. One
-        // started with no declared work does not, nor its own guess: it
-        // starts as it would without the history.
+        // A second stack respects the open guess, declared work or not (24 +
+        // 5.3 + 4 GB is over 30.4); one with no declared work leaves only its
+        // own guess out.
         let plain = Entry { long_lived: true, priority: 10, ..job(6, "dev-env:stack", 1.0, 4) };
-        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])), vec!["memory"]);
         let mut guessing = Entry { checkout: "/w/b".into(), ..plain.clone() };
         guessing.expects = vec![Expect { work: "browser".into(), mem_kb: GB, implied: true, ..Default::default() }];
-        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])), vec!["memory"]);
         let mut declared = guessing.clone();
         declared.expects[0].implied = false;
         assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&declared), &declared, 1000.0, &[])), vec!["memory"]);
-        // Expired, it books nothing, and a run for the stack still goes first.
+        // A run that linked to the open guess keeps its link.
+        let linked = Entry { work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item: Some(0) }), ..me.clone() };
+        assert!(!link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Expired, it books nothing: the stack with no declared work starts
+        // (24 + 1 + 4 GB), and no run links to the guess or keeps its link.
         stack.expects[0].expired = true;
-        assert_eq!(reserve(std::slice::from_ref(&stack)).1, grows);
-        assert_eq!(link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "browser").unwrap().0.item, None);
+        let r = std::slice::from_ref(&stack);
+        assert_eq!(reserve(r).1, grows);
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])).is_empty());
+        assert!(link_work(&me, r, &[], |w| w == "browser").is_none());
+        assert!(link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Nor once it came true.
+        stack.expects[0] = Expect { expired: false, started: true, ..stack.expects[0].clone() };
+        let r = std::slice::from_ref(&stack);
+        assert!(link_work(&me, r, &[], |w| w == "browser").is_none());
+        assert!(link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Declared work that has started still links: the stack exists for it.
+        stack.expects[0].implied = false;
+        let r = std::slice::from_ref(&stack);
+        assert_eq!(link_work(&me, r, &[], |w| w == "browser").unwrap().0.item, None);
+        assert!(!link_lapsed(&linked, r, &[], |w| w == "browser"));
+    }
+
+    #[test]
+    fn a_run_takes_over_a_guessed_booking_once_by_the_progress_rule() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        let r = std::slice::from_ref(&stack);
+        let run = run_for(Some(0));
+        // 29 GB held, 1 still to grow and the 4.3 GB the run takes over:
+        // 34.3 GB of 32. The guess it takes over counts once, not as nothing.
+        assert_eq!(blockers(decide(&machine(1.0, 29), &lim, r, std::slice::from_ref(&run), &run, 1000.0, &[])), vec!["memory"]);
+        // 26 GB held: 31.3 GB, under all of RAM, and it starts.
+        assert!(blockers(decide(&machine(1.0, 26), &lim, r, std::slice::from_ref(&run), &run, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_lone_stack_is_kept_out_by_other_programs_only_up_to_the_outside_admit_ceiling() {
+        // 32 GB, mem_max 85 (27.2 GB), outside_admit up to 95% (30.4 GB). Nothing
+        // of taskguard runs; other programs hold 20 GB and a 9 GB stack would
+        // take the machine to 29 GB: only they keep it out, and nothing
+        // taskguard runs would free that. It starts as outside_admit allows.
+        let lim = Limits { outside_admit: true, ..LIM };
+        let stack = Entry { long_lived: true, priority: 10, ..job(1, "dev-env:stack", 3.0, 9) };
+        let me = std::slice::from_ref(&stack);
+        assert!(blockers(decide(&machine(1.0, 20), &lim, &[], me, &stack, 1000.0, &[])).is_empty());
+        // Past that ceiling memory stays a hard rule; without the leeway it waits.
+        assert_eq!(blockers(decide(&machine(1.0, 22), &lim, &[], me, &stack, 1000.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&machine(1.0, 20), &LIM, &[], me, &stack, 1000.0, &[])), vec!["memory"]);
+        // When a steady stack of taskguard's fills the room, outside programs
+        // are no excuse: 16 + 4 + 9 GB of its own is over 27.2.
+        let a = steady_stack(12, 16);
+        assert_eq!(blockers(decide(&machine(1.0, 17), &lim, std::slice::from_ref(&a), me, &stack, 1000.0, &[])), vec!["memory"]);
     }
 
     #[test]

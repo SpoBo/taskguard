@@ -166,12 +166,12 @@ fn apply_nudge(me: &mut Entry, n: &queue::Nudge, database: Option<&Db>) {
 }
 
 /// Link a waiting job to the long-lived job in its checkout that expects it,
-/// or drop the link when that job is gone. Work for a long-lived job goes
-/// one priority above it, so it starts before the jobs that queued for room
+/// or drop the link when that job is gone, or only guessed the work and the
+/// guess has expired or come true. Work for a long-lived job goes one
+/// priority above it, so it starts before the jobs that queued for room
 /// meanwhile, and before a next stack.
 fn link_to_stack(me: &mut Entry, own_priority: i32, running: &[Entry], waiting: &[Entry], cmd: &[String], quiet: bool) {
-    let gone = me.work_for.as_ref().is_some_and(|w| !running.iter().chain(waiting).any(|e| e.pid == w.pid));
-    if gone {
+    if queue::link_lapsed(me, running, waiting, |w| is_work(w, me, cmd)) {
         me.work_for = None;
         me.priority = own_priority;
     }

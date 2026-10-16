@@ -228,7 +228,9 @@ below).
   run is admitted against, and what it took after. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
   nothing else runs, the first in line that fits starts. A waiting long-lived
-  job itself starts that way only under `mem_max`. `auto_pause` leaves it
+  job itself starts that way only under `mem_max`, or, when only programs
+  outside taskguard keep it out, up to the ceiling `outside_admit` allows:
+  nothing taskguard runs would free that memory. `auto_pause` leaves it
   alone. `taskguard status` marks it `STEADY`, and a job it keeps out says it
   starts when the stack is stopped, not when it finishes.
 - **Work for a long-lived job goes first.** The caller that starts a dev
@@ -251,22 +253,29 @@ below).
   stack runs, hold their turn as a strict reservation, also while they do not
   fit yet: lints that fit do not take the room meanwhile, unless the stack
   could only start once another stack is stopped. A stack started without
-  `--expect` behaves as before; the variable means nothing to any other job.
+  `--expect` books only what its history infers (below); the variable means
+  nothing to any other job.
 - **Without a declaration, the history says what work follows a stack.**
   When at least `infer_work_min` (3) of a stack's last `infer_work_of` (5)
   runs in its checkout had work of one kind queue there within
   `infer_work_within` (900) seconds of their start, that work is expected
   again. A kind of work is a pool, or the key of a job outside any pool. The
   stack books that work's usual need, which `taskguard status` shows as
-  `(expects browser from history, books 4.3 GB)`, and the work links and
-  goes first as declared work does. It is a guess, so it is bounded:
+  `(expects browser from history, books 4.3 GB)`, and while the guess is
+  open the work links and goes first as declared work does. It is a guess,
+  so it is bounded:
   - it books room for twice the work's usual delay after the stack started,
     ten minutes at most, and drops it once work for the stack starts or the
     stack stops;
-  - no job waits for it by the rule for nothing running, so it can never
-    stop the queue, and a job waits for it at most up to all of RAM;
-  - it never keeps out a stack whose caller declared no work, its own guess
-    included: such a stack starts as it would without the history;
+  - once it has expired or come true, no work links to it, and work linked
+    to it drops back to its own priority and holds its turn no more;
+  - no job that ends by itself waits for it by the rule for nothing running,
+    so it can never stop the queue, and such a job waits for it at most up
+    to all of RAM;
+  - another stack respects it while it is open, also one whose caller
+    declared no work, so the room is there when the work comes. Such a stack
+    leaves only its own guess out, starts at once when it still fits next to
+    the open guess, and otherwise waits at most until the guess expires;
   - a declaration always wins: a stack with `--expect` books only what was
     declared, and `--expect none` expects nothing at all;
   - `infer_work = false` turns it off.
