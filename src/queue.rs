@@ -2731,9 +2731,16 @@ mod tests {
         // With its run queued for it, the lint waits: the room is theirs.
         let waiting = [stack.clone(), run_for(Some(0)), lint.clone()];
         assert_eq!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
-        // Not when it could only start once a stack is stopped: 14 GB held
-        // by other programs and 13.3 GB more is over the 27.2 GB limit.
+        // Still when 14 GB is held by other programs: once the build has
+        // ended nothing of taskguard's runs, and a lone job may then take
+        // the machine up to all of RAM (14 + 13.3 of 32 GB), so the stack
+        // and its run will start, and the room is theirs.
         let m = machine(1.0, 14);
+        assert_eq!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        // Not when it could not start even then: 14 GB held and 22.3 GB more
+        // for a bigger stack and its run is over all of RAM.
+        let big = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 18)) };
+        let waiting = [big, run_for(Some(0)), lint.clone()];
         assert!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])).is_empty());
     }
 
