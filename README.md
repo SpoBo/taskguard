@@ -240,15 +240,16 @@ below).
   (repeatable) or `TASKGUARD_EXPECT=WORK,WORK` in its environment, so it
   passes through scripts such as `devenv up`. WORK is a pool name, a job key,
   or a command pattern as in `[[job]] match`. The stack then books room for
-  each piece of work, learned as that work learns its own need: what jobs of
-  the pool typically took, or the history or first guess of the command. It
+  each piece of work, learned as that work learns its own need: the need
+  jobs of the pool typically started with (their peak with headroom, or a
+  minimum), or the history or first guess of the command. It
   starts only when the machine has room for itself and that work, so the
   whole load is known before it starts. A job that queues in the same
   checkout and matches WORK is that work: it goes one priority above the
   stack, so it starts before the jobs that queued for room meanwhile and
   before a next stack, and when it starts it takes over the room booked for
   it, which the stack then drops. `taskguard status` shows both ends: `(for
-  stack dev-env:stack)` on the work, `(expects browser, books 3.6 GB)` on the
+  stack dev-env:stack)` on the work, `(expects browser, books 4.3 GB)` on the
   stack. Work that queues while its stack still waits waits for the stack and
   holds nobody back meanwhile. A stack with work queued for it, and work whose
   stack runs, hold their turn as a strict reservation, also while they do not

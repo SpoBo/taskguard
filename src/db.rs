@@ -1054,6 +1054,25 @@ impl Db {
         Ok(None)
     }
 
+    /// The memory jobs of `pool` typically started with, over the last 30
+    /// days: the 90th percentile of each key's highest need, and how many
+    /// keys that is. A need is what a job is admitted with (its peak with
+    /// headroom, or a minimum), so it is what room booked for such a job
+    /// must cover; their peaks would leave the difference unbooked.
+    pub fn pool_need(&self, pool: &str) -> Result<Option<(u64, usize)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT max(need_mem_kb) FROM runs
+             WHERE pool = ?1 AND need_mem_kb > 0 AND started_at IS NOT NULL AND queued_at > ?2
+             GROUP BY key",
+        )?;
+        let mut v: Vec<i64> = stmt.query_map(params![pool, now() - 30.0 * 86400.0], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        if v.is_empty() {
+            return Ok(None);
+        }
+        v.sort();
+        Ok(Some((v[((v.len() as f64 * 0.9) as usize).min(v.len() - 1)] as u64, v.len())))
+    }
+
     /// The work that followed a long-lived job before: for the last `of`
     /// runs of `key` in `checkout` (of the last two weeks), every job of
     /// another kind that queued in that checkout within `within` seconds of

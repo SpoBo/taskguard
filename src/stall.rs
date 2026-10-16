@@ -137,10 +137,9 @@ pub struct Agent {
     pub down_after_s: f64,
     pub pause_s: f64,
     /// The agent declares its browser run when it brings the stack up
-    /// (`TASKGUARD_EXPECT=browser`), and the stack books `booking_kb` for it:
-    /// what browser runs typically took, less than the run's own need.
+    /// (`TASKGUARD_EXPECT=browser`), and the stack books for it what browser
+    /// runs typically started with: the run's need.
     pub declares: bool,
-    pub booking_kb: u64,
     /// The agent queues its run 2 s after its stack, not once the stack is up.
     pub with_stack: bool,
     /// Undeclared, but the history says a browser run follows its stacks
@@ -168,7 +167,6 @@ pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
         down_after_s: 20.0,
         pause_s: 30.0,
         declares: false,
-        booking_kb: 36 * GB / 10,
         with_stack: false,
         implied: false,
         no_run: false,
@@ -318,7 +316,7 @@ pub fn run(s: &Scenario) -> Outcome {
                 Phase::Idle { until } if t >= until => {
                     ticket += 1;
                     let expects = if a.declares {
-                        vec![Expect { work: "browser".into(), mem_kb: a.booking_kb, ..Default::default() }]
+                        vec![Expect { work: "browser".into(), mem_kb: a.run_need_kb, ..Default::default() }]
                     } else if a.implied {
                         vec![Expect {
                             work: "browser".into(),

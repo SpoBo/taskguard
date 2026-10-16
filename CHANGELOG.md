@@ -24,8 +24,8 @@ and the versions follow [semver](https://semver.org).
 - A long-lived job can declare the work that will run on it:
   `--expect WORK` (repeatable) or `TASKGUARD_EXPECT=WORK,WORK`, where WORK is
   a pool name, a job key or a command pattern. The stack books room for that
-  work (learned as the work learns its own need) and starts only with room
-  for both. A job in the same checkout that matches is its work: it goes one
+  work (learned as the work learns its own need; for a pool, the need its
+  jobs typically started with) and starts only with room for both. A job in the same checkout that matches is its work: it goes one
   priority above the stack, takes over the booked room when it starts, and
   waits while its stack still waits. `taskguard status` shows `(for stack
   KEY)` on the work and `(expects WORK, books SIZE)` on the stack. Without a
