@@ -85,7 +85,8 @@ outlier_weights = [0, 0.5]
 noise_mem = 2         # percent of RAM
 noise_cpu = 0.5       # cores
 # A job that only programs outside taskguard keep out starts anyway, with a
-# warning, while memory stays under pause_at.
+# warning, while memory stays under pause_at (with mem_max at or above
+# pause_at: halfway from mem_max to all of RAM).
 outside_admit = true
 # A job that cannot fit now (its CPU need is above the whole limit, or it has
 # waited past max_bypass) starts on this share of its CPU need, once the

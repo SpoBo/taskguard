@@ -22,6 +22,13 @@ and the versions follow [semver](https://semver.org).
 - Each run now stores how its need was made (`runs.need_why`), so `dump`
   can explain an old run too, not only the next one.
 
+### Fixed
+
+- `outside_admit` works again when `mem_max` is at or above `pause_at`
+  (92% by default), as with `mem_max = 95`. It capped memory at `pause_at`,
+  under the limit, so it could never let a job start; the cap is now
+  halfway from `mem_max` to all of RAM in that case.
+
 ## [0.10.0] - 2026-10-16
 
 ### Fixed

@@ -154,7 +154,7 @@ pub struct Config {
     /// A job short of CPU by at most this many cores starts anyway.
     pub noise_cpu: f64,
     /// A job that only programs outside taskguard keep out starts anyway,
-    /// while memory stays under `pause_at`.
+    /// while memory stays under `pause_at` (see `commands::outside_ceiling`).
     pub outside_admit: bool,
     /// A job that cannot fit now starts on this share of its CPU need, when
     /// the machine is near its recent low. 0 turns it off.

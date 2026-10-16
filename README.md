@@ -127,8 +127,10 @@ below).
   starts anyway: readings move by that much from one second to the next.
   So does a job that only programs outside taskguard keep out, while
   taskguard's own jobs fit under the limits (`outside_admit`). Memory stays a
-  hard rule at `pause_at` (92%). Each such start prints a warning with what
-  the job lacks and the rule that let it start.
+  hard rule at `pause_at` (92%), or, when `mem_max` is at or above `pause_at`,
+  halfway from `mem_max` to all of RAM (97.5% for `mem_max = 95`). Each such
+  start prints a warning with what the job lacks and the rule that let it
+  start.
 - **Nothing running means the job starts,** whatever the CPU and memory
   readings say, so the queue cannot deadlock on a wrong reading. Memory
   pressure is the one exception: then the load comes from other programs, and
@@ -594,7 +596,8 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   `outlier_weights = [0.5]` to learn sooner, or `outlier_ratio = 0` to learn
   every peak at once.
 - A job that starts early on `noise_mem` or `outside_admit` can push memory
-  past `mem_max`, up to `pause_at`. Set `outside_admit = false` and
+  past `mem_max`, up to `pause_at` (or halfway from `mem_max` to all of RAM
+  when `mem_max` is at or above `pause_at`). Set `outside_admit = false` and
   `noise_mem = 0` to keep `mem_max` a hard rule.
 
 ## Moving from tsc-queue
