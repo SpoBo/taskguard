@@ -185,6 +185,43 @@ examples:
   taskguard prune --undo 'packages/api:*' --apply
 ";
 
+const DUMP: &str = "\
+taskguard dump PATTERN | --cmd \"COMMAND\" | --run ID [--runs N]
+
+Everything taskguard knows about a job, as one JSON document: to find out
+why a job reserved what it did, and to tune the rules from real histories.
+Attach it to a bug report.
+
+Name the job one way:
+  PATTERN          a history key, or a glob with * and ? (taskguard history
+                   lists the keys); every key that matches gets an entry
+  --cmd \"COMMAND\"  the job this command is in this directory, matched as
+                   doctor --explain does
+  --run ID         the job of one run (runs[].id, or wait_spans[].run_id)
+
+options:
+  --runs N         how many recent runs to include per job (default 20)
+
+per job:
+  match            how the command matches: pool, label, minimums, and which
+                   rule set what
+  config           the settings files read, the ones that changed a setting,
+                   and the rules that turn history into needs
+  learned          what the history says: memory, CPU, outliers, failed runs
+                   whose peak is ignored, the 25% boost
+  next_need        what the next run reserves, step by step, each step with
+                   why (history, boost, first_guess, cpu_cap, min_cpu,
+                   min_mem, mem_cap)
+  runs             each run as stored, newest first: its need and how that
+                   was made (need_why; older runs have none), its peak, exit, what it
+                   waited for (wait_spans), what it changed (adjustments),
+                   and its role in the next need (in the window, outlier,
+                   failed and ignored, boost)
+  pruned           runs taken out with taskguard prune
+  live             the job's queue entries while it waits or runs, with what
+                   holds it back now
+";
+
 const DOCTOR: &str = "\
 taskguard doctor [--explain \"COMMAND\"]
 
@@ -231,6 +268,7 @@ pub fn text(cmd: &str) -> Option<String> {
         "history" => HISTORY.into(),
         "outliers" => OUTLIERS.into(),
         "prune" => PRUNE.into(),
+        "dump" => DUMP.into(),
         "doctor" => DOCTOR.into(),
         "import-history" => IMPORT.into(),
         "version" => VERSION.into(),
@@ -240,8 +278,8 @@ pub fn text(cmd: &str) -> Option<String> {
 }
 
 /// Every command in the order `help --all` prints them.
-pub const ALL: [&str; 12] =
-    ["run", "wait", "top", "status", "pause", "start", "history", "outliers", "prune", "doctor", "import-history", "version"];
+pub const ALL: [&str; 13] =
+    ["run", "wait", "top", "status", "pause", "start", "history", "outliers", "prune", "dump", "doctor", "import-history", "version"];
 
 /// The full help, every command in one text: for LLM agents and for reading
 /// it all at once. `usage` is the overview that comes first.

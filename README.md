@@ -509,6 +509,7 @@ jobs. Set `TASKGUARD=/path/to/taskguard` to try a local build.
 | `taskguard prune --undo [PATTERN]` | Put pruned runs back |
 | `taskguard doctor` | Configuration, live readings, and leftover tsc-queue shims |
 | `taskguard doctor --explain "COMMAND"` | How one command is matched, pooled and learned |
+| `taskguard dump PATTERN \| --cmd "COMMAND" \| --run ID` | Everything taskguard knows about a job, as JSON: how it matches, what its next run reserves and why, step by step, and each recent run with what it waited for and what it did to the need. Attach it to a bug report |
 | `taskguard import-history` | Load tsc-queue's memory history |
 | `taskguard help COMMAND`, `taskguard COMMAND --help` | Help for one command: what it does, its options, examples |
 | `taskguard help --all` | Every command in full, in one text, for LLM agents |

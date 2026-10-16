@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 use std::path::Path;
 use std::time::Duration;
 
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS runs (
   package TEXT,
   steady_cores_wanted REAL,
   steady_mem_kb INTEGER,
-  nested_jobs INTEGER
+  nested_jobs INTEGER,
+  need_why TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -177,6 +179,7 @@ CREATE TABLE IF NOT EXISTS pruned_runs (
   steady_cores_wanted REAL,
   steady_mem_kb INTEGER,
   nested_jobs INTEGER,
+  need_why TEXT,
   pruned_at REAL NOT NULL,
   prune_reason TEXT NOT NULL
 );
@@ -188,7 +191,7 @@ CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
 const RUN_COLUMNS: &str = "id, ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, started_at, ended_at, exit,
   waited_s, main_blocker, now, min_cpu, min_mem_kb, need_cpu, need_mem_kb, peak_mem_kb, cores_used, cores_wanted, cpu_seconds,
   runnable_seconds, pageins, starved, starved_detail, machine_full_frac, imported, paused_s, package, steady_cores_wanted,
-  steady_mem_kb, nested_jobs";
+  steady_mem_kb, nested_jobs, need_why";
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -217,7 +220,7 @@ pub struct Estimate {
 }
 
 /// What history says about one key.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Learned {
     pub runs: usize,
     /// Max of the recent peaks, with outliers held back (see `Outliers`).
@@ -290,7 +293,7 @@ impl Default for Learn {
 }
 
 /// A recent run whose memory peak stands far above the others.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Outlier {
     pub run_id: i64,
     pub peak_kb: u64,
@@ -311,6 +314,20 @@ impl Outlier {
     }
 }
 
+/// Whether a run adds the 25% memory boost: it was starved of memory and
+/// reached what it was given (`starved`, the need it started with, its peak,
+/// and whether it failed). See `Db::learned`.
+pub fn boosts(starved: Option<&str>, need_kb: Option<i64>, peak_kb: i64, failed: bool) -> bool {
+    starved == Some("memory")
+        && match need_kb {
+            None => !failed,
+            Some(need) => {
+                let peak = peak_kb as f64;
+                peak >= need as f64 * BOOST_REACHED && (!failed || peak <= need as f64 * BOOST_FAILED_MAX)
+            }
+        }
+}
+
 /// The memory need when every recent run failed: the second-highest peak,
 /// at least `new_job_mem_kb` but never more than the highest. One failed run
 /// far above the others alone does not set the need, as the job is then as
@@ -327,7 +344,7 @@ pub fn failed_need(peaks: &[u64], new_job_mem_kb: u64) -> Option<u64> {
 /// took 20 GB where the others took 5 GB. A single such run may be a one-off,
 /// so it does not set the memory need at once: it counts by `weight`, which
 /// grows each time it happens again, until it counts in full.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Outliers {
     pub runs: Vec<Outlier>,
     /// The highest peak below them.
@@ -501,6 +518,8 @@ pub struct NewRun<'a> {
     pub min_mem_kb: Option<u64>,
     pub need_cpu: f64,
     pub need_mem_kb: u64,
+    /// How the need was made, as JSON, for `taskguard dump`.
+    pub need_why: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -579,10 +598,13 @@ impl Db {
         }
         // Databases made before wrapper jobs were learned: how many taskguard
         // jobs a run started inside itself. Both tables, so a prune keeps it.
-        for table in ["runs", "pruned_runs"] {
-            let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'nested_jobs'"))?.exists([])?;
-            if !has {
-                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN nested_jobs INTEGER"))?;
+        // And how the need a run started with was made, as JSON (`need::Need`).
+        for (col, kind) in [("nested_jobs", "INTEGER"), ("need_why", "TEXT")] {
+            for table in ["runs", "pruned_runs"] {
+                let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"))?.exists([])?;
+                if !has {
+                    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {col} {kind}"))?;
+                }
             }
         }
         Ok(Db { conn })
@@ -642,16 +664,7 @@ impl Db {
         // One that failed counts only when its peak also stayed within what
         // the boost gives: a run that went to 50x its need and crashed tells
         // nothing about its need.
-        let boosted = rows.iter().zip(&runs).take(boost_runs).any(|(r, o)| {
-            r.3.as_deref() == Some("memory")
-                && match (r.6, o.failed()) {
-                    (None, failed) => !failed,
-                    (Some(need), failed) => {
-                        let peak = r.0 as f64;
-                        peak >= need as f64 * BOOST_REACHED && (!failed || peak <= need as f64 * BOOST_FAILED_MAX)
-                    }
-                }
-        });
+        let boosted = rows.iter().zip(&runs).take(boost_runs).any(|(r, o)| boosts(r.3.as_deref(), r.6, r.0, o.failed()));
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
         let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
         let nested_jobs = recent.iter().filter_map(|r| r.7).filter(|n| *n > 0).max().map(|n| n as u64);
@@ -667,6 +680,75 @@ impl Db {
             steady_cpu,
             nested_jobs,
         })
+    }
+
+    /// Rows as JSON objects, one field per column, for `taskguard dump`: every
+    /// column, the ones a newer version added too.
+    fn rows_json(&self, sql: &str, args: impl rusqlite::Params) -> Result<Vec<serde_json::Value>> {
+        use rusqlite::types::ValueRef;
+        let mut stmt = self.conn.prepare(sql)?;
+        let names: Vec<String> = stmt.column_names().iter().map(|n| n.to_string()).collect();
+        let rows = stmt
+            .query_map(args, |r| {
+                let mut o = serde_json::Map::new();
+                for (i, n) in names.iter().enumerate() {
+                    let v = match r.get_ref(i)? {
+                        ValueRef::Null => serde_json::Value::Null,
+                        ValueRef::Integer(v) => v.into(),
+                        ValueRef::Real(v) => v.into(),
+                        ValueRef::Text(t) => {
+                            let t = String::from_utf8_lossy(t);
+                            // need_why holds JSON: keep it as JSON.
+                            match (n.as_str(), serde_json::from_str(&t)) {
+                                ("need_why", Ok(v)) => v,
+                                _ => t.into_owned().into(),
+                            }
+                        }
+                        ValueRef::Blob(b) => format!("{} bytes", b.len()).into(),
+                    };
+                    o.insert(n.clone(), v);
+                }
+                Ok(serde_json::Value::Object(o))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// The newest `limit` runs of a key: those still waiting or running
+    /// first, then the finished ones in the order `learned` reads them.
+    pub fn runs_json(&self, key: &str, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.rows_json(
+            "SELECT * FROM runs WHERE key = ?1 ORDER BY ended_at IS NULL DESC, ended_at DESC, id DESC LIMIT ?2",
+            params![key, limit as i64],
+        )
+    }
+
+    /// What a run waited for, span by span.
+    pub fn wait_spans_json(&self, run_id: i64) -> Result<Vec<serde_json::Value>> {
+        self.rows_json("SELECT * FROM wait_spans WHERE run_id = ?1 ORDER BY from_ts", [run_id])
+    }
+
+    /// The changes a run made to its key's needs (boosts, outliers, advice).
+    pub fn adjustments_json(&self, run_id: i64) -> Result<Vec<serde_json::Value>> {
+        self.rows_json("SELECT * FROM adjustments WHERE run_id = ?1 ORDER BY ts", [run_id])
+    }
+
+    /// The pruned runs of a key.
+    pub fn pruned_json(&self, key: &str) -> Result<Vec<serde_json::Value>> {
+        self.rows_json(
+            "SELECT id, ended_at, exit, peak_mem_kb, pruned_at, prune_reason FROM pruned_runs WHERE key = ?1 ORDER BY ended_at DESC",
+            [key],
+        )
+    }
+
+    /// The key of a run, in the history or among the pruned runs.
+    pub fn key_of_run(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT key FROM runs WHERE id = ?1 UNION ALL SELECT key FROM pruned_runs WHERE id = ?1 LIMIT 1", [run_id], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// Every key with finished runs, or those that match `pattern`: a key, or
@@ -794,8 +876,8 @@ impl Db {
     pub fn insert_run(&self, r: &NewRun) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO runs (ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, now,
-                               min_cpu, min_mem_kb, need_cpu, need_mem_kb, package)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                               min_cpu, min_mem_kb, need_cpu, need_mem_kb, package, need_why)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 r.ns,
                 r.pool,
@@ -812,7 +894,8 @@ impl Db {
                 r.min_mem_kb.map(|v| v as i64),
                 r.need_cpu,
                 r.need_mem_kb as i64,
-                r.package
+                r.package,
+                r.need_why
             ],
         )?;
         Ok(self.conn.last_insert_rowid())

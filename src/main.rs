@@ -7,12 +7,14 @@ mod commands;
 mod config;
 mod dash;
 mod db;
+mod dump;
 mod groups;
 mod help;
 mod insight;
 mod key;
 mod machine;
 mod matcher;
+mod need;
 mod queue;
 mod recorder;
 mod report;
@@ -39,6 +41,8 @@ usage:
   taskguard outliers [PATTERN]                 memory peaks far above a job's other runs, and how much they count
   taskguard prune PATTERN | --outliers | --undo
                                                drop runs from the history, or put them back (a dry run without --apply)
+  taskguard dump PATTERN | --cmd \"COMMAND\" | --run ID
+                                               all taskguard knows about a job, as JSON: what it reserves and why
   taskguard doctor [--explain \"COMMAND\"]       configuration, readings, and how a command matches
   taskguard import-history                     load tsc-queue's history
   taskguard run [options] -- COMMAND           the same as the first form, for a command named like a subcommand
@@ -65,6 +69,7 @@ const SUBCOMMANDS: &[&str] = &[
     "history",
     "outliers",
     "prune",
+    "dump",
     "doctor",
     "import-history",
     "version",
@@ -187,6 +192,7 @@ fn dispatch(args: &[String]) -> Result<i32> {
             "history" => commands::history(),
             "outliers" => commands::outliers(rest),
             "prune" => commands::prune(rest),
+            "dump" => dump::dump(rest),
             "doctor" => commands::doctor(rest),
             "import-history" => commands::import_history(),
             "top" => top::run(rest),

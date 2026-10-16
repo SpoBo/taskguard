@@ -7,6 +7,7 @@ use crate::insight::{self, AdviceInput, RunFacts, Tracker};
 use crate::key;
 use crate::machine;
 use crate::matcher;
+use crate::need;
 use crate::queue::{self, Decision, Entry, Queue};
 use crate::report::{self, Lines, say};
 use crate::sys;
@@ -272,14 +273,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let startup = cfg.long_lived(&cls, pool.as_deref());
 
     let database = Db::open_dir(&dir).ok();
-    let learned = database.as_ref().and_then(|d| d.learned(&jkey, &cfg.learn()).ok()).unwrap_or_default();
     // A compile with no history of its own falls back on what tsc-queue learned.
-    let tool = matcher::effective(&o.cmd).first().map(|c| c.rsplit('/').next().unwrap_or(c).to_string()).unwrap_or_default();
-    let learned = match (&database, learned.runs, tool.as_str()) {
-        (Some(d), 0, "tsc" | "tsgo") => {
-            d.learned(&format!("tsc-queue:{}", crate::commands::legacy_key(&cwd)), &cfg.learn()).unwrap_or(learned)
-        }
-        _ => learned,
+    let (learned, history_key) = match &database {
+        Some(d) => need::history(d, &cfg, &cwd, &o.cmd, &jkey),
+        None => (Default::default(), jkey.clone()),
     };
     // A command whose recent runs started other taskguard jobs inside it, such
     // as `bun run ci:local` around a turbo run, is a wrapper. Queued as one
@@ -302,45 +299,27 @@ pub fn run(mut o: Opts) -> Result<i32> {
         }
         exec(&o.cmd);
     }
-    let learned_mem = learned.mem_kb.map(|m| if learned.mem_boosted { (m as f64 * 1.25) as u64 } else { m });
-    // A job that once wanted more cores than the machine has is capped at the
-    // limit; otherwise it could only ever start on an empty machine.
-    let cpu_cap = (sys::ncpu() as f64 * cfg.cpu_max / 100.0).min(sys::ncpu() as f64);
     // A job with no history still reserves room: what similar jobs needed, or
     // new_job_mem without any. Counting a first run as zero let a burst of new
     // compiles start into a machine that could not hold them, and froze it:
     // each grew to several GB within seconds, faster than the readings showed.
     let package = package_name(&cwd);
     let cmdline = o.cmd.join(" ");
-    let (est_mem, est_cpu, est_dur, estimate_from) = if learned.runs == 0 {
-        let same = package.as_deref().map(|p| (p, cmdline.as_str()));
-        let est = database.as_ref().and_then(|d| d.estimate(same, cls.label.as_deref(), &tool, pool.as_deref()).ok().flatten());
-        let from = match &est {
-            Some(e) if e.mem_kb.is_some() => e.from.clone(),
-            _ => "the new_job_mem default".to_string(),
-        };
-        let (m, c, d) = est.map(|e| (e.mem_kb, e.cpu, e.dur_s)).unwrap_or((None, None, None));
-        (Some(m.unwrap_or(cfg.new_job_mem_kb)), Some(c.unwrap_or(1.0)), d, Some(from))
-    } else {
-        (None, None, None, None)
-    };
-    let need_cpu = learned.cpu.or(est_cpu).unwrap_or(0.0).min(cpu_cap).max(min_cpu.unwrap_or(0.0));
-    let need_mem = learned_mem.or(est_mem).unwrap_or(0).max(min_mem.unwrap_or(0));
-    // A job that once took more memory than the limit allows is capped at the
-    // limit, as CPU is: otherwise it could only ever start on an empty machine.
-    let mem_cap = (sys::mem_total_kb() as f64 * cfg.mem_max / 100.0) as u64;
-    let need_mem = if mem_cap > 0 && need_mem > mem_cap && min_mem.is_none_or(|m| m <= mem_cap) {
+    let guess = (learned.runs == 0)
+        .then(|| need::guess(database.as_ref(), &cfg, package.as_deref(), &o.cmd, cls.label.as_deref(), pool.as_deref()));
+    let need = need::derive(&need::inputs(&cfg, &learned, Some(&history_key), guess.as_ref(), min_cpu, min_mem));
+    if let Some(from) = need.mem_capped_from {
         say(&format!(
             "warning {jkey} - its history says {} of memory, more than mem_max {:.0}% of RAM allows; it reserves {} (see taskguard outliers)",
-            report::gb(need_mem),
+            report::gb(from),
             cfg.mem_max,
-            report::gb(mem_cap)
+            report::gb(need.mem_kb)
         ));
-        mem_cap
-    } else {
-        need_mem
-    };
-    let raised = min_cpu.is_some_and(|m| m > learned.cpu.unwrap_or(0.0)) || min_mem.is_some_and(|m| m > learned_mem.unwrap_or(0));
+    }
+    let (need_cpu, need_mem, raised) = (need.cpu, need.mem_kb, need.raised_by_min);
+    let need_why = serde_json::to_string(&need).ok();
+    let estimate_from = guess.as_ref().map(|g| g.from.clone());
+    let est_dur = guess.as_ref().and_then(|g| g.dur_s);
 
     // `bunx` and `npx` set the variable to their own name; that is no script.
     let script = std::env::var("npm_lifecycle_event").ok().filter(|s| !matches!(s.as_str(), "bunx" | "npx" | "pnpx" | "dlx" | "exec"));
@@ -380,6 +359,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 min_mem_kb: min_mem,
                 need_cpu,
                 need_mem_kb: need_mem,
+                need_why: need_why.as_deref(),
             })
             .ok()
         })

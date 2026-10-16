@@ -224,6 +224,36 @@ fn a_run_is_learned_and_explained() {
 }
 
 #[test]
+fn dump_shows_what_a_job_reserves_and_why() {
+    let e = Env::new("");
+    assert!(e.run(&["--key", "k", "--", "sh", "-c", "exit 0"]).status.success());
+    let dump = |args: &[&str]| -> serde_json::Value {
+        let o = e.run(args);
+        assert!(o.status.success(), "{args:?}: {}", stderr(&o));
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let v = dump(&["dump", "k"]);
+    let job = &v["jobs"][0];
+    assert_eq!(job["key"], "k");
+    // The run stored how its need was made: a first run guesses.
+    let run = &job["runs"][0];
+    assert_eq!(run["need_why"]["steps"][0]["step"], "first_guess", "{run}");
+    assert_eq!(run["role"]["in_window"], true);
+    // The next run reserves from the history, and says so.
+    assert_eq!(job["next_need"]["steps"][0]["step"], "history", "{job}");
+    assert!(job["config"]["rules"]["keep"].as_u64().is_some());
+    // The same job by one of its runs.
+    let id = run["id"].as_i64().unwrap().to_string();
+    let by_run = dump(&["dump", "--run", &id]);
+    assert_eq!(by_run["jobs"][0]["key"], "k");
+    assert_eq!(by_run["focus_run"].as_i64().unwrap().to_string(), id);
+    // A command, matched as doctor --explain does.
+    let by_cmd = dump(&["dump", "--cmd", "bunx --bun playwright test"]);
+    assert_eq!(by_cmd["jobs"][0]["match"]["pool"]["name"], "e2e");
+    assert!(!e.run(&["dump", "nope*"]).status.success());
+}
+
+#[test]
 fn a_cpu_starved_run_is_flagged_and_advised() {
     let e = Env::new("");
     let n = std::thread::available_parallelism().unwrap().get() * 3;
@@ -559,7 +589,7 @@ fn every_command_has_help_and_help_all_has_them_all() {
     let h = out(&["outliers", "--ratio", "1.2", "--help"]);
     assert!(h.starts_with("taskguard outliers"), "{h}");
     assert_eq!(out(&["help", "outliers"]), h);
-    for cmd in ["top", "status", "pause", "resume", "history", "prune", "doctor", "import-history", "version", "help"] {
+    for cmd in ["top", "status", "pause", "resume", "history", "prune", "dump", "doctor", "import-history", "version", "help"] {
         let h = out(&[cmd, "--help"]);
         assert!(h.contains(&format!("taskguard {cmd}")), "{cmd}: {h}");
     }
