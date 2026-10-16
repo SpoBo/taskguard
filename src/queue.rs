@@ -110,11 +110,43 @@ pub struct Entry {
     /// Older versions leave it out; their long-lived jobs show as such only
     /// once they are steady.
     pub long_lived: bool,
+    /// For a long-lived job: the work its caller said will run on it
+    /// (`--expect`), with the memory booked for each until that work starts.
+    /// Older versions leave it out, and do not see the booking.
+    pub expects: Vec<Expect>,
+    /// The long-lived job this job is work for: one in the same checkout
+    /// that expects it. Older versions leave it out.
+    pub work_for: Option<WorkFor>,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
     #[serde(skip)]
     pub stalled: bool,
+}
+
+/// Work a long-lived job expects: a pool name, a job key, or a command
+/// pattern as in `[[job]] match`. Until a job that matches it starts, the
+/// long-lived job books `mem_kb` for it, so the room the work needs is
+/// there when it comes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Expect {
+    pub work: String,
+    pub mem_kb: u64,
+    /// Where `mem_kb` comes from, in words.
+    pub from: String,
+    /// A job for it has started: the booking is gone.
+    pub started: bool,
+}
+
+/// The long-lived job a job is work for, and which of its `expects` it
+/// takes over (none when every one of them has started already).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkFor {
+    pub pid: i32,
+    pub key: String,
+    pub item: Option<u32>,
 }
 
 impl Entry {
@@ -264,6 +296,9 @@ pub struct Nudge {
     pub pause: Option<bool>,
     pub need_cpu: Option<f64>,
     pub need_mem_kb: Option<u64>,
+    /// To a long-lived job: work it expects has started (`Expect::started`),
+    /// by index.
+    pub work_started: Vec<u32>,
 }
 
 pub struct Queue {
@@ -661,6 +696,10 @@ pub enum Blocker {
     Paused {
         key: String,
     },
+    /// Work for a long-lived job that does not run yet: it waits for it.
+    Stack {
+        key: String,
+    },
     Memory {
         would_pct: f64,
         limit_pct: f64,
@@ -692,6 +731,7 @@ impl Blocker {
             Blocker::Memory { .. } => "memory",
             Blocker::Pressure { .. } => "pressure",
             Blocker::Paused { .. } => "paused",
+            Blocker::Stack { .. } => "stack",
             Blocker::Cpu { .. } => "cpu",
         }
     }
@@ -723,11 +763,82 @@ pub enum Decision {
 /// A job paused by hand reserves no CPU: it uses none until someone resumes
 /// it, and the room it leaves is what the pause was for. Its memory stays
 /// reserved, since it keeps what it holds and grows again when it resumes.
+///
+/// A long-lived job also reserves what it books for the work it expects.
 pub fn reserve(running: &[Entry]) -> (f64, u64) {
     running.iter().fold((0.0, 0), |(c, m), e| {
         let cpu = if e.paused_by_hand { 0.0 } else { (e.need_cpu - e.live_cpu).max(0.0) };
-        (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb))
+        (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb) + booked(e, running))
     })
+}
+
+/// What `e` still books for the work it expects: each item whose work has
+/// not started, and that no running job has taken over yet. A waiting job
+/// books all of them, so it starts only with room for its work too.
+pub fn booked(e: &Entry, running: &[Entry]) -> u64 {
+    let taken = |i: usize| {
+        e.started_at.is_some() && running.iter().any(|r| r.work_for.as_ref().is_some_and(|w| w.pid == e.pid && w.item == Some(i as u32)))
+    };
+    e.expects.iter().enumerate().filter(|(i, x)| !x.started && !taken(*i)).map(|(_, x)| x.mem_kb).sum()
+}
+
+/// The memory `job` adds when it starts: its need, plus what it books for
+/// the work it expects, less what its long-lived job booked for it, which it
+/// takes over.
+pub fn need_with_booking(job: &Entry, running: &[Entry]) -> u64 {
+    let own = if job.started_at.is_none() { booked(job, &[]) } else { 0 };
+    (job.need_mem_kb + own).saturating_sub(booking_taken_over(job, running))
+}
+
+/// What the long-lived job of `job` books for it now, which `job` takes over
+/// when it starts.
+fn booking_taken_over(job: &Entry, running: &[Entry]) -> u64 {
+    let Some(WorkFor { pid, item: Some(i), .. }) = &job.work_for else { return 0 };
+    if job.started_at.is_some() {
+        return 0;
+    }
+    let Some(stack) = running.iter().find(|e| e.pid == *pid) else { return 0 };
+    let taken = running.iter().any(|r| r.pid != job.pid && r.work_for.as_ref().is_some_and(|w| w.pid == *pid && w.item == Some(*i)));
+    stack.expects.get(*i as usize).filter(|x| !x.started && !taken).map_or(0, |x| x.mem_kb)
+}
+
+/// Is `job` work for a long-lived job that does not run yet? It waits for
+/// it: the work needs it up.
+pub fn waits_for_stack(job: &Entry, running: &[Entry]) -> bool {
+    job.started_at.is_none() && job.work_for.as_ref().is_some_and(|w| !running.iter().any(|e| e.pid == w.pid))
+}
+
+/// The long-lived job in `me`'s checkout that expects it, among `running`
+/// and `waiting`, by `matches` (does `me` match this declared work?). A
+/// running one comes first, then the item whose work no other job has taken.
+/// Returns the link and the long-lived job's priority.
+pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> Option<(WorkFor, i32)> {
+    if me.long_lived {
+        return None;
+    }
+    let claimed = |pid: i32, i: usize| {
+        running
+            .iter()
+            .chain(waiting)
+            .any(|r| r.pid != me.pid && r.work_for.as_ref().is_some_and(|w| w.pid == pid && w.item == Some(i as u32)))
+    };
+    let stacks = running.iter().chain(waiting).filter(|e| e.long_lived && e.pid != me.pid && e.checkout == me.checkout);
+    let mut best: Option<(u8, WorkFor, i32)> = None;
+    for e in stacks {
+        for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work)) {
+            let free = !x.started && !claimed(e.pid, i);
+            // A stack that waits takes only work that can take over a booking.
+            if e.started_at.is_none() && !free {
+                continue;
+            }
+            let rank = u8::from(e.started_at.is_none()) * 2 + u8::from(!free);
+            if best.as_ref().is_none_or(|(r, _, _)| rank < *r) {
+                let item = free.then_some(i as u32);
+                best = Some((rank, WorkFor { pid: e.pid, key: e.key.clone(), item }, e.priority));
+            }
+        }
+    }
+    best.map(|(_, w, p)| (w, p))
 }
 
 /// Does `a` belong to an older task-runner run than `b`? Only jobs that are
@@ -840,7 +951,7 @@ pub fn decide(
                 let mut blockers: Vec<Blocker> = room
                     .blockers(m, lim, running, me, now, unknown_starts)
                     .into_iter()
-                    .filter(|b| matches!(b, Blocker::Memory { .. } | Blocker::Slots { .. }))
+                    .filter(|b| matches!(b, Blocker::Memory { .. } | Blocker::Slots { .. } | Blocker::Stack { .. }))
                     .collect();
                 if blockers.is_empty() {
                     blockers.push(room.memory_blocker(m, lim, me));
@@ -1125,7 +1236,7 @@ pub fn signal_tree(root: i32, sig: i32) {
 }
 
 /// The room the running jobs leave, read once per decision.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Room {
     res_cpu: f64,
     res_mem: u64,
@@ -1140,6 +1251,9 @@ struct Room {
     /// reserve: the memory that frees up once they have ended.
     passing_live: u64,
     passing_res: u64,
+    /// The running jobs: what a job takes over from its long-lived job
+    /// depends on them.
+    running: Vec<Entry>,
 }
 
 impl Room {
@@ -1157,11 +1271,12 @@ impl Room {
             ours_mem,
             passing_live: passing.iter().map(|e| e.live_mem_kb).sum(),
             passing_res: reserve(&passing).1,
+            running: running.to_vec(),
         }
     }
 
     fn mem_would(&self, job: &Entry) -> f64 {
-        (self.mem_used + self.res_mem + job.need_mem_kb) as f64
+        (self.mem_used + self.res_mem + need_with_booking(job, &self.running)) as f64
     }
 
     /// The most memory a job may take the machine to by the progress rule:
@@ -1179,7 +1294,7 @@ impl Room {
             (Some(pk), Some(max)) => (running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32) < max,
             _ => true,
         };
-        pool_free && self.mem_would(job) <= self.progress_ceiling(m, lim, job)
+        pool_free && !waits_for_stack(job, running) && self.mem_would(job) <= self.progress_ceiling(m, lim, job)
     }
 
     /// Would `job` fit by the progress rule once every running job that ends
@@ -1190,7 +1305,7 @@ impl Room {
         let drained = Room {
             mem_used: self.mem_used.saturating_sub(self.passing_live),
             res_mem: self.res_mem.saturating_sub(self.passing_res),
-            ..*self
+            ..self.clone()
         };
         drained.fits_on_progress(m, lim, &lasting, job)
     }
@@ -1204,7 +1319,7 @@ impl Room {
             short_kb: (mem_would - self.mem_limit).max(0.0) as u64,
             used_kb: self.mem_used,
             reserve_kb: self.res_mem,
-            need_kb: job.need_mem_kb,
+            need_kb: need_with_booking(job, &self.running),
             total_kb: m.mem_total_kb,
         }
     }
@@ -1262,7 +1377,7 @@ impl Room {
                         return None;
                     }
                     let outside = self.mem_used.saturating_sub(self.ours_mem);
-                    let ours = (self.ours_mem + self.res_mem + job.need_mem_kb) as f64;
+                    let ours = (self.ours_mem + self.res_mem + need_with_booking(job, &self.running)) as f64;
                     if short_kb as f64 <= total * lim.noise_mem_pct / 100.0 {
                         why.push(format!(
                             "memory short by {:.1} GB, within noise_mem {:.0}% of RAM",
@@ -1314,6 +1429,10 @@ impl Room {
     /// of it in line.
     fn blockers(&self, m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry, now: f64, unknown_starts: &[f64]) -> Vec<Blocker> {
         let mut blockers = Vec::new();
+        // Work for a long-lived job that does not run yet needs it up first.
+        if waits_for_stack(job, running) {
+            blockers.push(Blocker::Stack { key: job.work_for.as_ref().map(|w| w.key.clone()).unwrap_or_default() });
+        }
         if let (Some(pk), Some(max)) = (&job.pool_key, job.pool_slots) {
             let holders: Vec<String> = running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).map(|e| e.key.clone()).collect();
             if holders.len() as u32 >= max {
@@ -1506,6 +1625,18 @@ mod tests {
         assert_eq!(serde_json::from_str::<Entry>(&newer).unwrap().ticket, 7);
         let older: Entry = serde_json::from_str(r#"{"ticket":3,"pid":10,"run_id":1,"key":"k"}"#).unwrap();
         assert_eq!((older.ticket, older.need_cpu), (3, 0.0));
+        assert!(!older.long_lived && older.expects.is_empty() && older.work_for.is_none());
+        // What this version adds reads back, and leaves the rest alone.
+        let stack = Entry {
+            long_lived: true,
+            expects: vec![Expect { work: "browser".into(), mem_kb: 4, from: "x".into(), started: true }],
+            work_for: Some(WorkFor { pid: 9, key: "s".into(), item: Some(0) }),
+            ..older
+        };
+        let back: Entry = serde_json::from_str(&serde_json::to_string(&stack).unwrap()).unwrap();
+        assert_eq!(back, stack);
+        let nudge: Nudge = serde_json::from_str(r#"{"start":false,"work_started":[0]}"#).unwrap();
+        assert_eq!(nudge.work_started, vec![0]);
     }
 
     #[test]
@@ -2300,6 +2431,117 @@ mod tests {
         let waiting = [lint.clone(), slow.clone()];
         assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &lint, 3300.0, &[])), vec!["memory"]);
         assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &slow, 3300.0, &[])), vec!["reserved"]);
+    }
+
+    /// A stack that expects a browser run of 4.3 GB, in checkout /w/a.
+    fn expecting(mut stack: Entry) -> Entry {
+        stack.checkout = "/w/a".into();
+        stack.expects = vec![Expect { work: "browser".into(), mem_kb: 43 * GB / 10, ..Default::default() }];
+        stack
+    }
+
+    /// The browser run of checkout /w/a, linked to the stack of pid 11.
+    fn run_for(item: Option<u32>) -> Entry {
+        Entry {
+            pool: Some("browser".into()),
+            checkout: "/w/a".into(),
+            need_mem_kb: 43 * GB / 10,
+            priority: 11,
+            work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item }),
+            ..job(3, "pr.ts --pr 17398", 3.0, 0)
+        }
+    }
+
+    #[test]
+    fn a_stack_starts_only_with_room_for_the_work_it_expects() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        // 18 GB held of 32 (limit 30.4): the stack alone (9.4 GB) fits, with
+        // its 4.3 GB run it does not.
+        let alone = Entry { long_lived: true, priority: 10, need_mem_kb: 94 * GB / 10, ..job(2, "dev-env:stack", 3.0, 0) };
+        let stack = Entry { pid: 11, ..expecting(alone.clone()) };
+        let m = machine(1.0, 18);
+        let busy = [Entry { started_at: Some(990.0), ..job(5, "lint", 1.0, 1) }];
+        assert!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&alone), &alone, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])), vec!["memory"]);
+        assert_eq!(need_with_booking(&stack, &busy), 94 * GB / 10 + 43 * GB / 10);
+        assert!(blockers(decide(&machine(1.0, 15), &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_running_stack_keeps_the_room_for_its_run_until_the_run_starts() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let stack = expecting(steady_stack(11, 7));
+        let r = std::slice::from_ref(&stack);
+        // What the stack may still grow to (1 GB), and 4.3 GB booked for its run.
+        let grows = stack.need_mem_kb - stack.live_mem_kb;
+        assert_eq!(reserve(r).1, grows + 43 * GB / 10);
+        let lint = Entry { need_mem_kb: 46 * GB / 10, ..job(4, "lint", 3.5, 0) };
+        let run = run_for(Some(0));
+        let waiting = [lint.clone(), run.clone()];
+        let m = machine(1.0, 24);
+        let other = [stack.clone(), Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 0) }];
+        // 24 GB held + 5.3 reserved: a lint that needs that room waits; the
+        // run takes over the booking, and goes first.
+        assert_eq!(blockers(decide(&m, &lim, &other, &waiting, &lint, 1000.0, &[])), vec!["priority", "memory"]);
+        assert!(blockers(decide(&m, &lim, &other, &waiting, &run, 1000.0, &[])).is_empty());
+        let alone = [lint.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &other, &alone, &lint, 1000.0, &[])), vec!["memory"]);
+        // Once the run runs, the stack books nothing for it: the run's own
+        // need counts instead.
+        let running = [stack.clone(), Entry { started_at: Some(1000.0), ..run.clone() }];
+        assert_eq!(reserve(&running).1, grows + 43 * GB / 10);
+        assert_eq!(super::booked(&stack, &running), 0);
+        // And once its owner has marked it started, it stays dropped.
+        let mut done = stack.clone();
+        done.expects[0].started = true;
+        assert_eq!(reserve(std::slice::from_ref(&done)).1, grows);
+    }
+
+    #[test]
+    fn work_links_to_the_stack_of_its_checkout_that_expects_it() {
+        let stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(3, "pr.ts", 3.0, 4) };
+        let is = |w: &str| w == "browser";
+        let (link, priority) = link_work(&me, std::slice::from_ref(&stack), &[], is).unwrap();
+        assert_eq!((link.pid, link.item, priority), (11, Some(0), 10));
+        // Not from another checkout, and not work it does not expect.
+        let elsewhere = Entry { checkout: "/w/b".into(), ..me.clone() };
+        assert!(link_work(&elsewhere, std::slice::from_ref(&stack), &[], is).is_none());
+        assert!(link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "lint").is_none());
+        // A second run while the first one has the booking still goes first,
+        // without a booking to take over.
+        let first = Entry { pid: 30, started_at: Some(990.0), ..run_for(Some(0)) };
+        let (link, _) = link_work(&me, &[stack.clone(), first], &[], is).unwrap();
+        assert_eq!(link.item, None);
+        // A stack that still waits takes only work that can take over its booking.
+        let waiting = Entry { started_at: None, ..stack.clone() };
+        let claimed = Entry { pid: 30, ..run_for(Some(0)) };
+        assert!(link_work(&me, &[], &[waiting.clone(), claimed], is).is_none());
+        assert_eq!(link_work(&me, &[], std::slice::from_ref(&waiting), is).unwrap().0.item, Some(0));
+        // A long-lived job is nobody's work.
+        assert!(link_work(&Entry { long_lived: true, ..me }, std::slice::from_ref(&stack), &[], is).is_none());
+    }
+
+    #[test]
+    fn work_waits_for_its_stack_and_holds_nobody_back_meanwhile() {
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 9)) };
+        let run = run_for(Some(0));
+        let lint = job(4, "lint", 1.0, 1);
+        let waiting = [stack.clone(), run.clone(), lint.clone()];
+        let busy = [Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 2) }];
+        let m = machine(1.0, 4);
+        assert_eq!(blockers(decide(&m, &LIM, &busy, &waiting, &run, 1000.0, &[])), vec!["stack"]);
+        // Its priority is above the stack's, but it cannot start: the lint
+        // that fits is held back only by the stack itself.
+        assert_eq!(blockers(decide(&m, &LIM, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        let d = decide(&m, &LIM, &busy, &waiting, &lint, 1000.0, &[]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Priority { key, priority: 10 } if key == "dev-env:stack"))
+        );
+        // With nothing running, the progress rule skips it too: the stack
+        // behind it in line starts.
+        assert_eq!(blockers(decide(&m, &LIM, &[], &waiting, &run, 1000.0, &[])), vec!["stack"]);
+        assert!(blockers(decide(&m, &LIM, &[], &waiting, &stack, 1000.0, &[])).is_empty());
     }
 
     #[test]

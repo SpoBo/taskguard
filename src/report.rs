@@ -3,7 +3,7 @@
 //! the scheduler really thinks.
 
 use crate::machine::MachineSample;
-use crate::queue::{Blocker, Decision, Entry, Limits, reserve};
+use crate::queue::{Blocker, Decision, Entry, Limits, booked, need_with_booking, reserve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -61,6 +61,7 @@ pub fn blocker_text(b: &Blocker) -> String {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
         Blocker::Paused { key } => format!("{key} is paused for memory; it resumes before anything new starts"),
+        Blocker::Stack { key } => format!("work for {key}, which has not started yet; it starts after it"),
         Blocker::Memory { would_pct, limit_pct, short_kb, .. } => {
             format!("memory: would reach {would_pct:.0}% (limit {limit_pct:.0}%), {} short", gb(*short_kb))
         }
@@ -167,6 +168,7 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         Blocker::Pressure { paced: true, .. } => ("starts when memory fits".into(), None),
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
         Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
+        Blocker::Stack { key } => (format!("starts after {key} has started"), None),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
@@ -486,14 +488,16 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             ),
         ));
     }
-    let mem_would = m.mem_used_kb + s.reserve_mem_kb + e.need_mem_kb;
+    let need = need_with_booking(e, &s.running);
+    let mem_would = m.mem_used_kb + s.reserve_mem_kb + need;
     out.push((
         checked("memory", mem_would <= s.mem_limit_kb),
         format!(
-            "memory: {} held + {} promised + {} for this job = {:.0}% (limit {:.0}%)",
+            "memory: {} held + {} promised + {} for this job{} = {:.0}% (limit {:.0}%)",
             gb(m.mem_used_kb),
             gb(s.reserve_mem_kb),
-            gb(e.need_mem_kb),
+            gb(need),
+            link_text(e, &s.running),
             mem_would as f64 * 100.0 / m.mem_total_kb.max(1) as f64,
             s.limits.mem_max_pct
         ),
@@ -530,6 +534,21 @@ pub fn bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: u
             }
         })
         .collect()
+}
+
+/// What a job's link to a long-lived job adds to its line: the work a
+/// long-lived job expects and books room for, or the long-lived job a job
+/// is work for. Empty for any other job.
+pub fn link_text(e: &Entry, running: &[Entry]) -> String {
+    let mut t = String::new();
+    if let Some(w) = &e.work_for {
+        t += &format!(" (for stack {})", w.key);
+    }
+    let open: Vec<&str> = e.expects.iter().filter(|x| !x.started).map(|x| x.work.as_str()).collect();
+    if !open.is_empty() {
+        t += &format!(" (expects {}, books {})", open.join(", "), gb(booked(e, running)));
+    }
+    t
 }
 
 /// The job's key cut to `n` characters, with its priority when it has one: "api:tsc p2".
@@ -597,14 +616,15 @@ pub fn render_status(s: &Snapshot) -> String {
         let min = if e.raised_by_min { " min" } else { "" };
         let _ = writeln!(
             o,
-            "  {:<36} {:<12} {:>6}   {:>4.1} / {:<9}  {:>8} / {}{min}{tag}",
+            "  {:<36} {:<12} {:>6}   {:>4.1} / {:<9}  {:>8} / {}{min}{tag}{}",
             job_name(e, 36),
             trunc(e.pool.as_deref().unwrap_or("-"), 12),
             dur(s.now - e.started_at.unwrap_or(s.now)),
             e.live_cpu,
             needs_cpu,
             gb(e.live_mem_kb),
-            needs_mem
+            needs_mem,
+            link_text(e, &s.running)
         );
     }
     let _ = writeln!(o);
@@ -632,6 +652,7 @@ pub fn render_status(s: &Snapshot) -> String {
         if e.stalled {
             blocked += " [stalled: holds no job back]";
         }
+        blocked += &link_text(e, &s.running);
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:<21} {}",

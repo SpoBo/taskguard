@@ -1006,7 +1006,11 @@ impl Db {
         if let Some(p) = pool {
             tiers.push((None, None, Some(p), None, format!("jobs in {p}")));
         }
-        tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
+        // A guess without a program (work named only by its pool) does not
+        // fall back on every job there is.
+        if !tool.is_empty() {
+            tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
+        }
         for (same, l, p, t, what) in tiers {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT max(peak_mem_kb), avg(coalesce(cores_used, cores_wanted)), avg(ended_at - started_at - coalesce(paused_s, 0)) FROM runs

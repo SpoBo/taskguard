@@ -231,6 +231,24 @@ below).
   job itself starts that way only under `mem_max`. `auto_pause` leaves it
   alone. `taskguard status` marks it `STEADY`, and a job it keeps out says it
   starts when the stack is stopped, not when it finishes.
+- **Work for a long-lived job goes first.** The caller that starts a dev
+  stack usually knows what will run on it: the browser run it brings the
+  stack up for. It can say so, with `--expect WORK` on the stack's job
+  (repeatable) or `TASKGUARD_EXPECT=WORK,WORK` in its environment, so it
+  passes through scripts such as `devenv up`. WORK is a pool name, a job key,
+  or a command pattern as in `[[job]] match`. The stack then books room for
+  each piece of work, learned as that work learns its own need: what jobs of
+  the pool typically took, or the history or first guess of the command. It
+  starts only when the machine has room for itself and that work, so the
+  whole load is known before it starts. A job that queues in the same
+  checkout and matches WORK is that work: it goes one priority above the
+  stack, so it starts before the jobs that queued for room meanwhile and
+  before a next stack, and when it starts it takes over the room booked for
+  it, which the stack then drops. `taskguard status` shows both ends: `(for
+  stack dev-env:stack)` on the work, `(expects browser, books 3.6 GB)` on the
+  stack. Work that queues while its stack still waits waits for the stack and
+  holds nobody back meanwhile. A stack started without `--expect` behaves as
+  before; the variable means nothing to any other job.
 
 ### What is measured
 
@@ -322,6 +340,7 @@ taskguard --wait [--id NAME]
 | `--min-cpu N` | Never start with fewer than N free cores. |
 | `--min-mem SIZE` | Never start with less than SIZE free (`6G`, `512M`). |
 | `--priority N` | Higher starts first. The default is 0, or `priority` from the config. |
+| `--expect WORK` | For a long-lived job: work that will run on it (a pool name, job key or command pattern). It books room for it, and that work goes first. Repeatable; also `TASKGUARD_EXPECT=WORK,WORK`. |
 | `--now` | Skip the queue, but still measure and learn. |
 | `--bg` | Wait for room, then return and let the job run on. |
 | `--pipe` | With `--bg`: pass stdin to the command. |
@@ -617,6 +636,10 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   past `mem_max`, up to `pause_at` (or halfway from `mem_max` to all of RAM
   when `mem_max` is at or above `pause_at`). Set `outside_admit = false` and
   `noise_mem = 0` to keep `mem_max` a hard rule.
+- A stack that expects work (`--expect`) books room for it until it starts,
+  however long that takes: work that never comes keeps that room booked
+  while the stack runs. A stack plus its work that do not fit next to another
+  stack wait for room, where before the stack started and its work waited.
 
 ## Moving from tsc-queue
 
@@ -678,7 +701,11 @@ version runs, but they still wait for it to end when nothing else runs.
 Versions up to 0.10.0 start the first in line whatever the readings say when
 nothing runs but long-lived jobs past their start-up, also a second dev stack
 over `mem_max`, and skip that rule at macOS warning; their jobs decide so
-whatever newer versions do.
+whatever newer versions do. They do not know `--expect` either: they ignore
+`TASKGUARD_EXPECT`, do not see what a newer stack books for its work, and may
+start their own jobs into that room. The priority a newer job takes as work
+for a stack is an ordinary priority, so their waiting jobs do let it go
+first.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not

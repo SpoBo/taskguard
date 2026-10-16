@@ -185,6 +185,39 @@ pub fn guess(db: Option<&Db>, cfg: &Config, package: Option<&str>, argv: &[Strin
     }
 }
 
+/// What a long-lived job books for work it expects (`--expect WORK`): the
+/// need that work will start with, learned as the work itself learns it.
+/// WORK is a pool name, a job key, or a command (pattern) run from `cwd`.
+/// A pool books what jobs of that pool typically took; a key or command
+/// its history, else a first guess as for a new job, with the minimums of
+/// the job rules it matches.
+pub fn expected(db: Option<&Db>, cfg: &Config, cwd: &Path, work: &str) -> crate::queue::Expect {
+    let expect = |mem_kb: u64, from: String| crate::queue::Expect { work: work.to_string(), mem_kb, from, ..Default::default() };
+    if cfg.pools.iter().any(|p| p.name == work) {
+        let est = db.and_then(|d| d.estimate(None, None, "", Some(work)).ok().flatten());
+        return match est.and_then(|e| e.mem_kb.map(|m| (m, e.from))) {
+            Some((m, from)) => expect(m, from),
+            None => expect(cfg.new_job_mem_kb, format!("no jobs in pool {work} yet: the new_job_mem default")),
+        };
+    }
+    let argv = crate::matcher::split_shell(work);
+    let has_history = |k: &str| db.and_then(|d| d.learned(k, &cfg.learn()).ok()).is_some_and(|l| l.runs > 0);
+    let key = if has_history(work) { work.to_string() } else { crate::key::run_key(cwd, &argv) };
+    let cls = cfg.classify(&argv, &key).unwrap_or_default();
+    let (learned, history_key) = match db {
+        Some(d) => history(d, cfg, cwd, &argv, &key),
+        None => (Default::default(), key.clone()),
+    };
+    let pool = cls.pool.as_ref().map(|p| p.0.as_str());
+    let guess = (learned.runs == 0).then(|| self::guess(db, cfg, None, &argv, cls.label.as_deref(), pool));
+    let need = derive(&inputs(cfg, &learned, Some(&history_key), guess.as_ref(), cls.min_cpu, cls.min_mem_kb));
+    let from = match need.steps.last() {
+        Some(s) => format!("{}: {}", s.step, s.why),
+        None => "nothing known".into(),
+    };
+    expect(need.mem_kb, from)
+}
+
 /// The program a command runs: `tsc` for `bunx tsc -p .`.
 pub fn tool(argv: &[String]) -> String {
     crate::matcher::effective(argv).first().map(|c| c.rsplit('/').next().unwrap_or(c).to_string()).unwrap_or_default()

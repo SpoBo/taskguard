@@ -10,7 +10,7 @@
 //! to the rules shows what it does to it.
 
 use crate::machine::{MachineSample, PEAK_WINDOW};
-use crate::queue::{Decision, Entry, Limits, LongLived, decide};
+use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, link_work};
 
 const GB: u64 = 1024 * 1024;
 const TICK: f64 = 1.0;
@@ -125,6 +125,11 @@ pub struct Agent {
     pub give_up_s: f64,
     pub down_after_s: f64,
     pub pause_s: f64,
+    /// The agent declares its browser run when it brings the stack up
+    /// (`TASKGUARD_EXPECT=browser`), and the stack books `booking_kb` for it:
+    /// what browser runs typically took, less than the run's own need.
+    pub declares: bool,
+    pub booking_kb: u64,
 }
 
 pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
@@ -141,6 +146,8 @@ pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
         give_up_s: 600.0,
         down_after_s: 20.0,
         pause_s: 30.0,
+        declares: false,
+        booking_kb: 36 * GB / 10,
     }
 }
 
@@ -173,6 +180,9 @@ pub struct Scenario {
     pub lints: Option<Lints>,
     pub jobs: Vec<Job>,
     pub secs: f64,
+    /// The scout's fallback, for comparison: a steady stack books what it
+    /// holds, without room to grow.
+    pub steady_books_live: bool,
 }
 
 /// What came of it.
@@ -276,6 +286,11 @@ pub fn run(s: &Scenario) -> Outcome {
                         known: true,
                         priority: 10,
                         long_lived: true,
+                        expects: if a.declares {
+                            vec![Expect { work: "browser".into(), mem_kb: a.booking_kb, ..Default::default() }]
+                        } else {
+                            Vec::new()
+                        },
                         ..Default::default()
                     };
                     waiting.push((e, Kind::Stack(n)));
@@ -388,6 +403,9 @@ pub fn run(s: &Scenario) -> Outcome {
                 _ => None,
             };
             r.e.follow(mem, cpu, s.host.ncpu as f64, t, lived);
+            if s.steady_books_live && r.e.steady() {
+                r.e.need_mem_kb = mem;
+            }
         }
         let ours: u64 = running.iter().map(|r| r.e.live_mem_kb).sum();
         let used = s.host.outside(t) + ours;
@@ -422,8 +440,25 @@ pub fn run(s: &Scenario) -> Outcome {
         while i < waiting.len() {
             let run_now: Vec<Entry> = running.iter().map(|r| r.e.clone()).collect();
             let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
+            // As the runner does: work links to the stack that expects it,
+            // and goes one priority above it.
+            if waiting[i].0.work_for.is_none() {
+                let me = waiting[i].0.clone();
+                if let Some((link, p)) = link_work(&me, &run_now, &all, |w| me.pool.as_deref() == Some(w)) {
+                    waiting[i].0.priority = me.priority.max(p + 1);
+                    waiting[i].0.work_for = Some(link);
+                }
+            }
+            let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
             let (me, kind) = waiting[i].clone();
             if matches!(decide(&m, &s.lim, &run_now, &all, &me, t, &[]), Decision::Admit { .. }) {
+                // The nudge to the stack: its work has started.
+                if let Some(w) = &me.work_for
+                    && let Some(i) = w.item
+                    && let Some(st) = running.iter_mut().find(|r| r.e.pid == w.pid)
+                {
+                    st.e.expects[i as usize].started = true;
+                }
                 for (w, _) in waiting.iter_mut().filter(|(w, _)| w.ahead_of(&me) && w.bypassed_since.is_none()) {
                     w.bypassed_since = Some(t);
                 }
@@ -459,7 +494,17 @@ pub fn morning(outside_gb: f64) -> Scenario {
         lints: Some(macbook_lints()),
         jobs: Vec::new(),
         secs: 7200.0,
+        steady_books_live: false,
     }
+}
+
+/// The same morning, with each agent declaring its browser run on its stack.
+pub fn declared_morning(outside_gb: f64) -> Scenario {
+    let mut s = morning(outside_gb);
+    for a in &mut s.agents {
+        a.declares = true;
+    }
+    s
 }
 
 /// Omarchy (24 cores, 31.3 GB, Linux, mem_max 95, DALP's max_backfill 1800):
@@ -521,7 +566,7 @@ pub fn head_of_line() -> Scenario {
     let host =
         Host { total_kb: gb(31.3), ncpu: 24, outside_kb: gb(15.8), outside_swing_kb: gb(0.3), warning_pct: None, critical_pct: 100.0 };
     let lim = Limits { warn_admit: false, ..macbook_limits() };
-    Scenario { host, lim, agents: Vec::new(), lints: None, jobs, secs: 1800.0 }
+    Scenario { host, lim, agents: Vec::new(), lints: None, jobs, secs: 1800.0, steady_books_live: false }
 }
 
 /// The longest a small job (under 1 GB) of `s` waited, or the scenario's
@@ -578,6 +623,11 @@ mod tests {
             // 0.10.0 also capped outside_admit at pause_at, under mem_max.
             let old = Scenario { lim: Limits { outside_mem_max_pct: 92.0, ..macbook_limits() }, ..morning(outside) };
             eprintln!("{}", row(&format!("outside {outside} GB, outside cap 92%"), &run(&old)));
+            eprintln!("{}", row(&format!("outside {outside} GB, declared"), &run(&declared_morning(outside))));
+            let live = Scenario { steady_books_live: true, ..morning(outside) };
+            eprintln!("{}", row(&format!("outside {outside} GB, steady books live"), &run(&live)));
+            let both = Scenario { steady_books_live: true, ..declared_morning(outside) };
+            eprintln!("{}", row(&format!("outside {outside} GB, declared + live"), &run(&both)));
         }
     }
 
