@@ -266,8 +266,7 @@ below).
   stack books that work's usual need, which `taskguard status` shows as
   `(expects browser from history, books 4.3 GB)` until work queues for
   it, and while the guess is open the work links and goes first as declared
-  work does. It is a guess,
-  so it is bounded:
+  work does. It is a guess, so it is bounded:
   - it books room for twice the work's usual delay after the stack started,
     ten minutes at most, and drops it once work for the stack starts or the
     stack stops;
