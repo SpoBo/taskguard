@@ -202,9 +202,9 @@ below).
   a job starts when there is room for its start-up peak, and holds that peak
   for its start-up (`startup`, 300 seconds by default). Then its needs start
   again from what it uses: its CPU need is what it wanted over the last 10
-  seconds, up or down, and its memory need what it holds plus 25%, or what
-  its past runs grew to after their start-up when that is more, and it follows
-  its peak from there. A DALP dev stack wants almost every core while it
+  seconds, up or down, and its memory need what it holds plus 25%, up or
+  down with each reading, so an idle stack releases its booking. A DALP dev
+  stack wants almost every core while it
   starts and seeds, then idles at a few percent; without this it kept every
   core for hours. Its history keeps both: the start-up peak, which the next
   run is admitted against, and what it took after. Past its start-up it

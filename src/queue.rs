@@ -199,8 +199,8 @@ impl Entry {
 pub struct LongLived {
     /// Seconds after its start that it holds its start-up peak.
     pub startup: f64,
-    /// The highest memory its past runs took after their start-up: what it
-    /// still grows to once it settles.
+    /// The highest memory its past runs took after their start-up. `follow`
+    /// does not book it: once steady, a job books what it holds now.
     pub steady_mem_kb: Option<u64>,
 }
 
@@ -219,11 +219,11 @@ impl Entry {
     /// A long-lived job follows its peak through its start-up only. After that its needs start again
     /// from what it uses: a dev stack that took every core while it started
     /// and seeded, and idles at a few percent, must not keep every core for
-    /// hours. Its memory need is what it holds plus a quarter, or what its
-    /// past runs grew to after their start-up when that is more, and follows
-    /// its peak from there: running out of memory kills processes. Its CPU
-    /// need is measured use plus a margin, up or down, because runnable wait
-    /// can reflect priority and contention rather than useful work.
+    /// hours. Its memory need is what it holds now plus a quarter, up or
+    /// down with each reading, so an idle stack releases its booking; what
+    /// its past runs grew to after their start-up is not booked. Its CPU need
+    /// is measured use plus a margin, up or down, because runnable wait can
+    /// reflect priority and contention rather than useful work.
     pub fn follow(&mut self, mem_kb: u64, used_recent: f64, ncpu: f64, now: f64, long: Option<LongLived>) {
         if let Some(l) = long
             && self.steady_since.is_none()
@@ -2030,7 +2030,8 @@ mod tests {
         s.follow(2 * GB, 0.3, 12.0, 1460.0, Some(STACK));
         assert_eq!(s.need_mem_kb, 2 * GB + (2 * GB) / 4);
 
-        // What its past runs grew to after their start-up stays reserved.
+        // What its past runs grew to after their start-up is not booked:
+        // only what it holds now, plus a quarter.
         let mut again = Entry { started_at: Some(1000.0), ..stack() };
         again.follow(3 * GB, 0.2, 12.0, 1300.0, Some(LongLived { steady_mem_kb: Some(5 * GB), ..STACK }));
         assert_eq!(again.need_mem_kb, 3 * GB + (3 * GB) / 4);
