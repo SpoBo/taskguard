@@ -247,8 +247,23 @@ below).
   it, which the stack then drops. `taskguard status` shows both ends: `(for
   stack dev-env:stack)` on the work, `(expects browser, books 3.6 GB)` on the
   stack. Work that queues while its stack still waits waits for the stack and
-  holds nobody back meanwhile. A stack started without `--expect` behaves as
-  before; the variable means nothing to any other job.
+  holds nobody back meanwhile. A stack with work queued for it, and work whose
+  stack runs, hold their turn as a strict reservation, also while they do not
+  fit yet: lints that fit do not take the room meanwhile, unless the stack
+  could only start once another stack is stopped. A stack started without
+  `--expect` behaves as before; the variable means nothing to any other job.
+- **A stack waits a few seconds for its work.** A caller may start the stack
+  and its work at the same moment, not one after the other. So a long-lived
+  job that has reason to expect work waits up to `expect_wait` (5) seconds,
+  before it starts, for that work to queue, and starts as soon as it has:
+  with room for both, and the work right after it. The reason is either a
+  declaration (`--expect`), or its history in that checkout: at least two of
+  its last five runs there, and on at least half of them, a job of the same
+  pool (or with the same key, outside any pool) queued in that checkout while
+  it ran. Work the history implies books nothing, and only counts when it
+  queues within those seconds; then the stack books what it needs. A stack
+  with neither reason starts at once, as before: sometimes you only want the
+  stack. `expect_wait = 0` turns the wait off.
 
 ### What is measured
 
@@ -580,6 +595,7 @@ outlier_ratio = 1.5    # a peak this many times the next one is an outlier; 0 = 
 outside_admit = true   # start jobs that only other programs keep out
 partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
 max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
+expect_wait = 5        # a dev stack waits this long for the work it expects to queue
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -640,6 +656,9 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   however long that takes: work that never comes keeps that room booked
   while the stack runs. A stack plus its work that do not fit next to another
   stack wait for room, where before the stack started and its work waited.
+  Work only links to a stack in its own checkout.
+- The history only suggests that work follows a stack; it never books room
+  by itself. Only work that queues within `expect_wait` of the stack counts.
 
 ## Moving from tsc-queue
 
@@ -703,7 +722,10 @@ nothing runs but long-lived jobs past their start-up, also a second dev stack
 over `mem_max`, and skip that rule at macOS warning; their jobs decide so
 whatever newer versions do. They do not know `--expect` either: they ignore
 `TASKGUARD_EXPECT`, do not see what a newer stack books for its work, and may
-start their own jobs into that room. The priority a newer job takes as work
+start their own jobs into that room. Nor do they know `expect_wait`: they see
+a stack that waits a few seconds for its work as one that could start, and
+mark it as stalled only after 10 seconds, so keep `expect_wait` under 10
+while such versions share the machine. The priority a newer job takes as work
 for a stack is an ordinary priority, so their waiting jobs do let it go
 first.
 A version before 0.4.0 does not

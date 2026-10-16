@@ -1042,6 +1042,43 @@ impl Db {
         Ok(None)
     }
 
+    /// The work that followed a long-lived job before: for the last few
+    /// runs of `key` in `checkout` (at most `n`, of the last two weeks), the
+    /// pool, or the key of a job without one, of every other job that queued
+    /// in that checkout while the run ran. Returns how many runs were looked
+    /// at, and what followed with on how many of them, most first.
+    pub fn followers(&self, key: &str, pool: Option<&str>, checkout: &str, n: usize) -> Result<(usize, Vec<(String, usize)>)> {
+        let now = now();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, started_at, coalesce(ended_at, ?3) FROM runs
+             WHERE key = ?1 AND started_at IS NOT NULL AND started_at > ?3 - 14 * 86400
+               AND (cwd = ?2 OR substr(cwd, 1, length(?2) + 1) = ?2 || '/')
+             ORDER BY started_at DESC LIMIT ?4",
+        )?;
+        let runs: Vec<(i64, f64, f64)> = stmt
+            .query_map(params![key, checkout, now, n as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT coalesce(pool, key) FROM runs
+             WHERE id != ?1 AND key != ?2 AND (pool IS NULL OR ?5 IS NULL OR pool != ?5)
+               AND queued_at >= ?3 AND queued_at <= ?4
+               AND (cwd = ?6 OR substr(cwd, 1, length(?6) + 1) = ?6 || '/')",
+        )?;
+        for (id, from, to) in &runs {
+            let works: Vec<String> =
+                stmt.query_map(params![id, key, from, to, pool, checkout], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+            for w in works {
+                match seen.iter_mut().find(|(s, _)| *s == w) {
+                    Some((_, c)) => *c += 1,
+                    None => seen.push((w, 1)),
+                }
+            }
+        }
+        seen.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        Ok((runs.len(), seen))
+    }
+
     /// How many of the key's most recent runs in a row were starved.
     pub fn starved_streak(&self, key: &str) -> Result<usize> {
         let mut stmt =
@@ -1857,6 +1894,40 @@ mod tests {
         run(&db, "k", 1000, 1.0, 10.0, None);
         let l = db.learned("k", &Learn::default()).unwrap();
         assert_eq!((l.steady_mem_kb, l.steady_cpu), (None, None));
+    }
+
+    #[test]
+    fn the_work_that_followed_a_stack_in_its_checkout() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let t = now() - 86400.0;
+        let at = |key: &str, pool: Option<&str>, cwd: &str, queued: f64, started: f64, ended: Option<f64>| {
+            let id = db.insert_run(&NewRun { ns: "n", key, pool, cwd, ..Default::default() }).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE runs SET queued_at = ?2, started_at = ?3, ended_at = ?4 WHERE id = ?1",
+                    params![id, queued, started, ended],
+                )
+                .unwrap();
+        };
+        // Three stacks in /w/dalp; a browser run followed two of them, and a
+        // lint each. The third still runs.
+        for (i, run) in [(0, true), (1, true), (2, false)] {
+            let s = t + 3600.0 * i as f64;
+            at("dev-env:stack", Some("stack"), "/w/dalp", s - 10.0, s, (i < 2).then_some(s + 1800.0));
+            if run {
+                at("e2e/agentic:pr.ts", Some("browser"), "/w/dalp/e2e/agentic", s + 400.0, s + 400.0, Some(s + 700.0));
+            }
+            at(&format!("pkg{i}:oxlint"), None, "/w/dalp/pkg", s + 60.0, s + 60.0, Some(s + 70.0));
+        }
+        // Nothing of another checkout counts, nor whatever ran before a stack.
+        at("e2e/agentic:pr.ts", Some("browser"), "/w/dalp-2/e2e/agentic", t + 7300.0, t + 7300.0, Some(t + 7400.0));
+        at("root:tsc", None, "/w/dalp", t - 600.0, t - 600.0, Some(t - 500.0));
+        let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/dalp", 5).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(works[0], ("browser".to_string(), 2));
+        assert!(works[1..].iter().all(|(w, c)| w.ends_with(":oxlint") && *c == 1), "{works:?}");
+        let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/elsewhere", 5).unwrap();
+        assert_eq!((n, works.len()), (0, 0));
     }
 
     #[test]

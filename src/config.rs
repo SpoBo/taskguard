@@ -40,6 +40,7 @@ pub struct Layer {
     pub new_job_mem: Option<String>,
     pub max_bypass: Option<u64>,
     pub max_backfill: Option<u64>,
+    pub expect_wait: Option<f64>,
     pub boost_runs: Option<usize>,
     pub outlier_ratio: Option<f64>,
     pub outlier_min: Option<String>,
@@ -139,6 +140,9 @@ pub struct Config {
     pub new_job_mem_kb: u64,
     pub max_bypass: u64,
     pub max_backfill: u64,
+    /// Seconds a long-lived job that expects work waits, before it starts,
+    /// for that work to queue: see `queue::Entry::expect_until`. 0 = never.
+    pub expect_wait: f64,
     pub boost_runs: usize,
     /// A memory peak more than this many times the next one below it is an
     /// outlier, and counts by `outlier_weights`. At or under 1: no outliers.
@@ -199,6 +203,7 @@ impl Default for Config {
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
             max_backfill: 600,
+            expect_wait: 5.0,
             boost_runs: 5,
             outlier_ratio: 1.5,
             outlier_min_kb: 1024 * 1024,
@@ -633,6 +638,7 @@ impl Config {
         }
         set!(max_bypass);
         set!(max_backfill);
+        set!(expect_wait);
         set!(boost_runs);
         set!(outlier_ratio);
         if let Some(v) = &l.outlier_min

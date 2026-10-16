@@ -117,6 +117,10 @@ pub struct Entry {
     /// The long-lived job this job is work for: one in the same checkout
     /// that expects it. Older versions leave it out.
     pub work_for: Option<WorkFor>,
+    /// For a long-lived job that expects work: until then it waits, before
+    /// it starts, for that work to queue (`expect_wait`), so it starts with
+    /// room for both. Older versions leave it out.
+    pub expect_until: Option<f64>,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -137,6 +141,9 @@ pub struct Expect {
     pub from: String,
     /// A job for it has started: the booking is gone.
     pub started: bool,
+    /// Not declared: the history says such work followed this job before.
+    /// It books nothing until a job for it queues while this job waits.
+    pub implied: bool,
 }
 
 /// The long-lived job a job is work for, and which of its `expects` it
@@ -700,6 +707,12 @@ pub enum Blocker {
     Stack {
         key: String,
     },
+    /// A long-lived job waits, for at most `wait_s` more, for the work it
+    /// expects to queue.
+    Expect {
+        work: Vec<String>,
+        wait_s: f64,
+    },
     Memory {
         would_pct: f64,
         limit_pct: f64,
@@ -732,6 +745,7 @@ impl Blocker {
             Blocker::Pressure { .. } => "pressure",
             Blocker::Paused { .. } => "paused",
             Blocker::Stack { .. } => "stack",
+            Blocker::Expect { .. } => "expect",
             Blocker::Cpu { .. } => "cpu",
         }
     }
@@ -827,8 +841,9 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
     for e in stacks {
         for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work)) {
             let free = !x.started && !claimed(e.pid, i);
-            // A stack that waits takes only work that can take over a booking.
-            if e.started_at.is_none() && !free {
+            // A stack that waits takes only work that can take over a booking;
+            // work the history implies only while the stack still waits.
+            if (e.started_at.is_none() && !free) || (x.implied && e.started_at.is_some()) {
                 continue;
             }
             let rank = u8::from(e.started_at.is_none()) * 2 + u8::from(!free);
@@ -921,6 +936,17 @@ pub fn decide(
         return Decision::Wait { blockers: vec![Blocker::Paused { key: p.key.clone() }] };
     }
 
+    // A long-lived job that expects work waits a few seconds for it to
+    // queue, unless it already has: its caller may start the work right
+    // after it, and then it starts with room for both, and the work goes
+    // first, instead of the stack starting alone.
+    if let Some(until) = me.expect_until.filter(|u| *u > now && me.started_at.is_none())
+        && !waiting.iter().any(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid))
+    {
+        let work = me.expects.iter().map(|x| x.work.clone()).collect();
+        return Decision::Wait { blockers: vec![Blocker::Expect { work, wait_s: until - now }] };
+    }
+
     // Always make progress: with nothing running, the first job in line that
     // fits starts, whatever the CPU reading says and up to all of RAM. This is
     // what keeps the queue from deadlocking on a machine that is busy with
@@ -973,7 +999,17 @@ pub fn decide(
     // keep it out: it starts once the running jobs have made room for it, or
     // when none runs, which they do not put off. A job that may start on part
     // of its need (`partial_fit`) waits only for that part.
+    //
+    // Work queued for a long-lived job is what that job exists for: the
+    // long-lived job it waits for, and that work once its long-lived job
+    // runs, hold their turn as a strict reservation does, also while they do
+    // not fit yet. Otherwise a stream of lints keeps taking the room a stack
+    // and its run need together, until the caller gives up on the run.
+    let queued_for = |w: &Entry| w.work_for.is_some() || waiting.iter().any(|x| x.work_for.as_ref().is_some_and(|l| l.pid == w.pid));
     let holds = |w: &Entry| {
+        if queued_for(w) {
+            return true;
+        }
         let (mut theirs, _) = room.left(m, lim, running, w, now, unknown_starts);
         if theirs.is_empty() {
             return true;
@@ -1629,7 +1665,8 @@ mod tests {
         // What this version adds reads back, and leaves the rest alone.
         let stack = Entry {
             long_lived: true,
-            expects: vec![Expect { work: "browser".into(), mem_kb: 4, from: "x".into(), started: true }],
+            expects: vec![Expect { work: "browser".into(), mem_kb: 4, from: "x".into(), started: true, implied: true }],
+            expect_until: Some(5.0),
             work_for: Some(WorkFor { pid: 9, key: "s".into(), item: Some(0) }),
             ..older
         };
@@ -2542,6 +2579,72 @@ mod tests {
         // behind it in line starts.
         assert_eq!(blockers(decide(&m, &LIM, &[], &waiting, &run, 1000.0, &[])), vec!["stack"]);
         assert!(blockers(decide(&m, &LIM, &[], &waiting, &stack, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_stack_that_expects_work_waits_a_few_seconds_for_it_to_queue() {
+        let stack = Entry {
+            pid: 11,
+            long_lived: true,
+            priority: 10,
+            queued_at: 1000.0,
+            expect_until: Some(1005.0),
+            ..expecting(job(2, "dev-env:stack", 3.0, 9))
+        };
+        let m = machine(1.0, 4);
+        let alone = std::slice::from_ref(&stack);
+        let d = decide(&m, &LIM, &[], alone, &stack, 1002.0, &[]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Expect { wait_s, .. } if *wait_s == 3.0)),
+            "{d:?}"
+        );
+        // The run queued: the stack starts now, with room for both, and the
+        // run waits for it.
+        let run = run_for(Some(0));
+        let both = [stack.clone(), run.clone()];
+        assert!(blockers(decide(&m, &LIM, &[], &both, &stack, 1002.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &LIM, &[], &both, &run, 1002.0, &[])), vec!["stack"]);
+        // Nothing queued: after the wait it starts alone.
+        assert!(blockers(decide(&m, &LIM, &[], alone, &stack, 1005.0, &[])).is_empty());
+        // A stack that expects nothing never waits.
+        let plain = Entry { expects: Vec::new(), expect_until: None, ..stack.clone() };
+        assert!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_stack_with_work_queued_for_it_holds_its_turn_also_before_it_fits() {
+        // DALP's max_backfill: a job ahead holds its turn only while it could
+        // start, for half an hour.
+        let lim = Limits { max_backfill: 1800.0, ..LIM };
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 9)) };
+        let lint = job(4, "lint", 1.0, 1);
+        let busy = [Entry { started_at: Some(990.0), est_dur_s: Some(20.0), ..job(5, "build", 0.5, 12) }];
+        // 4 GB held + 12 reserved + 13.3 for the stack and its run: it waits.
+        let m = machine(1.0, 4);
+        // Alone, it lets the lint that fits start meanwhile, as before.
+        let waiting = [stack.clone(), lint.clone()];
+        assert!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])).is_empty());
+        // With its run queued for it, the lint waits: the room is theirs.
+        let waiting = [stack.clone(), run_for(Some(0)), lint.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        // Not when it could only start once a stack is stopped: 14 GB held
+        // by other programs and 13.3 GB more is over the 27.2 GB limit.
+        let m = machine(1.0, 14);
+        assert!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn work_the_history_implies_links_only_while_the_stack_waits() {
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0] = Expect { work: "browser".into(), implied: true, ..Default::default() };
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(3, "pr.ts", 3.0, 4) };
+        let is = |w: &str| w == "browser";
+        // It books nothing.
+        assert_eq!(reserve(std::slice::from_ref(&stack)).1, stack.need_mem_kb - stack.live_mem_kb);
+        // Up already: a run that queues now is no evidence of anything.
+        assert!(link_work(&me, std::slice::from_ref(&stack), &[], is).is_none());
+        let waiting = Entry { started_at: None, ..stack };
+        assert_eq!(link_work(&me, &[], std::slice::from_ref(&waiting), is).unwrap().0.item, Some(0));
     }
 
     #[test]

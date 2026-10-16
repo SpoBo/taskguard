@@ -130,6 +130,10 @@ pub struct Agent {
     /// what browser runs typically took, less than the run's own need.
     pub declares: bool,
     pub booking_kb: u64,
+    /// The agent queues its run 2 s after its stack, not once the stack is up.
+    pub with_stack: bool,
+    /// Undeclared, but the history says a browser run follows its stacks.
+    pub implied: bool,
 }
 
 pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
@@ -148,6 +152,8 @@ pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
         pause_s: 30.0,
         declares: false,
         booking_kb: 36 * GB / 10,
+        with_stack: false,
+        implied: false,
     }
 }
 
@@ -183,6 +189,8 @@ pub struct Scenario {
     /// The scout's fallback, for comparison: a steady stack books what it
     /// holds, without room to grow.
     pub steady_books_live: bool,
+    /// `expect_wait`.
+    pub expect_wait: f64,
 }
 
 /// What came of it.
@@ -200,6 +208,8 @@ pub struct Outcome {
     pub over_limit_s: f64,
     pub lints_done: usize,
     pub worst_stack_wait: f64,
+    /// Runs that started while their stack did not run: they fail.
+    pub runs_without_stack: usize,
     /// When each of `Scenario::jobs` started, if it did.
     pub job_started: Vec<Option<f64>>,
 }
@@ -212,12 +222,24 @@ struct Live {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Phase {
-    Idle { until: f64 },
-    StackQueued,
+    Idle {
+        until: f64,
+    },
+    /// The stack waits or starts; the run queues at `run_at` when the agent
+    /// queues it together with the stack.
+    StackQueued {
+        run_at: Option<f64>,
+    },
     StackUp,
-    RunQueued { since: f64 },
-    RunRunning { until: f64 },
-    Down { at: f64 },
+    RunQueued {
+        since: f64,
+    },
+    RunRunning {
+        until: f64,
+    },
+    Down {
+        at: f64,
+    },
 }
 
 pub fn run(s: &Scenario) -> Outcome {
@@ -274,6 +296,13 @@ pub fn run(s: &Scenario) -> Outcome {
             match phase[n] {
                 Phase::Idle { until } if t >= until => {
                     ticket += 1;
+                    let expects = if a.declares {
+                        vec![Expect { work: "browser".into(), mem_kb: a.booking_kb, ..Default::default() }]
+                    } else if a.implied {
+                        vec![Expect { work: "browser".into(), implied: true, ..Default::default() }]
+                    } else {
+                        Vec::new()
+                    };
                     let e = Entry {
                         ticket,
                         pid: stack_pid,
@@ -286,18 +315,19 @@ pub fn run(s: &Scenario) -> Outcome {
                         known: true,
                         priority: 10,
                         long_lived: true,
-                        expects: if a.declares {
-                            vec![Expect { work: "browser".into(), mem_kb: a.booking_kb, ..Default::default() }]
-                        } else {
-                            Vec::new()
-                        },
+                        expect_until: (!expects.is_empty() && s.expect_wait > 0.0).then_some(t + s.expect_wait),
+                        expects,
                         ..Default::default()
                     };
                     waiting.push((e, Kind::Stack(n)));
-                    phase[n] = Phase::StackQueued;
+                    phase[n] = Phase::StackQueued { run_at: a.with_stack.then_some(t + 2.0) };
                 }
-                Phase::StackQueued => {
-                    if let Some(r) = running.iter().find(|r| r.kind == Kind::Stack(n))
+                Phase::StackQueued { run_at } => {
+                    if run_at.is_some_and(|at| t >= at) {
+                        ticket += 1;
+                        waiting.push((run_entry(n, a, ticket, t), Kind::Run(n)));
+                        phase[n] = Phase::RunQueued { since: t };
+                    } else if let Some(r) = running.iter().find(|r| r.kind == Kind::Stack(n))
                         && t - r.started >= a.stack_ramp_s
                     {
                         phase[n] = Phase::StackUp;
@@ -305,21 +335,7 @@ pub fn run(s: &Scenario) -> Outcome {
                 }
                 Phase::StackUp => {
                     ticket += 1;
-                    let e = Entry {
-                        ticket,
-                        pid: 2000 + n as i32,
-                        key: format!("e2e/agentic:bun_src/pr.ts_--pr_{}", 17397 + n),
-                        pool: Some("browser".into()),
-                        checkout: checkout(n),
-                        queued_at: t,
-                        need_cpu: a.run_cpu,
-                        need_mem_kb: a.run_need_kb,
-                        known: true,
-                        raised_by_min: true,
-                        est_dur_s: Some(a.run_s),
-                        ..Default::default()
-                    };
-                    waiting.push((e, Kind::Run(n)));
+                    waiting.push((run_entry(n, a, ticket, t), Kind::Run(n)));
                     phase[n] = Phase::RunQueued { since: t };
                 }
                 Phase::RunQueued { since } => {
@@ -342,6 +358,7 @@ pub fn run(s: &Scenario) -> Outcome {
                 }
                 Phase::Down { at } if t >= at => {
                     running.retain(|r| r.kind != Kind::Stack(n));
+                    waiting.retain(|(_, k)| *k != Kind::Stack(n));
                     phase[n] = Phase::Idle { until: t + a.pause_s };
                 }
                 _ => {}
@@ -449,9 +466,25 @@ pub fn run(s: &Scenario) -> Outcome {
                     waiting[i].0.work_for = Some(link);
                 }
             }
+            // As the runner does: a waiting stack books at least what the
+            // work that queued for it needs.
+            if waiting[i].0.long_lived {
+                let pid = waiting[i].0.pid;
+                for x in 0..waiting[i].0.expects.len() {
+                    let theirs = all
+                        .iter()
+                        .filter(|w| w.work_for.as_ref().is_some_and(|l| l.pid == pid && l.item == Some(x as u32)))
+                        .map(|w| w.need_mem_kb)
+                        .max()
+                        .unwrap_or(0);
+                    let item = &mut waiting[i].0.expects[x];
+                    item.mem_kb = item.mem_kb.max(theirs);
+                }
+            }
             let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
             let (me, kind) = waiting[i].clone();
-            if matches!(decide(&m, &s.lim, &run_now, &all, &me, t, &[]), Decision::Admit { .. }) {
+            let d = decide(&m, &s.lim, &run_now, &all, &me, t, &[]);
+            if matches!(d, Decision::Admit { .. }) {
                 // The nudge to the stack: its work has started.
                 if let Some(w) = &me.work_for
                     && let Some(i) = w.item
@@ -468,6 +501,11 @@ pub fn run(s: &Scenario) -> Outcome {
                 if let Kind::Job(n) = kind {
                     out.job_started[n] = Some(t);
                 }
+                if let Kind::Run(n) = kind
+                    && !running.iter().any(|r| r.kind == Kind::Stack(n))
+                {
+                    out.runs_without_stack += 1;
+                }
                 let e = Entry { started_at: Some(t), start_need_cpu: Some(me.need_cpu), start_need_mem_kb: Some(me.need_mem_kb), ..me };
                 running.push(Live { e, kind, started: t });
                 waiting.remove(i);
@@ -478,6 +516,24 @@ pub fn run(s: &Scenario) -> Outcome {
         t += TICK;
     }
     out
+}
+
+/// The browser run of agent `n`.
+fn run_entry(n: usize, a: &Agent, ticket: u64, t: f64) -> Entry {
+    Entry {
+        ticket,
+        pid: 2000 + n as i32,
+        key: format!("e2e/agentic:bun_src/pr.ts_--pr_{}", 17397 + n),
+        pool: Some("browser".into()),
+        checkout: format!("/w/dalp/{n}"),
+        queued_at: t,
+        need_cpu: a.run_cpu,
+        need_mem_kb: a.run_need_kb,
+        known: true,
+        raised_by_min: true,
+        est_dur_s: Some(a.run_s),
+        ..Default::default()
+    }
 }
 
 /// Does agent `n`'s run run now?
@@ -495,6 +551,7 @@ pub fn morning(outside_gb: f64) -> Scenario {
         jobs: Vec::new(),
         secs: 7200.0,
         steady_books_live: false,
+        expect_wait: 5.0,
     }
 }
 
@@ -566,7 +623,7 @@ pub fn head_of_line() -> Scenario {
     let host =
         Host { total_kb: gb(31.3), ncpu: 24, outside_kb: gb(15.8), outside_swing_kb: gb(0.3), warning_pct: None, critical_pct: 100.0 };
     let lim = Limits { warn_admit: false, ..macbook_limits() };
-    Scenario { host, lim, agents: Vec::new(), lints: None, jobs, secs: 1800.0, steady_books_live: false }
+    Scenario { host, lim, agents: Vec::new(), lints: None, jobs, secs: 1800.0, steady_books_live: false, expect_wait: 5.0 }
 }
 
 /// The longest a small job (under 1 GB) of `s` waited, or the scenario's
@@ -628,6 +685,26 @@ mod tests {
             eprintln!("{}", row(&format!("outside {outside} GB, steady books live"), &run(&live)));
             let both = Scenario { steady_books_live: true, ..declared_morning(outside) };
             eprintln!("{}", row(&format!("outside {outside} GB, declared + live"), &run(&both)));
+        }
+    }
+
+    #[test]
+    fn a_stack_and_its_run_queued_together() {
+        eprintln!("{}", header());
+        for outside in [11.0, 12.8, 14.5] {
+            for (name, declares, implied, wait) in [
+                ("nothing", false, false, 5.0),
+                ("history implies", false, true, 5.0),
+                ("declared", true, false, 5.0),
+                ("declared, no wait", true, false, 0.0),
+            ] {
+                let mut s = Scenario { expect_wait: wait, ..morning(outside) };
+                for a in &mut s.agents {
+                    (a.with_stack, a.declares, a.implied) = (true, declares, implied);
+                }
+                let o = run(&s);
+                eprintln!("{} {:>3} without stack", row(&format!("together {outside} GB, {name}"), &o), o.runs_without_stack);
+            }
         }
     }
 

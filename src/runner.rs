@@ -375,10 +375,26 @@ pub fn run(mut o: Opts) -> Result<i32> {
     if startup.is_none() && !o.expect.is_empty() && !o.quiet {
         say(&format!("warning {jkey} - --expect is for a long-lived job (long_lived = true); ignored"));
     }
-    let expects: Vec<queue::Expect> = match startup {
+    let mut expects: Vec<queue::Expect> = match startup {
         Some(_) => work.iter().map(|w| need::expected(database.as_ref(), &cfg, &cwd, w)).collect(),
         None => Vec::new(),
     };
+    // Without a declaration, the history may still say that work follows
+    // this job in this checkout: what queued there while at least half of
+    // its last runs (two at least) ran. That books nothing; it only makes
+    // the job wait `expect_wait` for such work to queue with it.
+    let expect_wait = cfg.expect_wait.clamp(0.0, 60.0);
+    if startup.is_some()
+        && expects.is_empty()
+        && expect_wait > 0.0
+        && let Some((n, works)) = database.as_ref().and_then(|d| d.followers(&jkey, pool.as_deref(), &checkout.to_string_lossy(), 5).ok())
+        && n >= 2
+    {
+        for (w, c) in works.into_iter().filter(|(_, c)| c * 2 >= n) {
+            let from = format!("not declared; it queued while {c} of the last {n} runs of {jkey} in this checkout ran");
+            expects.push(queue::Expect { work: w, from, implied: true, ..Default::default() });
+        }
+    }
     let estimate_from = guess.as_ref().map(|g| g.from.clone());
     let est_dur = guess.as_ref().and_then(|g| g.dur_s);
 
@@ -465,9 +481,19 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let conf_mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut seen_mtime = conf_mtime(&conf_path);
 
+    // It waits a few seconds for that work to queue, so it starts with room
+    // for both; a job with nothing to expect starts as before.
+    if !me.expects.is_empty() && expect_wait > 0.0 {
+        me.expect_until = Some(me.queued_at + expect_wait);
+    }
     if !o.quiet {
         for x in &me.expects {
-            say(&format!("expects {} - {} books {} for it until it starts ({})", x.work, me.key, report::gb(x.mem_kb), x.from));
+            let wait = me.expect_until.map(|_| format!("; it waits up to {expect_wait:.0}s for it to queue")).unwrap_or_default();
+            if x.implied {
+                say(&format!("expects {} - {}: it books room only once that work queues{wait}", x.work, x.from));
+            } else {
+                say(&format!("expects {} - {} books {} for it until it starts ({}){wait}", x.work, me.key, report::gb(x.mem_kb), x.from));
+            }
         }
     }
     // The priority without the lift that work for a long-lived job gets.

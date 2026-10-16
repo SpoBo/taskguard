@@ -30,6 +30,12 @@ and the versions follow [semver](https://semver.org).
   waits while its stack still waits. `taskguard status` shows `(for stack
   KEY)` on the work and `(expects WORK, books SIZE)` on the stack. Without a
   declaration nothing changes.
+- `expect_wait` (5 seconds by default, 0 turns it off): a long-lived job that
+  declares work, or whose history in its checkout says work follows it (on at
+  least half of its last runs there, two at least), waits that long before it
+  starts for the work to queue, so a stack and a run started together start
+  with room for both. Work the history implies books nothing until it
+  queues. A stack with neither starts at once.
 
 ### Changed
 
@@ -43,6 +49,9 @@ and the versions follow [semver](https://semver.org).
   has ended holds nobody back, whatever its priority or reservation: it can
   only start once a long-lived job is stopped or other programs free memory,
   and the small jobs behind it start meanwhile.
+- A stack with work queued for it, and work whose stack runs, hold their turn
+  as a strict reservation, also while they do not fit yet, rather than letting
+  jobs that fit start meanwhile (backfill).
 
 ### Fixed
 

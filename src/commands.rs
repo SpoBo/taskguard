@@ -483,8 +483,8 @@ pub fn doctor(args: &[String]) -> Result<i32> {
     println!("namespace here: {}", key::namespace(&cwd));
     println!();
     println!(
-        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  partial_fit {}  hints {}",
-        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.partial_fit, cfg.hints
+        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  partial_fit {}  expect_wait {}s  hints {}",
+        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.partial_fit, cfg.expect_wait, cfg.hints
     );
     for (k, v) in &cfg.origin {
         if v != "built-in" {

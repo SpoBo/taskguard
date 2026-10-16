@@ -62,6 +62,11 @@ pub fn blocker_text(b: &Blocker) -> String {
         }
         Blocker::Paused { key } => format!("{key} is paused for memory; it resumes before anything new starts"),
         Blocker::Stack { key } => format!("work for {key}, which has not started yet; it starts after it"),
+        Blocker::Expect { work, wait_s } => format!(
+            "waits up to {:.0}s more for the work it expects ({}) to queue, so it starts with room for both",
+            wait_s.ceil(),
+            work.join(", ")
+        ),
         Blocker::Memory { would_pct, limit_pct, short_kb, .. } => {
             format!("memory: would reach {would_pct:.0}% (limit {limit_pct:.0}%), {} short", gb(*short_kb))
         }
@@ -169,6 +174,7 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
         Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
         Blocker::Stack { key } => (format!("starts after {key} has started"), None),
+        Blocker::Expect { wait_s, .. } => (format!("decides in at most {:.0}s", wait_s.ceil()), Some(*wait_s)),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
@@ -544,7 +550,7 @@ pub fn link_text(e: &Entry, running: &[Entry]) -> String {
     if let Some(w) = &e.work_for {
         t += &format!(" (for stack {})", w.key);
     }
-    let open: Vec<&str> = e.expects.iter().filter(|x| !x.started).map(|x| x.work.as_str()).collect();
+    let open: Vec<&str> = e.expects.iter().filter(|x| !x.started && (!x.implied || x.mem_kb > 0)).map(|x| x.work.as_str()).collect();
     if !open.is_empty() {
         t += &format!(" (expects {}, books {})", open.join(", "), gb(booked(e, running)));
     }

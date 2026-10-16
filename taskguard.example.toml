@@ -71,6 +71,10 @@ max_backfill = 600    # until a reserved job has waited this many seconds, newer
                       # before it could start anyway, so the machine drains for it.
                       # 0 (or anything up to max_bypass) = never.
                       # taskguard 0.1.6 and older reject a file that sets it.
+expect_wait = 5       # seconds a long-lived job (a dev stack) waits before it starts for the
+                      # work it expects to queue, so it starts with room for both. Only when
+                      # it declares work (--expect, TASKGUARD_EXPECT) or its history says work
+                      # follows it in that checkout. 0 = never; at most 60.
 boost_runs = 5        # runs that get +25% memory after a memory-starved run
 # A peak more than outlier_ratio times the next peak below it, and outlier_min
 # above it, is an outlier. Outliers count by outlier_weights: the first entry

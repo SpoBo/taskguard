@@ -569,7 +569,7 @@ fn a_long_lived_job_holds_its_peak_only_through_its_start_up() {
 #[test]
 fn a_stack_books_the_work_it_expects_and_that_work_goes_first() {
     let e = Env::new(
-        "sample_every = 0.2\nnew_job_mem = \"700M\"\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n",
+        "sample_every = 0.2\nnew_job_mem = \"700M\"\nexpect_wait = 0.5\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n",
     );
     // The caller of the stack says a browser run will follow (DALP passes the
     // variable through `devenv up`).
@@ -599,6 +599,26 @@ fn a_stack_books_the_work_it_expects_and_that_work_goes_first() {
     // Any other job ignores the variable; --expect on it says so.
     let other = e.run(&["--expect", "browser", "--", "true"]);
     assert!(stderr(&other).contains("--expect is for a long-lived job"), "{}", stderr(&other));
+    unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    let _ = stack.wait();
+}
+
+#[test]
+fn a_stack_waits_for_the_work_it_expects_when_both_queue_together() {
+    let e =
+        Env::new("sample_every = 0.2\nexpect_wait = 20\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n");
+    let mut stack = e.cmd(&["--id", "stack", "--expect", "browser", "--", "sh", "-c", "touch up; sleep 30"]);
+    let mut stack = stack.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let t = Instant::now();
+    // The run queues a moment later: the stack, which waits for it, starts
+    // at once, and the run after it.
+    std::thread::sleep(Duration::from_millis(300));
+    let run = e.run(&["--id", "browser", "--", "true"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert!(t.elapsed() < Duration::from_secs(15), "the stack did not wait out expect_wait: {:?}", t.elapsed());
+    assert!(stderr(&run).contains("for stack "), "{}", stderr(&run));
+    let started = |pool: &str| -> f64 { e.db().query_row("SELECT started_at FROM runs WHERE pool = ?1", [pool], |r| r.get(0)).unwrap() };
+    assert!(started("browser") >= started("stack"), "the run starts only once its stack runs");
     unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
     let _ = stack.wait();
 }
