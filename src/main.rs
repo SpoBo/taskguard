@@ -21,6 +21,8 @@ mod report;
 mod runner;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod stall;
 mod sys;
 mod top;
 
