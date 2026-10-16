@@ -228,9 +228,10 @@ below).
   run is admitted against, and what it took after. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
   nothing else runs, the first in line that fits starts. A waiting long-lived
-  job itself starts that way only under `mem_max`, or, when only programs
-  outside taskguard keep it out, up to the ceiling `outside_admit` allows:
-  nothing taskguard runs would free that memory. `auto_pause` leaves it
+  job itself starts that way next to it only under `mem_max`, or, when only
+  programs outside taskguard keep it out, up to the ceiling `outside_admit`
+  allows. With nothing of taskguard's running at all, it starts up to all of
+  RAM: nothing taskguard runs would free that memory. `auto_pause` leaves it
   alone. `taskguard status` marks it `STEADY`, and a job it keeps out says it
   starts when the stack is stopped, not when it finishes.
 - **Work for a long-lived job goes first.** The caller that starts a dev
@@ -275,13 +276,15 @@ below).
   - another stack respects it while it is open, also one whose caller
     declared no work, so the room is there when the work comes. Such a stack
     leaves only its own guess out, starts at once when it still fits next to
-    the open guess, and otherwise waits at most until the guess expires;
+    the open guess, and otherwise waits at most until the guess expires or
+    its work starts;
   - a declaration always wins: a stack with `--expect` books only what was
     declared, and `--expect none` expects nothing at all;
   - `infer_work = false` turns it off.
 
   Once the work has queued, its room is no guess any more and is booked as
-  declared work is.
+  declared work is: it does not expire while that work waits, and it ends
+  when the work starts, or, past its time, when the work leaves the queue.
 - **A stack waits a few seconds for its work.** A caller may start the stack
   and its work at the same moment, not one after the other. So a long-lived
   job that expects work, declared or from its history, waits up to

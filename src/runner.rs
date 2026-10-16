@@ -84,17 +84,6 @@ fn apply_work_started(me: &mut Entry, n: &queue::Nudge) -> bool {
     changed
 }
 
-/// A guess of the history that did not come true in time: its booking ends.
-fn expire_guesses(me: &mut Entry, now: f64) -> bool {
-    let started = me.started_at.unwrap_or(now);
-    let mut changed = false;
-    for x in me.expects.iter_mut().filter(|x| x.open() && x.expire_after_s.is_some_and(|a| now - started > a)) {
-        x.expired = true;
-        changed = true;
-    }
-    changed
-}
-
 /// The longest a booking on the history's guess lasts after its job started.
 const GUESS_MAX_S: f64 = 600.0;
 
@@ -918,7 +907,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
                 }
             }
-            if expire_guesses(&mut me, now) {
+            if me.expects.iter().any(|x| x.due(me.started_at.unwrap_or(now), now)) && queue::expire_guesses(&mut me, &q.waiting(), now) {
                 let _ = q.write(&q.run_path(me_pid), &me);
                 say(&format!("expected {} - the work its history suggested did not come in time; it no longer books room for it", me.key));
             }
@@ -1321,8 +1310,8 @@ mod tests {
         let declared = queue::Expect { work: "e2e".into(), mem_kb: 4, ..Default::default() };
         let stack = Entry { started_at: Some(1000.0), expects: vec![declared, guess], ..Default::default() };
         let mut s = stack.clone();
-        assert!(!expire_guesses(&mut s, 1600.0));
-        assert!(expire_guesses(&mut s, 1601.0));
+        assert!(!queue::expire_guesses(&mut s, &[], 1600.0));
+        assert!(queue::expire_guesses(&mut s, &[], 1601.0));
         assert!(!s.expects[0].expired && s.expects[1].expired, "only the guess expires");
         // Work for the stack started: the guess goes with it.
         let mut s = stack;

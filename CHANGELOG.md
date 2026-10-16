@@ -39,12 +39,13 @@ and the versions follow [semver](https://semver.org).
   drops it once work for the stack starts. While the guess is open the
   stack waits `expect_wait` for the work, and matching work links to it and
   goes first; an expired or started guess links nothing, and work linked to
-  it drops back to its own priority. The guess never stops the rule for
-  nothing running. Another stack respects it while it is open, also one
-  started with no declared work, so such a stack waits at most until the
-  guess expires; a stack that still fits next to it starts at once. A
-  declaration wins; `--expect none` expects nothing; `infer_work = false`
-  turns it off.
+  it drops back to its own priority. A guess whose work has queued and
+  linked to it came true: it does not expire while that work waits. The
+  guess never stops the rule for nothing running. Another stack respects it
+  while it is open, also one started with no declared work, so such a stack
+  waits at most until the guess expires or its work starts; a stack that
+  still fits next to it starts at once. A declaration wins; `--expect none`
+  expects nothing; `infer_work = false` turns it off.
 - `expect_wait` (5 seconds by default, 0 turns it off): a long-lived job that
   expects work, declared or from its history, waits that long before it
   starts for the work to queue, so a stack and a run started together start
@@ -54,12 +55,13 @@ and the versions follow [semver](https://semver.org).
 
 - With nothing running, or nothing but long-lived jobs past their start-up,
   the first job in line that fits starts, up to all of RAM, rather than the
-  first in line whatever the memory reading says. A long-lived job, such as a
-  second dev stack, starts that way only under `mem_max`, or, when only
-  programs outside taskguard keep it out, up to the ceiling `outside_admit`
-  allows. A job that does not fit holds nobody back, so the jobs behind it
-  that fit start. At macOS
-  warning this rule still decides when only long-lived jobs run.
+  first in line whatever the memory reading says. Next to long-lived jobs, a
+  long-lived job, such as a second dev stack, starts that way only under
+  `mem_max`, or, when only programs outside taskguard keep it out, up to the
+  ceiling `outside_admit` allows. With nothing of taskguard's running, it
+  starts up to all of RAM, as before. A job that does not fit holds nobody
+  back, so the jobs behind it that fit start. At macOS warning this rule
+  still decides when only long-lived jobs run.
 - A waiting job that would not fit even once every job that ends by itself
   has ended holds nobody back, whatever its priority or reservation: it can
   only start once a long-lived job is stopped or other programs free memory,

@@ -156,6 +156,27 @@ impl Expect {
     pub fn open(&self) -> bool {
         !self.started && !self.expired
     }
+
+    /// A guess whose time is up, for a job that started at `started`.
+    pub fn due(&self, started: f64, now: f64) -> bool {
+        self.open() && self.expire_after_s.is_some_and(|a| now - started > a)
+    }
+}
+
+/// A guess of the history that did not come true in time: its booking ends.
+/// One whose work has queued and linked to it came true: it stays booked
+/// while that work waits, until the work starts or leaves the queue.
+pub fn expire_guesses(e: &mut Entry, waiting: &[Entry], now: f64) -> bool {
+    let (pid, started) = (e.pid, e.started_at.unwrap_or(now));
+    let linked = |i: usize| waiting.iter().any(|w| w.work_for.as_ref().is_some_and(|l| l.pid == pid && l.item == Some(i as u32)));
+    let mut changed = false;
+    for (i, x) in e.expects.iter_mut().enumerate() {
+        if x.due(started, now) && !linked(i) {
+            x.expired = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The long-lived job a job is work for, and which of its `expects` it
@@ -996,12 +1017,14 @@ pub fn decide(
     // hold up the whole queue until it is stopped.
     //
     // A job that does not fit even so holds nobody back: it waits for memory,
-    // and the jobs behind it that fit start meanwhile. A long-lived job must
-    // fit under `mem_max`: it does not end by itself, so starting it over the
-    // limit is no progress but load that stays, and a second dev stack
-    // started that way kept the first one's run out until it was given up.
-    // Only when programs outside taskguard alone keep it out may it go up to
-    // the ceiling of `outside_admit`: nothing taskguard runs would free that.
+    // and the jobs behind it that fit start meanwhile. Next to long-lived
+    // jobs, a long-lived job must fit under `mem_max`: it does not end by
+    // itself, so starting it over the limit is no progress but load that
+    // stays, and a second dev stack started that way kept the first one's
+    // run out until it was given up. Only when programs outside taskguard
+    // alone keep it out may it go up to the ceiling of `outside_admit`, and
+    // with nothing of taskguard's running, up to all of RAM: nothing taskguard
+    // runs would free that.
     let room = Room::new(m, lim, running);
     if running.iter().all(Entry::steady) {
         let fits = |w: &Entry| room.fits_on_progress(m, lim, running, w);
@@ -1377,13 +1400,15 @@ impl Room {
     }
 
     /// The most memory a job may take the machine to by the progress rule:
-    /// all of RAM, as nothing else of taskguard's would come after it; a
-    /// long-lived job, which stays, only `mem_max` (with `noise_mem`), or
-    /// when only programs outside taskguard keep it out, the ceiling of
-    /// `outside_admit`: nothing taskguard runs would free that.
+    /// all of RAM, as nothing else of taskguard's would come after it. A
+    /// long-lived job, which stays, next to long-lived jobs of taskguard's,
+    /// only `mem_max` (with `noise_mem`), or when only programs outside
+    /// taskguard keep it out, the ceiling of `outside_admit`. With nothing of
+    /// taskguard's running, it too goes up to all of RAM: nothing taskguard
+    /// runs would free the rest.
     fn progress_ceiling(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> f64 {
         let total = m.mem_total_kb as f64;
-        if !job.long_lived {
+        if !job.long_lived || self.running.is_empty() {
             return total;
         }
         let ceiling = self.mem_limit + total * lim.noise_mem_pct / 100.0;
@@ -1410,6 +1435,7 @@ impl Room {
             mem_used: self.mem_used.saturating_sub(self.passing_live),
             ours_mem: self.ours_mem.saturating_sub(self.passing_live),
             res_mem: self.res_mem.saturating_sub(self.passing_res),
+            running: lasting.clone(),
             ..self.clone()
         };
         drained.fits_on_progress(m, lim, &lasting, job)
@@ -2493,9 +2519,10 @@ mod tests {
         // The run fits under all of RAM (30 GB of 32), and starts.
         let d = decide(&m, &lim, r, &waiting, &run_a, 1000.0, &[]);
         assert!(matches!(&d, Decision::Admit { reason, .. } if reason.contains("long-lived")), "{d:?}");
-        // With nothing running at all, a stack still has to fit under mem_max.
-        assert_eq!(blockers(decide(&machine(1.0, 22), &lim, &[], &waiting, &stack_b, 1000.0, &[])), vec!["memory"]);
-        assert!(blockers(decide(&machine(1.0, 20), &lim, &[], &waiting, &stack_b, 1000.0, &[])).is_empty());
+        // With nothing running at all, a stack starts up to all of RAM: 22 +
+        // 9.4 GB fits in 32, 23 + 9.4 does not.
+        assert!(blockers(decide(&machine(1.0, 22), &lim, &[], &waiting, &stack_b, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&machine(1.0, 23), &lim, &[], &waiting, &stack_b, 1000.0, &[])), vec!["memory"]);
         // At macOS warning the same holds: the run starts next to its stack.
         let mut warn = m.clone();
         warn.mem_pressure = Some(50.0);
@@ -2781,22 +2808,63 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_stack_is_kept_out_by_other_programs_only_up_to_the_outside_admit_ceiling() {
-        // 32 GB, mem_max 85 (27.2 GB), outside_admit up to 95% (30.4 GB). Nothing
-        // of taskguard runs; other programs hold 20 GB and a 9 GB stack would
-        // take the machine to 29 GB: only they keep it out, and nothing
-        // taskguard runs would free that. It starts as outside_admit allows.
-        let lim = Limits { outside_admit: true, ..LIM };
+    fn a_lone_stack_is_never_kept_out_by_other_programs_alone() {
+        // 32 GB, mem_max 85 (27.2 GB). Nothing of taskguard runs; other
+        // programs hold 22 GB and a 9 GB stack would take the machine to 31
+        // GB: only they keep it out, and nothing taskguard runs would free
+        // that. It starts up to all of RAM, whatever outside_admit and its
+        // ceiling say.
         let stack = Entry { long_lived: true, priority: 10, ..job(1, "dev-env:stack", 3.0, 9) };
         let me = std::slice::from_ref(&stack);
-        assert!(blockers(decide(&machine(1.0, 20), &lim, &[], me, &stack, 1000.0, &[])).is_empty());
-        // Past that ceiling memory stays a hard rule; without the leeway it waits.
-        assert_eq!(blockers(decide(&machine(1.0, 22), &lim, &[], me, &stack, 1000.0, &[])), vec!["memory"]);
-        assert_eq!(blockers(decide(&machine(1.0, 20), &LIM, &[], me, &stack, 1000.0, &[])), vec!["memory"]);
+        for lim in [
+            LIM,
+            Limits { outside_admit: true, ..LIM },
+            Limits { outside_admit: true, outside_mem_max_pct: 92.0, ..LIM },
+            Limits { outside_admit: false, outside_mem_max_pct: 50.0, ..LIM },
+        ] {
+            assert!(blockers(decide(&machine(1.0, 22), &lim, &[], me, &stack, 1000.0, &[])).is_empty(), "{lim:?}");
+            // Never past all of RAM: 24 + 9 GB is over 32.
+            assert_eq!(blockers(decide(&machine(1.0, 24), &lim, &[], me, &stack, 1000.0, &[])), vec!["memory"], "{lim:?}");
+        }
+        // Next to a steady stack, only programs outside taskguard keep it out
+        // (4 + 1 + 9 GB of taskguard's is under 27.2): it starts up to the
+        // outside_admit ceiling (30.4 GB), and without that leeway waits.
+        let small = steady_stack(12, 4);
+        let r = std::slice::from_ref(&small);
+        let lim = Limits { outside_admit: true, ..LIM };
+        assert!(blockers(decide(&machine(1.0, 20), &lim, r, me, &stack, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&machine(1.0, 21), &lim, r, me, &stack, 1000.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&machine(1.0, 20), &LIM, r, me, &stack, 1000.0, &[])), vec!["memory"]);
         // When a steady stack of taskguard's fills the room, outside programs
         // are no excuse: 16 + 4 + 9 GB of its own is over 27.2.
         let a = steady_stack(12, 16);
         assert_eq!(blockers(decide(&machine(1.0, 17), &lim, std::slice::from_ref(&a), me, &stack, 1000.0, &[])), vec!["memory"]);
+    }
+
+    #[test]
+    fn a_guess_whose_work_queued_stays_while_that_work_waits() {
+        // The history says the run follows about 6 minutes after the stack
+        // starts: the guess expires 10 minutes in. The run queues at minute 6
+        // and links; memory pressure keeps it out past minute 10.
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), queued_at: 360.0, ..job(3, "pr.ts", 3.0, 4) };
+        let (link, priority) = link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "browser").unwrap();
+        assert_eq!((link.item, priority + 1), (Some(0), 11));
+        let run = Entry { work_for: Some(link), priority: priority + 1, ..me };
+        let waiting = std::slice::from_ref(&run);
+        // Minute 11: the guess came true, so it does not expire.
+        assert!(!expire_guesses(&mut stack, waiting, 660.0));
+        let r = std::slice::from_ref(&stack);
+        assert!(!link_lapsed(&run, r, waiting, |w| w == "browser"));
+        assert_eq!(reserve(r).1, GB + 43 * GB / 10, "it keeps the room booked for the run");
+        let mut m = machine(1.0, 20);
+        m.mem_pressure = Some(50.0);
+        assert_eq!(blockers(decide(&m, &LIM, r, waiting, &run, 660.0, &[])), vec!["pressure"]);
+        // Once the run has left the queue, the guess that is past its time ends.
+        assert!(expire_guesses(&mut stack, &[], 660.0));
+        assert_eq!(reserve(std::slice::from_ref(&stack)).1, GB);
     }
 
     #[test]

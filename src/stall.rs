@@ -21,7 +21,7 @@
 //! `cargo test stall -- --nocapture --test-threads 1` prints the tables.
 
 use crate::machine::{MachineSample, PEAK_WINDOW};
-use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, link_lapsed, link_work};
+use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, expire_guesses, link_lapsed, link_work};
 
 const GB: u64 = 1024 * 1024;
 const TICK: f64 = 1.0;
@@ -419,6 +419,7 @@ pub fn run(s: &Scenario) -> Outcome {
             }
         }
         // What each running job holds and uses now.
+        let queued: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
         for r in running.iter_mut() {
             let age = t - r.started;
             let (mem, cpu) = match r.kind {
@@ -453,10 +454,7 @@ pub fn run(s: &Scenario) -> Outcome {
             r.e.follow(mem, cpu, s.host.ncpu as f64, t, lived);
             // As the owner does: a guess of the history that did not come
             // true in time stops booking.
-            let age_now = t - r.started;
-            for x in r.e.expects.iter_mut().filter(|x| x.open() && x.expire_after_s.is_some_and(|a| age_now > a)) {
-                x.expired = true;
-            }
+            expire_guesses(&mut r.e, &queued, t);
             if s.steady_books_live && r.e.steady() {
                 r.e.need_mem_kb = mem;
             }
