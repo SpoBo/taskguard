@@ -285,8 +285,9 @@ below).
     declared, and `--expect none` expects nothing at all;
   - `infer_work = false` turns it off.
 
-  Once the work has queued, its room is no guess any more and is booked as
-  declared work is: it does not expire while that work waits, and it ends
+  Once the work has queued and linked to it, its room is no guess any more
+  and is booked as declared work is, by every rule, also the rule for
+  nothing running: it does not expire while that work waits, and it ends
   when the work starts, or, past its time, when the work leaves the queue.
 - **A stack waits a few seconds for its work.** A caller may start the stack
   and its work at the same moment, not one after the other. So a long-lived

@@ -21,7 +21,7 @@
 //! `cargo test stall -- --nocapture --test-threads 1` prints the tables.
 
 use crate::machine::{MachineSample, PEAK_WINDOW};
-use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, expire_guesses, link_lapsed, link_work};
+use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, expire_guesses, is_guess, link_lapsed, link_work};
 
 const GB: u64 = 1024 * 1024;
 const TICK: f64 = 1.0;
@@ -418,6 +418,7 @@ pub fn run(s: &Scenario) -> Outcome {
         }
         // What each running job holds and uses now.
         let queued: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
+        let ran: Vec<Entry> = running.iter().map(|r| r.e.clone()).collect();
         for r in running.iter_mut() {
             let age = t - r.started;
             let (mem, cpu) = match r.kind {
@@ -452,7 +453,7 @@ pub fn run(s: &Scenario) -> Outcome {
             r.e.follow(mem, cpu, s.host.ncpu as f64, t, lived);
             // As the owner does: a guess of the history that did not come
             // true in time stops booking.
-            expire_guesses(&mut r.e, &queued, t);
+            expire_guesses(&mut r.e, &ran, &queued, t);
             if s.steady_books_live && r.e.steady() {
                 r.e.need_mem_kb = mem;
             }
@@ -521,9 +522,6 @@ pub fn run(s: &Scenario) -> Outcome {
                         .unwrap_or(0);
                     let item = &mut waiting[i].0.expects[x];
                     item.mem_kb = item.mem_kb.max(theirs);
-                    if theirs > 0 {
-                        (item.implied, item.expire_after_s) = (false, None);
-                    }
                 }
             }
             let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
@@ -536,8 +534,8 @@ pub fn run(s: &Scenario) -> Outcome {
                     && let Some(st) = running.iter_mut().find(|r| r.e.pid == w.pid)
                 {
                     st.e.expects[i as usize].started = true;
-                    for x in st.e.expects.iter_mut().filter(|x| x.implied) {
-                        x.started = true;
+                    for g in (0..st.e.expects.len()).filter(|&g| is_guess(&st.e, g, &run_now, &all)).collect::<Vec<_>>() {
+                        st.e.expects[g].started = true;
                     }
                 }
                 for (w, _) in waiting.iter_mut().filter(|(w, _)| w.ahead_of(&me) && w.bypassed_since.is_none()) {

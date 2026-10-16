@@ -66,8 +66,8 @@ fn is_work(work: &str, me: &Entry, cmd: &[String]) -> bool {
 
 /// Mark the expected work a nudge says has started.
 /// Once work for it has started, a long-lived job also drops what it booked
-/// on the history's guess: the work came.
-fn apply_work_started(me: &mut Entry, n: &queue::Nudge) -> bool {
+/// on the history's guess (`queue::is_guess`): the work came.
+fn apply_work_started(me: &mut Entry, n: &queue::Nudge, running: &[Entry], waiting: &[Entry]) -> bool {
     let mut changed = false;
     for i in &n.work_started {
         if let Some(x) = me.expects.get_mut(*i as usize).filter(|x| !x.started) {
@@ -76,8 +76,8 @@ fn apply_work_started(me: &mut Entry, n: &queue::Nudge) -> bool {
         }
     }
     if !n.work_started.is_empty() {
-        for x in me.expects.iter_mut().filter(|x| x.implied && x.open()) {
-            x.started = true;
+        for i in (0..me.expects.len()).filter(|&i| me.expects[i].open() && queue::is_guess(me, i, running, waiting)).collect::<Vec<_>>() {
+            me.expects[i].started = true;
             changed = true;
         }
     }
@@ -629,22 +629,20 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 if let Some(n) = q.take_nudge(me_pid) {
                     apply_nudge(&mut me, &n, database.as_ref());
-                    apply_work_started(&mut me, &n);
+                    apply_work_started(&mut me, &n, &running, &waiting);
                     started_by_hand |= n.start;
                 }
                 link_to_stack(&mut me, own_priority, &running, &waiting, &o.cmd, o.quiet);
                 // Work that queued for this long-lived job may need more than
-                // was booked for it: book that. Work the history guessed that
-                // has queued is a guess no more.
+                // was booked for it: book that.
                 for (i, x) in me.expects.iter_mut().enumerate() {
                     let theirs = waiting
                         .iter()
                         .filter(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me_pid && l.item == Some(i as u32)))
                         .max_by_key(|w| w.need_mem_kb);
-                    if let Some(w) = theirs.filter(|w| w.need_mem_kb > x.mem_kb || x.implied) {
-                        x.mem_kb = x.mem_kb.max(w.need_mem_kb);
+                    if let Some(w) = theirs.filter(|w| w.need_mem_kb > x.mem_kb) {
+                        x.mem_kb = w.need_mem_kb;
                         x.from = format!("the need of {}, which queued for it", w.key);
-                        (x.implied, x.expire_after_s) = (false, None);
                     }
                 }
                 let mut waiting = waiting;
@@ -887,7 +885,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
             }
             if let Some(n) = q.take_nudge(me_pid) {
                 apply_nudge(&mut me, &n, database.as_ref());
-                if apply_work_started(&mut me, &n) {
+                if !n.work_started.is_empty() && apply_work_started(&mut me, &n, &q.running(), &q.waiting()) {
                     let _ = q.write(&q.run_path(me_pid), &me);
                 }
                 match (n.pause, me.paused_since.is_some()) {
@@ -907,7 +905,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
                 }
             }
-            if me.expects.iter().any(|x| x.due(me.started_at.unwrap_or(now), now)) && queue::expire_guesses(&mut me, &q.waiting(), now) {
+            if me.expects.iter().any(|x| x.due(me.started_at.unwrap_or(now), now))
+                && queue::expire_guesses(&mut me, &q.running(), &q.waiting(), now)
+            {
                 let _ = q.write(&q.run_path(me_pid), &me);
                 say(&format!("expected {} - the work its history suggested did not come in time; it no longer books room for it", me.key));
             }
@@ -1310,12 +1310,12 @@ mod tests {
         let declared = queue::Expect { work: "e2e".into(), mem_kb: 4, ..Default::default() };
         let stack = Entry { started_at: Some(1000.0), expects: vec![declared, guess], ..Default::default() };
         let mut s = stack.clone();
-        assert!(!queue::expire_guesses(&mut s, &[], 1600.0));
-        assert!(queue::expire_guesses(&mut s, &[], 1601.0));
+        assert!(!queue::expire_guesses(&mut s, &[], &[], 1600.0));
+        assert!(queue::expire_guesses(&mut s, &[], &[], 1601.0));
         assert!(!s.expects[0].expired && s.expects[1].expired, "only the guess expires");
         // Work for the stack started: the guess goes with it.
         let mut s = stack;
-        assert!(apply_work_started(&mut s, &queue::Nudge { work_started: vec![0], ..Default::default() }));
+        assert!(apply_work_started(&mut s, &queue::Nudge { work_started: vec![0], ..Default::default() }, &[], &[]));
         assert!(s.expects.iter().all(|x| x.started));
     }
 

@@ -40,7 +40,8 @@ and the versions follow [semver](https://semver.org).
   stack waits `expect_wait` for the work, and matching work links to it and
   goes first; an expired or started guess links nothing, and work linked to
   it drops back to its own priority. A guess whose work has queued and
-  linked to it came true: it does not expire while that work waits. The
+  linked to it came true: it is declared work from then on, also for the
+  rule for nothing running, and does not expire while that work waits. The
   guess never stops the rule for nothing running. Another stack respects it
   while it is open, also one started with no declared work, so such a stack
   waits at most until the guess expires or its work starts; a stack that
