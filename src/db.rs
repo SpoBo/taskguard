@@ -221,10 +221,16 @@ pub struct Estimate {
 pub struct Learned {
     pub runs: usize,
     /// Max of the recent peaks, with outliers held back (see `Outliers`).
-    /// None when no run was ever measured.
+    /// Runs that failed never raise it above the runs that passed; when every
+    /// recent run failed, see `failed_need`. None when no run was ever
+    /// measured.
     pub mem_kb: Option<u64>,
     /// The recent memory peaks that stand far above the others.
     pub outliers: Option<Outliers>,
+    /// The recent runs that failed with a peak at least `outlier_min_kb`
+    /// above `mem_kb`, newest first: held back, as a run that goes wrong can
+    /// take far more memory than the job needs.
+    pub failed: Vec<Outlier>,
     /// The cores recent runs used, weighted toward the newest runs, with
     /// outliers held back (see `cpu_need`). None when unknown.
     pub cpu: Option<f64>,
@@ -245,6 +251,10 @@ pub struct Learned {
 /// A run starved of memory raises the need when its peak reached this share
 /// of the need it started with.
 pub const BOOST_REACHED: f64 = 0.9;
+/// ... and, for a run that failed, when its peak stayed within what the boost
+/// gives. One that went far past its need and failed would not have passed
+/// with 25% more room.
+pub const BOOST_FAILED_MAX: f64 = 1.25;
 
 /// How history turns into needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -261,11 +271,21 @@ pub struct Learn {
     /// How much the outliers count, by how many there are: the first entry
     /// for one, the second for two. Past the list they count in full.
     pub outlier_weights: Vec<f64>,
+    /// What a job with no history reserves: also a job whose runs all failed
+    /// (see `failed_need`).
+    pub new_job_mem_kb: u64,
 }
 
 impl Default for Learn {
     fn default() -> Self {
-        Learn { keep: 10, boost_runs: 5, outlier_ratio: 2.0, outlier_min_kb: 1024 * 1024, outlier_weights: vec![0.0, 0.5] }
+        Learn {
+            keep: 10,
+            boost_runs: 5,
+            outlier_ratio: 1.5,
+            outlier_min_kb: 1024 * 1024,
+            outlier_weights: vec![0.0, 0.5],
+            new_job_mem_kb: 1536 * 1024,
+        }
     }
 }
 
@@ -284,6 +304,23 @@ impl Outlier {
     pub fn failed(&self) -> bool {
         self.exit.is_some_and(|e| e != 0)
     }
+
+    /// Why a failed run's peak does not count, in words.
+    pub fn why_ignored(&self) -> String {
+        format!("ignored: the run failed (exit {})", self.exit.unwrap_or(-1))
+    }
+}
+
+/// The memory need when every recent run failed: the second-highest peak,
+/// at least `new_job_mem_kb` but never more than the highest. One failed run
+/// far above the others alone does not set the need, as the job is then as
+/// little known as a new one; a job that fails at the same peak again and
+/// again does need it.
+pub fn failed_need(peaks: &[u64], new_job_mem_kb: u64) -> Option<u64> {
+    let mut by_peak = peaks.to_vec();
+    by_peak.sort_unstable_by(|a, b| b.cmp(a));
+    let top = *by_peak.first()?;
+    Some(by_peak.get(1).copied().unwrap_or(0).max(new_job_mem_kb).min(top))
 }
 
 /// The highest recent peaks when they stand far above the rest: one run that
@@ -311,7 +348,7 @@ impl Outliers {
     /// Why an outlier counts as it does, in words.
     pub fn why(&self, o: &Outlier) -> String {
         if o.failed() {
-            return format!("ignored: the run failed (exit {})", o.exit.unwrap_or(-1));
+            return o.why_ignored();
         }
         let n = self.repeats();
         let times = if n == 1 { "once".to_string() } else { format!("{n} times") };
@@ -576,6 +613,18 @@ impl Db {
             Some(o) => Some(o.mem_kb),
             None => recent.iter().map(|r| r.0 as u64).max(),
         };
+        // A run that failed never raises the need above the runs that passed.
+        let passed = runs[..recent.len()].iter().filter(|o| !o.failed()).map(|o| o.peak_kb).max();
+        let failed_peaks: Vec<u64> = runs[..recent.len()].iter().filter(|o| o.failed()).map(|o| o.peak_kb).collect();
+        let mem = match passed {
+            Some(p) => mem.map(|m| m.min(p)),
+            None => failed_need(&failed_peaks, rules.new_job_mem_kb),
+        };
+        let failed: Vec<Outlier> = runs[..recent.len()]
+            .iter()
+            .filter(|o| o.failed() && mem.is_some_and(|m| o.peak_kb >= m + rules.outlier_min_kb))
+            .cloned()
+            .collect();
         let cpu_runs: Vec<CpuRun> = recent
             .iter()
             .zip(&runs)
@@ -590,10 +639,19 @@ impl Db {
         // was given: then its need was too small. One that starved far below
         // its need was squeezed by others, and more room for it would have
         // gone unused. A run from before the need was recorded still counts.
-        let boosted = rows
-            .iter()
-            .take(boost_runs)
-            .any(|r| r.3.as_deref() == Some("memory") && r.6.is_none_or(|need| r.0 as f64 >= need as f64 * BOOST_REACHED));
+        // One that failed counts only when its peak also stayed within what
+        // the boost gives: a run that went to 50x its need and crashed tells
+        // nothing about its need.
+        let boosted = rows.iter().zip(&runs).take(boost_runs).any(|(r, o)| {
+            r.3.as_deref() == Some("memory")
+                && match (r.6, o.failed()) {
+                    (None, failed) => !failed,
+                    (Some(need), failed) => {
+                        let peak = r.0 as f64;
+                        peak >= need as f64 * BOOST_REACHED && (!failed || peak <= need as f64 * BOOST_FAILED_MAX)
+                    }
+                }
+        });
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
         let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
         let nested_jobs = recent.iter().filter_map(|r| r.7).filter(|n| *n > 0).max().map(|n| n as u64);
@@ -601,6 +659,7 @@ impl Db {
             runs: recent.len(),
             mem_kb: mem,
             outliers,
+            failed,
             cpu,
             dur_s: dur,
             mem_boosted: boosted,
@@ -1413,6 +1472,140 @@ mod tests {
         let o = l.outliers.unwrap();
         assert_eq!(o.repeats(), 0, "failed runs do not count as a repeat");
         assert_eq!(o.why(&o.runs[0]), "ignored: the run failed (exit 137)");
+    }
+
+    /// A run that peaked at `peak` GB, ended with `exit`, and started with a
+    /// memory need of `need` GB.
+    fn run_mem(db: &Db, key: &str, peak: f64, exit: i32, starved: Option<&str>, need: f64) -> i64 {
+        let gb = |x: f64| (x * GB as f64) as u64;
+        let id = db.insert_run(&NewRun { ns: "n", key, need_mem_kb: gb(need), ..Default::default() }).unwrap();
+        db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
+        let r = RunResult {
+            ended_at: now(),
+            exit,
+            peak_mem_kb: gb(peak),
+            cores_wanted: 1.0,
+            measured: true,
+            starved: starved.map(str::to_string),
+            ..Default::default()
+        };
+        db.finish_run(id, &r).unwrap();
+        id
+    }
+
+    fn mem_gb(l: &Learned) -> f64 {
+        (l.mem_kb.unwrap() as f64 / GB as f64 * 10.0).round() / 10.0
+    }
+
+    #[test]
+    fn a_failed_run_never_raises_the_need_above_the_runs_that_passed() {
+        // root:tsc_-p_tsconfig.json: two small runs, then one that failed at
+        // 14.5 GB starved of memory. With fewer than three runs there is no
+        // outlier check, so it set the need to 14.5 GB, 18 GB with the boost.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        run_mem(&db, "k", 0.2, 0, None, 0.0);
+        run_mem(&db, "k", 0.3, 2, None, 0.2);
+        let big = run_mem(&db, "k", 14.5, 1, Some("memory"), 0.3);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(mem_gb(&l), 0.2, "only the run that passed counts");
+        assert!(!l.mem_boosted, "it went to 48x its need and failed: more room would not have saved it");
+        let ids: Vec<i64> = l.failed.iter().map(|o| o.run_id).collect();
+        assert_eq!(ids, vec![big], "the failed 0.3 GB run is too close to the need to list");
+        assert_eq!(l.failed[0].why_ignored(), "ignored: the run failed (exit 1)");
+
+        // host/dapi tsc: peaks of 1-4.5 GB, then one that failed at 5.9 GB
+        // starved of memory, only 1.3x its need of 4.5 GB. It is no ratio
+        // outlier, so it counted in full and the need went to 7.4 GB.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for (peak, exit) in [(4.5, 0), (1.0, 0), (4.2, 0), (2.8, 0), (4.3, 0), (3.5, 0), (3.7, 0), (3.8, 2), (2.4, 0)] {
+            run_mem(&db, "k", peak, exit, None, 4.5);
+        }
+        run_mem(&db, "k", 5.9, 2, Some("memory"), 4.5);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(mem_gb(&l), 4.5);
+        assert!(!l.mem_boosted, "it went past what the boost would have given");
+        assert_eq!(l.failed.len(), 1, "only the 5.9 GB run: the failed 3.8 GB run is under the need");
+        assert_eq!(l.failed[0].peak_kb, (5.9 * GB as f64) as u64);
+    }
+
+    #[test]
+    fn when_every_run_failed_one_high_peak_alone_does_not_set_the_need() {
+        // prd14394-gate: 0.2 GB, then 12.3 GB, both failed.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        run_mem(&db, "k", 0.2, 1, None, 16.0);
+        run_mem(&db, "k", 12.3, 1, None, 16.0);
+        let rules = Learn::default();
+        let l = db.learned("k", &rules).unwrap();
+        assert_eq!(l.mem_kb, Some(rules.new_job_mem_kb), "as little known as a new job");
+        assert_eq!(l.failed.len(), 1);
+
+        // One failed run alone is no better.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        run_mem(&db, "k", 14.5, 1, None, 0.0);
+        assert_eq!(db.learned("k", &rules).unwrap().mem_kb, Some(rules.new_job_mem_kb));
+
+        // Under new_job_mem, the failed peak is all it reserves.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        run_mem(&db, "k", 0.5, 1, None, 0.0);
+        assert_eq!(mem_gb(&db.learned("k", &rules).unwrap()), 0.5);
+
+        // A job that fails at the same peak again and again does need it.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        run_mem(&db, "k", 12.0, 1, None, 0.0);
+        run_mem(&db, "k", 12.3, 1, None, 0.0);
+        let l = db.learned("k", &rules).unwrap();
+        assert_eq!(mem_gb(&l), 12.0);
+        assert!(l.failed.is_empty(), "12.3 GB is too close to the need to list");
+    }
+
+    #[test]
+    fn a_failed_run_starved_at_its_need_still_raises_it() {
+        // Killed for memory at its need: the need was too small.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..3 {
+            run_mem(&db, "k", 4.0, 0, None, 4.5);
+        }
+        run_mem(&db, "k", 4.4, 137, Some("memory"), 4.5);
+        assert!(db.learned("k", &Learn::default()).unwrap().mem_boosted);
+        // Up to what the boost gives still counts.
+        run_mem(&db, "k", 5.6, 137, Some("memory"), 4.5);
+        assert!(db.learned("k", &Learn::default()).unwrap().mem_boosted);
+    }
+
+    #[test]
+    fn a_one_off_peak_under_twice_the_usual_is_held_back() {
+        // 17 GB where the job usually takes 9 GB: 1.9x.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for _ in 0..4 {
+            run_mem(&db, "k", 9.0, 0, None, 9.0);
+        }
+        run_mem(&db, "k", 17.0, 0, None, 9.0);
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(mem_gb(&l), 9.0);
+        assert_eq!(l.outliers.as_ref().map(|o| o.why(&o.runs[0])).as_deref(), Some("ignored: seen once, maybe a one-off"));
+    }
+
+    #[test]
+    fn a_job_with_two_sizes_reserves_the_big_one() {
+        // tsc-queue:packages_dapi_server: 2 GB on a cache hit, 25 GB on a
+        // full build. Holding the 25 GB back would start a full build into a
+        // machine with no room for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        for peak in [24.0, 2.0, 1.7, 1.8, 25.0, 25.0, 25.0, 25.0, 1.9, 2.1] {
+            run_mem(&db, "k", peak, 0, None, 25.0);
+        }
+        let l = db.learned("k", &Learn::default()).unwrap();
+        assert_eq!(mem_gb(&l), 25.0);
+        assert_eq!(l.outliers, None);
     }
 
     #[test]

@@ -900,21 +900,23 @@ pub fn run(mut o: Opts) -> Result<i32> {
     Ok(code)
 }
 
-/// When the run that just ended stands far above the job's other runs, say
-/// how much it counts, and record it with the reason.
+/// When the run that just ended stands far above the job's other runs, or
+/// failed above its need, say how much it counts, and record it with the
+/// reason.
 fn note_outlier(d: &Db, cfg: &Config, me: &Entry) {
     let Ok(l) = d.learned(&me.key, &cfg.learn()) else { return };
-    let Some(o) = &l.outliers else { return };
-    let Some(run) = o.runs.iter().find(|r| r.run_id == me.run_id) else { return };
-    let why = o.why(run);
-    let _ = d.adjustment(&me.key, me.run_id, "mem_outlier", Some(o.normal_kb as f64), Some(o.mem_kb as f64), &why);
+    let next = l.mem_kb.unwrap_or(0);
+    let found = l.outliers.as_ref().and_then(|o| o.runs.iter().find(|r| r.run_id == me.run_id).map(|r| (r, o.normal_kb, o.why(r))));
+    let found = found.or_else(|| l.failed.iter().find(|r| r.run_id == me.run_id).map(|r| (r, next, r.why_ignored())));
+    let Some((run, usual, why)) = found else { return };
+    let _ = d.adjustment(&me.key, me.run_id, "mem_outlier", Some(usual as f64), Some(next as f64), &why);
     say(&format!(
         "warning {} - took {} of memory, {:.1}x its usual {}; {why}. The next run reserves {} (taskguard outliers; taskguard prune --outliers)",
         me.key,
         report::gb(run.peak_kb),
-        run.peak_kb as f64 / o.normal_kb.max(1) as f64,
-        report::gb(o.normal_kb),
-        report::gb(o.mem_kb)
+        run.peak_kb as f64 / usual.max(1) as f64,
+        report::gb(usual),
+        report::gb(next)
     ));
 }
 

@@ -316,7 +316,13 @@ pub fn outliers(args: &[String]) -> Result<i32> {
     let p = parse_prune(args)?;
     let rules = learn_rules(&p)?;
     let db = Db::open_dir(&config::state_dir())?;
-    let found = find_all_outliers(&db, p.pattern.as_deref(), &rules)?;
+    let mut found = Vec::new();
+    for k in db.keys(p.pattern.as_deref())? {
+        let l = db.learned(&k, &rules)?;
+        if l.outliers.is_some() || !l.failed.is_empty() {
+            found.push((k, l));
+        }
+    }
     println!(
         "a peak counts as an outlier when it is more than {}x and {} above the next peak below it (outlier_ratio, outlier_min)",
         rules.outlier_ratio,
@@ -328,19 +334,29 @@ pub fn outliers(args: &[String]) -> Result<i32> {
     }
     println!();
     println!("{:<52} {:>6} {:>9} {:>9} {:>9} {:>6} {:>9}  why", "key", "run", "ended", "peak", "usual", "x", "next run");
-    for (k, o) in &found {
-        for r in &o.runs {
+    for (k, l) in &found {
+        let next = l.mem_kb.unwrap_or(0);
+        let row = |r: &db::Outlier, usual: u64, why: String| {
             println!(
                 "{:<52} {:>6} {:>9} {:>9} {:>9} {:>6.1} {:>9}  {}",
                 k,
                 r.run_id,
                 ago(r.ended_at),
                 gb(r.peak_kb),
-                gb(o.normal_kb),
-                r.peak_kb as f64 / o.normal_kb.max(1) as f64,
-                gb(o.mem_kb),
-                o.why(r)
+                gb(usual),
+                r.peak_kb as f64 / usual.max(1) as f64,
+                gb(next),
+                why
             );
+        };
+        let outliers = l.outliers.iter().flat_map(|o| o.runs.iter().map(move |r| (o, r)));
+        for (o, r) in outliers.clone() {
+            row(r, o.normal_kb, o.why(r));
+        }
+        // Failed runs above the need that are no ratio outlier: usual is the
+        // need the runs that passed leave.
+        for r in l.failed.iter().filter(|f| !outliers.clone().any(|(_, r)| r.run_id == f.run_id)) {
+            row(r, next, r.why_ignored());
         }
     }
     println!();
@@ -560,6 +576,15 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
                 if l.mem_boosted { " (+25% after a memory-starved run)" } else { "" },
                 l.dur_s.map(dur).unwrap_or("?".into())
             );
+            if let Some(f) = l.failed.first() {
+                let top = l.failed.iter().map(|r| r.peak_kb).max().unwrap_or(0);
+                println!(
+                    "failed:     {} run(s) up to {} above the need; {}, a run that goes wrong can take far more than the job needs (taskguard outliers)",
+                    l.failed.len(),
+                    gb(top),
+                    f.why_ignored()
+                );
+            }
             if let Some(o) = &l.outliers {
                 let top = o.runs.iter().map(|r| r.peak_kb).max().unwrap_or(0);
                 println!(

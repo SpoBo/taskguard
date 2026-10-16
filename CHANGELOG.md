@@ -10,6 +10,24 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A run that failed no longer raises a job's memory need above what its
+  passing runs took, also with fewer than three runs and when it is no
+  outlier. One `tsc` run that failed at 14.5 GB made every later run reserve
+  18 GB. When every recent run failed, one high peak alone does not set the
+  need: the job reserves `new_job_mem` until a peak comes back.
+- A failed run starved of memory adds the 25% boost only when its peak stayed
+  within that 25% of its need.
+- `taskguard outliers`, `doctor --explain` and the job's end line show failed
+  runs whose peak is ignored, and why.
+
+### Changed
+
+- `outlier_ratio` defaults to 1.5 (was 2): a one-off 17 GB peak where a job
+  usually takes 9 GB no longer sets the need for its next 10 runs. A job with
+  two sizes, such as a cache hit and a full build, still reserves the big one.
+
 ## [0.9.0] - 2026-10-12
 
 ### Added
