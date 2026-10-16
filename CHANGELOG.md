@@ -35,8 +35,8 @@ and the versions follow [semver](https://semver.org).
   queued in its checkout within `infer_work_within` (900) seconds of its
   start on at least `infer_work_min` (3) of its last `infer_work_of` (5)
   runs there. It books that work's usual need, shown as `(expects WORK from
-  history, ...)`, for twice its usual delay and ten minutes at most, and
-  drops it once work for the stack starts. While the guess is open the
+  history, ...)` until work queues for it, for twice its usual delay and ten
+  minutes at most, and drops it once work for the stack starts. While the guess is open the
   stack waits `expect_wait` for the work, and matching work links to it and
   goes first; an expired or started guess links nothing, and work linked to
   it drops back to its own priority. A guess whose work has queued and

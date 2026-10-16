@@ -890,7 +890,7 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
     let stacks = running.iter().chain(waiting).filter(|e| e.long_lived && e.pid != me.pid && e.checkout == me.checkout);
     let mut best: Option<(u8, WorkFor, i32)> = None;
     for e in stacks {
-        for (i, x) in e.expects.iter().enumerate().filter(|(i, x)| matches(&x.work) && still_expected(e, *i, running, waiting)) {
+        for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work) && still_expected(x)) {
             let free = x.open() && !claimed(e.pid, i);
             // A stack that waits takes only work that can take over a booking.
             if e.started_at.is_none() && !free {
@@ -906,11 +906,13 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
     best.map(|(_, w, p)| (w, p))
 }
 
-/// Is item `i` of `e` still expected: declared or come true, or a guess that
-/// has neither expired nor seen its work start? Only then does work link
-/// to it and go first.
-fn still_expected(e: &Entry, i: usize, running: &[Entry], waiting: &[Entry]) -> bool {
-    e.expects[i].open() || !is_guess(e, i, running, waiting)
+/// Is this work still expected: declared, or implied by the history and
+/// neither expired nor started? Only then does work link to it and go
+/// first. Once the run that made a guess come true has started, a second
+/// matching run is not the work the history foresaw: it keeps its own
+/// priority.
+fn still_expected(x: &Expect) -> bool {
+    !x.implied || x.open()
 }
 
 /// Has `me`'s link to its long-lived job lapsed: that job is gone, or what
@@ -918,8 +920,7 @@ fn still_expected(e: &Entry, i: usize, running: &[Entry], waiting: &[Entry]) -> 
 /// The item `me` links to is no guess: `me` made it come true.
 pub fn link_lapsed(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> bool {
     let Some(w) = &me.work_for else { return false };
-    let expected =
-        |e: &Entry, i: usize| matches(&e.expects[i].work) && (w.item == Some(i as u32) || still_expected(e, i, running, waiting));
+    let expected = |e: &Entry, i: usize| matches(&e.expects[i].work) && (w.item == Some(i as u32) || still_expected(&e.expects[i]));
     running.iter().chain(waiting).find(|e| e.pid == w.pid).is_none_or(|e| !(0..e.expects.len()).any(|i| expected(e, i)))
 }
 
@@ -2891,6 +2892,31 @@ mod tests {
         // Once the run has left the queue, the guess that is past its time ends.
         assert!(expire_guesses(&mut stack, &[], &[], 660.0));
         assert_eq!(reserve(std::slice::from_ref(&stack)).1, GB);
+    }
+
+    #[test]
+    fn a_second_run_does_not_ride_on_a_guess_the_first_run_made_come_true() {
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let is = |w: &str| w == "browser";
+        // The first run linked to the guess, took over its booking and runs.
+        stack.expects[0].started = true;
+        let first = Entry { pid: 30, started_at: Some(990.0), ..run_for(Some(0)) };
+        let running = [stack.clone(), first.clone()];
+        assert!(!link_lapsed(&first, &running, &[], is), "the first run keeps its link");
+        // A second matching run in the checkout is not the work the history
+        // foresaw: it does not link, so it gets no lift and does not wait
+        // for the stack.
+        let second = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(31, "pr.ts --pr 17399", 3.0, 4) };
+        assert!(link_work(&second, &running, &[], is).is_none());
+        // One that linked before the first run started lets go of its link.
+        let linked = Entry { work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item: None }), ..second.clone() };
+        assert!(link_lapsed(&linked, &running, &[], is));
+        // Declared work still links a second run: the caller said it comes.
+        stack.expects[0].implied = false;
+        let running = [stack, first];
+        assert_eq!(link_work(&second, &running, &[], is).unwrap().0.item, None);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! the scheduler really thinks.
 
 use crate::machine::MachineSample;
-use crate::queue::{Blocker, Decision, Entry, Limits, booked, need_with_booking, reserve};
+use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, reserve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -503,7 +503,7 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             gb(m.mem_used_kb),
             gb(s.reserve_mem_kb),
             gb(need),
-            link_text(e, &s.running),
+            link_text(e, &s.running, &queued(s)),
             mem_would as f64 * 100.0 / m.mem_total_kb.max(1) as f64,
             s.limits.mem_max_pct
         ),
@@ -542,10 +542,16 @@ pub fn bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: u
         .collect()
 }
 
+/// The entries of the jobs that wait.
+fn queued(s: &Snapshot) -> Vec<Entry> {
+    s.waiting.iter().map(|w| w.entry.clone()).collect()
+}
+
 /// What a job's link to a long-lived job adds to its line: the work a
 /// long-lived job expects and books room for, or the long-lived job a job
-/// is work for. Empty for any other job.
-pub fn link_text(e: &Entry, running: &[Entry]) -> String {
+/// is work for. Empty for any other job. Work the history guessed reads
+/// "from history" until a job queues for it and makes it come true.
+pub fn link_text(e: &Entry, running: &[Entry], waiting: &[Entry]) -> String {
     let mut t = String::new();
     if let Some(w) = &e.work_for {
         t += &format!(" (for stack {})", w.key);
@@ -553,8 +559,9 @@ pub fn link_text(e: &Entry, running: &[Entry]) -> String {
     let open: Vec<String> = e
         .expects
         .iter()
-        .filter(|x| x.open())
-        .map(|x| if x.implied { format!("{} from history", x.work) } else { x.work.clone() })
+        .enumerate()
+        .filter(|(_, x)| x.open())
+        .map(|(i, x)| if is_guess(e, i, running, waiting) { format!("{} from history", x.work) } else { x.work.clone() })
         .collect();
     if !open.is_empty() {
         t += &format!(" (expects {}, books {})", open.join(", "), gb(booked(e, running)));
@@ -611,6 +618,7 @@ pub fn render_status(s: &Snapshot) -> String {
     let _ = writeln!(o);
     let _ =
         writeln!(o, "RUNNING ({})                          pool          time   CPU now / needs      MEMORY now / needs", s.running.len());
+    let queue = queued(s);
     if s.running.is_empty() {
         let _ = writeln!(o, "  (nothing running)");
     }
@@ -635,7 +643,7 @@ pub fn render_status(s: &Snapshot) -> String {
             needs_cpu,
             gb(e.live_mem_kb),
             needs_mem,
-            link_text(e, &s.running)
+            link_text(e, &s.running, &queue)
         );
     }
     let _ = writeln!(o);
@@ -663,7 +671,7 @@ pub fn render_status(s: &Snapshot) -> String {
         if e.stalled {
             blocked += " [stalled: holds no job back]";
         }
-        blocked += &link_text(e, &s.running);
+        blocked += &link_text(e, &s.running, &queue);
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:<21} {}",
@@ -723,6 +731,18 @@ mod tests {
             outside_mem_max_pct: 95.0,
             partial_fit: 0.5,
         }
+    }
+
+    #[test]
+    fn a_guess_reads_from_history_until_work_queues_for_it() {
+        let guess = crate::queue::Expect { work: "browser".into(), mem_kb: GB, implied: true, ..Default::default() };
+        let stack = Entry { pid: 11, long_lived: true, expects: vec![guess], ..Default::default() };
+        let running = std::slice::from_ref(&stack);
+        assert_eq!(link_text(&stack, running, &[]), " (expects browser from history, books 1.0 GB)");
+        let link = crate::queue::WorkFor { pid: 11, key: "dev-env:stack".into(), item: Some(0) };
+        let run = Entry { pid: 30, work_for: Some(link), ..Default::default() };
+        assert_eq!(link_text(&stack, running, std::slice::from_ref(&run)), " (expects browser, books 1.0 GB)");
+        assert_eq!(link_text(&run, running, &[]), " (for stack dev-env:stack)");
     }
 
     /// Voyager: 18 cores at cpu_max 150 is 27 cores. A typecheck that needs

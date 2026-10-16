@@ -264,8 +264,9 @@ below).
   `infer_work_within` (900) seconds of their start, that work is expected
   again. A kind of work is a pool, or the key of a job outside any pool. The
   stack books that work's usual need, which `taskguard status` shows as
-  `(expects browser from history, books 4.3 GB)`, and while the guess is
-  open the work links and goes first as declared work does. It is a guess,
+  `(expects browser from history, books 4.3 GB)` until work queues for
+  it, and while the guess is open the work links and goes first as declared
+  work does. It is a guess,
   so it is bounded:
   - it books room for twice the work's usual delay after the stack started,
     ten minutes at most, and drops it once work for the stack starts or the
