@@ -22,8 +22,27 @@ and the versions follow [semver](https://semver.org).
 - Each run now stores how its need was made (`runs.need_why`), so `dump`
   can explain an old run too, not only the next one.
 
+### Changed
+
+- With nothing running, or nothing but long-lived jobs past their start-up,
+  the first job in line that fits starts, up to all of RAM, rather than the
+  first in line whatever the memory reading says. A long-lived job, such as a
+  second dev stack, starts that way only under `mem_max`. A job that does not
+  fit holds nobody back, so the jobs behind it that fit start. At macOS
+  warning this rule still decides when only long-lived jobs run.
+- A waiting job that would not fit even once every job that ends by itself
+  has ended holds nobody back, whatever its priority or reservation: it can
+  only start once a long-lived job is stopped or other programs free memory,
+  and the small jobs behind it start meanwhile.
+
 ### Fixed
 
+- A second dev stack is no longer started over memory while the first one's
+  run waits: the rule for "nothing runs but long-lived jobs" started the head
+  of the line whatever the readings said, and skipped itself at macOS
+  warning, so the run waited until its caller gave up.
+- The NEXT line names a long-lived job that holds the room as one that must
+  be stopped, not as one that will finish.
 - `outside_admit` works again when `mem_max` is at or above `pause_at`
   (92% by default), as with `mem_max = 95`. It capped memory at `pause_at`,
   under the limit, so it could never let a job start; the cap is now

@@ -131,28 +131,32 @@ pub fn eta_text(eta: f64) -> String {
 
 fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
     let remaining = |e: &Entry| e.remaining(now);
-    let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<(String, Option<f64>)> {
+    let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<&Entry> {
         let mut rs: Vec<&Entry> = running.iter().collect();
-        rs.sort_by(|a, b| remaining(a).unwrap_or(f64::MAX).total_cmp(&remaining(b).unwrap_or(f64::MAX)));
+        // A long-lived job comes last: it ends only when someone stops it.
+        rs.sort_by(|a, b| {
+            a.lasting().cmp(&b.lasting()).then(remaining(a).unwrap_or(f64::MAX).total_cmp(&remaining(b).unwrap_or(f64::MAX)))
+        });
         let mut freed = 0.0;
         for e in rs {
             freed += need(e);
             if freed >= short {
-                return Some((e.key.clone(), remaining(e)));
+                return Some(e);
             }
         }
         None
     };
-    let when = |key: String, rem: Option<f64>| match rem {
-        Some(r) => (format!("starts when {key} finishes (about {} left)", dur(r)), Some(r)),
-        None => (format!("starts when {key} finishes"), None),
+    let when = |e: &Entry| match remaining(e) {
+        _ if e.lasting() => (format!("starts when {} is stopped (long-lived: it does not end by itself)", e.key), None),
+        Some(r) => (format!("starts when {} finishes (about {} left)", e.key, dur(r)), Some(r)),
+        None => (format!("starts when {} finishes", e.key), None),
     };
     match b {
         Blocker::Older { key } | Blocker::Reserved { key, .. } | Blocker::Priority { key, .. } | Blocker::Pipeline { key, .. } => {
             (format!("starts after {key} has started"), None)
         }
-        Blocker::Slots { holders, .. } => match holders.first() {
-            Some(h) => when(h.clone(), running.iter().find(|e| &e.key == h).and_then(remaining)),
+        Blocker::Slots { holders, .. } => match holders.first().and_then(|h| running.iter().find(|e| &e.key == h)) {
+            Some(e) => when(e),
             None => ("starts when a slot frees up".into(), None),
         },
         Blocker::LearnStagger { wait_s } => (format!("starts in about {:.0}s", wait_s.ceil()), Some(*wait_s)),
@@ -166,14 +170,14 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
-                Some((k, r)) => when(k, r),
+                Some(e) => when(e),
                 None => (format!("starts when {} of memory frees up", gb(*short_kb)), None),
             }
         }
         Blocker::Cpu { short, .. } => {
             let need = |e: &Entry| e.need_cpu.max(e.live_cpu);
             match first_to_free(&need, *short) {
-                Some((k, r)) => when(k, r),
+                Some(e) => when(e),
                 None => (format!("starts when {short:.1} cores free up"), None),
             }
         }
@@ -887,5 +891,27 @@ mod tests {
         assert!(text.contains("1.8 GB short (may start in about 43s)"), "the waiting row says when:\n{text}");
         assert_eq!(s.waiting[0].eta_s.map(|t| t.round()), Some(43.0));
         assert!(text.contains("packages/api:tsc"));
+    }
+
+    #[test]
+    fn a_long_lived_holder_is_named_as_stopped_not_finished() {
+        let stack = Entry {
+            key: "dev-env:stack".into(),
+            need_mem_kb: 9 * GB,
+            live_mem_kb: 7 * GB,
+            long_lived: true,
+            started_at: Some(0.0),
+            ..Default::default()
+        };
+        let b = Blocker::Memory {
+            would_pct: 100.0,
+            limit_pct: 95.0,
+            short_kb: 2 * GB,
+            used_kb: 0,
+            reserve_kb: 0,
+            need_kb: 0,
+            total_kb: 32 * GB,
+        };
+        assert_eq!(unblock_text(&b, &[stack], 1000.0), "starts when dev-env:stack is stopped (long-lived: it does not end by itself)");
     }
 }

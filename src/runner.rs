@@ -388,6 +388,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         // until someone stops it, so no one counts on it ending.
         est_dur_s: learned.dur_s.or(est_dur).filter(|_| startup.is_none()),
         priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
+        long_lived: startup.is_some(),
         pausable: true,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()

@@ -231,6 +231,7 @@ pub fn run(s: &Scenario) -> Outcome {
         known: true,
         est_dur_s: (!j.long_lived).then_some(j.secs),
         priority: j.priority,
+        long_lived: j.long_lived,
         ..Default::default()
     };
     for (n, j) in s.jobs.iter().enumerate().filter(|(_, j)| j.at < 0.0) {
@@ -274,6 +275,7 @@ pub fn run(s: &Scenario) -> Outcome {
                         need_mem_kb: a.stack_need_kb,
                         known: true,
                         priority: 10,
+                        long_lived: true,
                         ..Default::default()
                     };
                     waiting.push((e, Kind::Stack(n)));

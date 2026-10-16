@@ -107,8 +107,10 @@ below).
   so the next job waits until it has shown what it takes (at most two
   minutes). A job with a history has its whole need booked from its first
   second, so the next job may start at once. So the job that needs that
-  stack does not wait behind it. `warn_admit = false` makes warning stop
-  every new job again.
+  stack does not wait behind it. When nothing runs but long-lived jobs past
+  their start-up, the rule below for nothing running decides at warning too,
+  up to all of RAM. `warn_admit = false` makes warning stop every new job
+  again.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
@@ -131,10 +133,16 @@ below).
   halfway from `mem_max` to all of RAM (97.5% for `mem_max = 95`). Each such
   start prints a warning with what the job lacks and the rule that let it
   start.
-- **Nothing running means the job starts,** whatever the CPU and memory
-  readings say, so the queue cannot deadlock on a wrong reading. Memory
-  pressure is the one exception: then the load comes from other programs, and
-  jobs wait until it eases.
+- **Nothing running means the first job in line that fits starts,** whatever
+  the CPU reading says and up to all of RAM, so the queue cannot deadlock on
+  a wrong reading or on programs outside taskguard. The same holds when
+  nothing runs but long-lived jobs past their start-up. A job that would not
+  fit in RAM even so waits for memory and holds nobody back: the jobs behind
+  it that fit start. A long-lived job must fit under `mem_max` (with
+  `noise_mem`): it does not end by itself, so starting it over the limit is
+  no progress but load that stays. Memory pressure is the one exception:
+  then the load comes from other programs, and jobs wait until it eases
+  (at macOS warning, see above).
 - **Any order, oldest first.** A small job may pass a big one that does not
   fit yet. This is safe: a job only reaches taskguard when its launcher has
   decided that it may run. Turbo starts a task only after the tasks it depends
@@ -183,7 +191,7 @@ below).
   its learned duration says it ends before the reserved job could start
   anyway: before the running jobs have freed the room it lacks, or, when
   programs outside taskguard keep it out, before none of them runs (then the
-  first in line starts whatever the readings say). Such a job takes no room
+  first in line that fits in RAM starts). Such a job takes no room
   the reserved one could use, so a steady stream of small jobs cannot keep it
   out, and a lint is not held up for half an hour behind a job that waits for
   two long test runs. A job with no learned duration waits. For a reserved job
@@ -192,6 +200,14 @@ below).
   when no other job runs, also when its need is above the whole limit. On by
   default for 10 minutes (`max_backfill = 600`); `0` turns it off, `1800`
   lets every job that fits through for half an hour.
+- **A job that only a stopped stack can make room for holds nobody back.**
+  A job ahead in line that would not fit by the rule for nothing running even
+  once every job that ends by itself has ended can only start when a
+  long-lived job is stopped, or when programs outside taskguard free memory.
+  Holding the jobs behind it gains it nothing, so it holds none of them back,
+  whatever its priority or reservation: on Omarchy one 5.5 GB lint that only
+  fit once a dev stack stopped kept two dozen others out, among them a test of
+  189 MB.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. A slot ceiling only stops such jobs from
   running at the same time and breaking each other; CPU and memory are always
@@ -211,8 +227,10 @@ below).
   core for hours. Its history keeps both: the start-up peak, which the next
   run is admitted against, and what it took after. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
-  nothing else runs, the first in line starts whatever the readings say.
-  `auto_pause` leaves it alone. `taskguard status` marks it `STEADY`.
+  nothing else runs, the first in line that fits starts. A waiting long-lived
+  job itself starts that way only under `mem_max`. `auto_pause` leaves it
+  alone. `taskguard status` marks it `STEADY`, and a job it keeps out says it
+  starts when the stack is stopped, not when it finishes.
 
 ### What is measured
 
@@ -657,6 +675,10 @@ A version only follows the rules it knows. A version that does not know
 `long_lived` runs such a job as any other: it holds its start-up peak until it
 ends. Its waiting jobs do read the lower needs of a long-lived job that a newer
 version runs, but they still wait for it to end when nothing else runs.
+Versions up to 0.10.0 start the first in line whatever the readings say when
+nothing runs but long-lived jobs past their start-up, also a second dev stack
+over `mem_max`, and skip that rule at macOS warning; their jobs decide so
+whatever newer versions do.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not
