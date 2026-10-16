@@ -1065,7 +1065,8 @@ impl Db {
              WHERE pool = ?1 AND need_mem_kb > 0 AND started_at IS NOT NULL AND queued_at > ?2
              GROUP BY key",
         )?;
-        let mut v: Vec<i64> = stmt.query_map(params![pool, now() - 30.0 * 86400.0], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        let mut v: Vec<i64> =
+            stmt.query_map(params![pool, now() - 30.0 * 86400.0], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
         if v.is_empty() {
             return Ok(None);
         }

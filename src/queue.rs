@@ -902,20 +902,17 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
 }
 
 /// Is this work still expected: declared, or a guess that has neither
-/// expired nor come true? Only then does work link to it and go first.
+/// expired nor seen its work start? Only then does work link to it and go
+/// first.
 fn still_expected(x: &Expect) -> bool {
     !x.implied || x.open()
 }
 
 /// Has `me`'s link to its long-lived job lapsed: that job is gone, or what
-/// it expected of `me` was a guess that has expired or come true?
+/// it expected of `me` was a guess that has expired or whose work started?
 pub fn link_lapsed(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> bool {
     let Some(w) = &me.work_for else { return false };
-    running
-        .iter()
-        .chain(waiting)
-        .find(|e| e.pid == w.pid)
-        .is_none_or(|e| !e.expects.iter().any(|x| matches(&x.work) && still_expected(x)))
+    running.iter().chain(waiting).find(|e| e.pid == w.pid).is_none_or(|e| !e.expects.iter().any(|x| matches(&x.work) && still_expected(x)))
 }
 
 /// Does `a` belong to an older task-runner run than `b`? Only jobs that are

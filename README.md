@@ -138,9 +138,10 @@ below).
   a wrong reading or on programs outside taskguard. The same holds when
   nothing runs but long-lived jobs past their start-up. A job that would not
   fit in RAM even so waits for memory and holds nobody back: the jobs behind
-  it that fit start. A long-lived job must fit under `mem_max` (with
-  `noise_mem`): it does not end by itself, so starting it over the limit is
-  no progress but load that stays. Memory pressure is the one exception:
+  it that fit start. Next to long-lived jobs, a long-lived job must fit under
+  `mem_max` (with `noise_mem`), or the ceiling `outside_admit` allows: it does
+  not end by itself, so starting it over the limit is no progress but load
+  that stays. Memory pressure is the one exception:
   then the load comes from other programs, and jobs wait until it eases
   (at macOS warning, see above).
 - **Any order, oldest first.** A small job may pass a big one that does not
@@ -269,8 +270,9 @@ below).
   - it books room for twice the work's usual delay after the stack started,
     ten minutes at most, and drops it once work for the stack starts or the
     stack stops;
-  - once it has expired or come true, no work links to it, and work linked
-    to it drops back to its own priority and holds its turn no more;
+  - once it has expired or its work has started, no work links to it, and
+    work linked to it drops back to its own priority and holds its turn no
+    more;
   - no job that ends by itself waits for it by the rule for nothing running,
     so it can never stop the queue, and such a job waits for it at most up
     to all of RAM;
