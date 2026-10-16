@@ -10,6 +10,18 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `taskguard dump PATTERN | --cmd "COMMAND" | --run ID` prints everything
+  taskguard knows about a job as one JSON document: how the command matches,
+  the rules in force and which file set them, what the next run reserves and
+  why, step by step (history, boost, first guess, caps, minimums), each recent
+  run with what it waited for, what it changed, and its role in the need
+  (outlier, failed and ignored, boost), pruned runs, and the live queue entry.
+  Use it to find out why a job reserved what it did.
+- Each run now stores how its need was made (`runs.need_why`), so `dump`
+  can explain an old run too, not only the next one.
+
 ## [0.10.0] - 2026-10-16
 
 ### Fixed
