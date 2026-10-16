@@ -141,9 +141,21 @@ pub struct Expect {
     pub from: String,
     /// A job for it has started: the booking is gone.
     pub started: bool,
-    /// Not declared: the history says such work followed this job before.
-    /// It books nothing until a job for it queues while this job waits.
+    /// Not declared: the history says such work followed this job before
+    /// (`infer_work`). Its booking is a guess: it ends `expire_after_s`
+    /// after the job started, and no job waits for it under the progress
+    /// rule.
     pub implied: bool,
+    pub expire_after_s: Option<f64>,
+    /// The guess did not come true in time: the booking is gone.
+    pub expired: bool,
+}
+
+impl Expect {
+    /// Still booked: its work has not started, and the guess has not expired.
+    pub fn open(&self) -> bool {
+        !self.started && !self.expired
+    }
 }
 
 /// The long-lived job a job is work for, and which of its `expects` it
@@ -793,7 +805,14 @@ pub fn booked(e: &Entry, running: &[Entry]) -> u64 {
     let taken = |i: usize| {
         e.started_at.is_some() && running.iter().any(|r| r.work_for.as_ref().is_some_and(|w| w.pid == e.pid && w.item == Some(i as u32)))
     };
-    e.expects.iter().enumerate().filter(|(i, x)| !x.started && !taken(*i)).map(|(_, x)| x.mem_kb).sum()
+    e.expects.iter().enumerate().filter(|(i, x)| x.open() && !taken(*i)).map(|(_, x)| x.mem_kb).sum()
+}
+
+/// The part of `booked` that only the history guessed (`infer_work`).
+fn guessed(e: &Entry, running: &[Entry]) -> u64 {
+    let guesses =
+        Entry { expects: e.expects.iter().map(|x| Expect { started: x.started || !x.implied, ..x.clone() }).collect(), ..e.clone() };
+    booked(&guesses, running)
 }
 
 /// The memory `job` adds when it starts: its need, plus what it books for
@@ -813,7 +832,7 @@ fn booking_taken_over(job: &Entry, running: &[Entry]) -> u64 {
     }
     let Some(stack) = running.iter().find(|e| e.pid == *pid) else { return 0 };
     let taken = running.iter().any(|r| r.pid != job.pid && r.work_for.as_ref().is_some_and(|w| w.pid == *pid && w.item == Some(*i)));
-    stack.expects.get(*i as usize).filter(|x| !x.started && !taken).map_or(0, |x| x.mem_kb)
+    stack.expects.get(*i as usize).filter(|x| x.open() && !taken).map_or(0, |x| x.mem_kb)
 }
 
 /// Is `job` work for a long-lived job that does not run yet? It waits for
@@ -840,10 +859,9 @@ pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl
     let mut best: Option<(u8, WorkFor, i32)> = None;
     for e in stacks {
         for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work)) {
-            let free = !x.started && !claimed(e.pid, i);
-            // A stack that waits takes only work that can take over a booking;
-            // work the history implies only while the stack still waits.
-            if (e.started_at.is_none() && !free) || (x.implied && e.started_at.is_some()) {
+            let free = x.open() && !claimed(e.pid, i);
+            // A stack that waits takes only work that can take over a booking.
+            if e.started_at.is_none() && !free {
                 continue;
             }
             let rank = u8::from(e.started_at.is_none()) * 2 + u8::from(!free);
@@ -1290,6 +1308,9 @@ struct Room {
     /// The running jobs: what a job takes over from its long-lived job
     /// depends on them.
     running: Vec<Entry>,
+    /// The part of `res_mem` that only the history guessed: what long-lived
+    /// jobs book for work nobody declared (`infer_work`).
+    res_guessed: u64,
 }
 
 impl Room {
@@ -1308,11 +1329,24 @@ impl Room {
             passing_live: passing.iter().map(|e| e.live_mem_kb).sum(),
             passing_res: reserve(&passing).1,
             running: running.to_vec(),
+            res_guessed: running.iter().map(|e| guessed(e, running)).sum(),
         }
     }
 
     fn mem_would(&self, job: &Entry) -> f64 {
-        (self.mem_used + self.res_mem + need_with_booking(job, &self.running)) as f64
+        self.mem_would_on(job, false)
+    }
+
+    /// As `mem_would`, by the progress rule (`progress`) or not. A guess of
+    /// the history never keeps a job out by the progress rule, so it cannot
+    /// stop the queue. Nor does it keep out a long-lived job started with no
+    /// declared work, its own guess included: such a stack starts as it
+    /// would without the history, and books its guess from then on.
+    fn mem_would_on(&self, job: &Entry, progress: bool) -> f64 {
+        let undeclared = job.long_lived && !job.expects.iter().any(|x| !x.implied);
+        let guess = if (progress && !job.long_lived) || undeclared { self.res_guessed } else { 0 };
+        let own = if undeclared && job.started_at.is_none() { guessed(job, &[]) } else { 0 };
+        (self.mem_used + self.res_mem - guess.min(self.res_mem) + need_with_booking(job, &self.running) - own) as f64
     }
 
     /// The most memory a job may take the machine to by the progress rule:
@@ -1330,7 +1364,7 @@ impl Room {
             (Some(pk), Some(max)) => (running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32) < max,
             _ => true,
         };
-        pool_free && !waits_for_stack(job, running) && self.mem_would(job) <= self.progress_ceiling(m, lim, job)
+        pool_free && !waits_for_stack(job, running) && self.mem_would_on(job, true) <= self.progress_ceiling(m, lim, job)
     }
 
     /// Would `job` fit by the progress rule once every running job that ends
@@ -1665,7 +1699,15 @@ mod tests {
         // What this version adds reads back, and leaves the rest alone.
         let stack = Entry {
             long_lived: true,
-            expects: vec![Expect { work: "browser".into(), mem_kb: 4, from: "x".into(), started: true, implied: true }],
+            expects: vec![Expect {
+                work: "browser".into(),
+                mem_kb: 4,
+                from: "x".into(),
+                started: true,
+                implied: true,
+                expire_after_s: Some(600.0),
+                expired: true,
+            }],
             expect_until: Some(5.0),
             work_for: Some(WorkFor { pid: 9, key: "s".into(), item: Some(0) }),
             ..older
@@ -2634,17 +2676,41 @@ mod tests {
     }
 
     #[test]
-    fn work_the_history_implies_links_only_while_the_stack_waits() {
+    fn a_guess_of_the_history_books_room_but_never_stops_the_queue() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
         let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
-        stack.expects[0] = Expect { work: "browser".into(), implied: true, ..Default::default() };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let grows = stack.need_mem_kb - stack.live_mem_kb;
+        let r = std::slice::from_ref(&stack);
+        // It books the run's usual 4.3 GB, and the run takes that over.
+        assert_eq!(reserve(r).1, grows + 43 * GB / 10);
         let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(3, "pr.ts", 3.0, 4) };
-        let is = |w: &str| w == "browser";
-        // It books nothing.
-        assert_eq!(reserve(std::slice::from_ref(&stack)).1, stack.need_mem_kb - stack.live_mem_kb);
-        // Up already: a run that queues now is no evidence of anything.
-        assert!(link_work(&me, std::slice::from_ref(&stack), &[], is).is_none());
-        let waiting = Entry { started_at: None, ..stack };
-        assert_eq!(link_work(&me, &[], std::slice::from_ref(&waiting), is).unwrap().0.item, Some(0));
+        assert_eq!(link_work(&me, r, &[], |w| w == "browser").unwrap().0.item, Some(0));
+        // 24 GB held of 32 and only the stack runs: a 5 GB lint does not fit
+        // with the guess booked (35 GB), but the progress rule ignores a
+        // guess, up to all of RAM (30 GB): it starts.
+        let m = machine(1.0, 24);
+        let lint = job(4, "lint", 3.5, 5);
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&lint), &lint, 1000.0, &[])).is_empty());
+        // While a job that ends by itself runs, the guess holds like a booking.
+        let busy = [stack.clone(), Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 0) }];
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&lint), &lint, 1000.0, &[])), vec!["memory"]);
+        // A second stack whose caller declared work respects the guess. One
+        // started with no declared work does not, nor its own guess: it
+        // starts as it would without the history.
+        let plain = Entry { long_lived: true, priority: 10, ..job(6, "dev-env:stack", 1.0, 4) };
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+        let mut guessing = Entry { checkout: "/w/b".into(), ..plain.clone() };
+        guessing.expects = vec![Expect { work: "browser".into(), mem_kb: GB, implied: true, ..Default::default() }];
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])).is_empty());
+        let mut declared = guessing.clone();
+        declared.expects[0].implied = false;
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&declared), &declared, 1000.0, &[])), vec!["memory"]);
+        // Expired, it books nothing, and a run for the stack still goes first.
+        stack.expects[0].expired = true;
+        assert_eq!(reserve(std::slice::from_ref(&stack)).1, grows);
+        assert_eq!(link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "browser").unwrap().0.item, None);
     }
 
     #[test]

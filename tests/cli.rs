@@ -612,7 +612,10 @@ fn a_stack_waits_for_the_work_it_expects_when_both_queue_together() {
     let t = Instant::now();
     // The run queues a moment later: the stack, which waits for it, starts
     // at once, and the run after it.
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until("the stack queues", || {
+        let out = e.run(&["status", "--json"]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|v| v["waiting"].as_array().is_some_and(|w| !w.is_empty()))
+    });
     let run = e.run(&["--id", "browser", "--", "true"]);
     assert!(run.status.success(), "{}", stderr(&run));
     assert!(t.elapsed() < Duration::from_secs(15), "the stack did not wait out expect_wait: {:?}", t.elapsed());

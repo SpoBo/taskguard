@@ -75,6 +75,16 @@ expect_wait = 5       # seconds a long-lived job (a dev stack) waits before it s
                       # work it expects to queue, so it starts with room for both. Only when
                       # it declares work (--expect, TASKGUARD_EXPECT) or its history says work
                       # follows it in that checkout. 0 = never; at most 60.
+# A long-lived job that declares no work books the work its history says
+# follows it: work of one kind (a pool, or a key outside any pool) that queued
+# in its checkout within infer_work_within seconds of its start on at least
+# infer_work_min of its last infer_work_of runs there. It books that work's
+# typical need until the work starts, at most twice its typical delay (10
+# minutes at most). --expect none on a job turns it off for that job.
+infer_work = true
+infer_work_min = 3
+infer_work_of = 5
+infer_work_within = 900
 boost_runs = 5        # runs that get +25% memory after a memory-starved run
 # A peak more than outlier_ratio times the next peak below it, and outlier_min
 # above it, is an outlier. Outliers count by outlier_weights: the first entry

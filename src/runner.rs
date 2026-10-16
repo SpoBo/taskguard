@@ -52,7 +52,8 @@ pub struct Opts {
 
 /// Work a long-lived job's caller says will run on it: `--expect`, then
 /// `TASKGUARD_EXPECT` (comma-separated). Any other job inherits the variable
-/// from whoever started it and leaves it alone.
+/// from whoever started it and leaves it alone. `none` says it expects no
+/// work, not even what its history suggests.
 fn declared_work(o: &Opts) -> Vec<String> {
     let env = std::env::var("TASKGUARD_EXPECT").unwrap_or_default();
     o.expect.iter().cloned().chain(env.split(',').map(str::trim).filter(|w| !w.is_empty()).map(str::to_string)).collect()
@@ -64,6 +65,8 @@ fn is_work(work: &str, me: &Entry, cmd: &[String]) -> bool {
 }
 
 /// Mark the expected work a nudge says has started.
+/// Once work for it has started, a long-lived job also drops what it booked
+/// on the history's guess: the work came.
 fn apply_work_started(me: &mut Entry, n: &queue::Nudge) -> bool {
     let mut changed = false;
     for i in &n.work_started {
@@ -72,7 +75,59 @@ fn apply_work_started(me: &mut Entry, n: &queue::Nudge) -> bool {
             changed = true;
         }
     }
+    if !n.work_started.is_empty() {
+        for x in me.expects.iter_mut().filter(|x| x.implied && x.open()) {
+            x.started = true;
+            changed = true;
+        }
+    }
     changed
+}
+
+/// A guess of the history that did not come true in time: its booking ends.
+fn expire_guesses(me: &mut Entry, now: f64) -> bool {
+    let started = me.started_at.unwrap_or(now);
+    let mut changed = false;
+    for x in me.expects.iter_mut().filter(|x| x.open() && x.expire_after_s.is_some_and(|a| now - started > a)) {
+        x.expired = true;
+        changed = true;
+    }
+    changed
+}
+
+/// The longest a booking on the history's guess lasts after its job started.
+const GUESS_MAX_S: f64 = 600.0;
+
+/// The work the history says follows a long-lived job `key` in `checkout`:
+/// each kind of work that queued within `infer_work_within` seconds of its
+/// start on at least `infer_work_min` of its last `infer_work_of` runs there.
+/// It books that work's usual need, for twice its usual delay at most.
+fn inferred_work(d: &Db, cfg: &Config, key: &str, pool: Option<&str>, checkout: &str) -> Vec<queue::Expect> {
+    let within = cfg.infer_work_within as f64;
+    let Ok((n, works)) = d.followers(key, pool, checkout, cfg.infer_work_of.max(1), within) else { return Vec::new() };
+    works
+        .into_iter()
+        .filter(|f| f.runs >= cfg.infer_work_min.max(1))
+        .map(|f| {
+            let mem_kb = f.need_kb.unwrap_or(cfg.new_job_mem_kb);
+            let expire = (2.0 * f.lag_s).clamp(60.0, GUESS_MAX_S);
+            queue::Expect {
+                from: format!(
+                    "from history: it queued within {}s of the start of {} of the last {n} runs of {key} here, after {} as a rule, needing {}; booked for {} at most",
+                    within,
+                    f.runs,
+                    report::dur(f.lag_s),
+                    report::gb(mem_kb),
+                    report::dur(expire)
+                ),
+                work: f.work,
+                mem_kb,
+                implied: true,
+                expire_after_s: Some(expire),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// sem's `-j`: N, +N (cores + N), -N (cores - N) or N% of cores, at least 1.
@@ -379,22 +434,20 @@ pub fn run(mut o: Opts) -> Result<i32> {
         Some(_) => work.iter().map(|w| need::expected(database.as_ref(), &cfg, &cwd, w)).collect(),
         None => Vec::new(),
     };
-    // Without a declaration, the history may still say that work follows
-    // this job in this checkout: what queued there while at least half of
-    // its last runs (two at least) ran. That books nothing; it only makes
-    // the job wait `expect_wait` for such work to queue with it.
-    let expect_wait = cfg.expect_wait.clamp(0.0, 60.0);
+    // `--expect none`: no work, not even what the history suggests.
+    let none = work.iter().any(|w| w == "none");
+    expects.retain(|x| x.work != "none");
+    // Without a declaration, the history may say what work follows this job
+    // in this checkout: it books that, as a guess with a time limit.
     if startup.is_some()
         && expects.is_empty()
-        && expect_wait > 0.0
-        && let Some((n, works)) = database.as_ref().and_then(|d| d.followers(&jkey, pool.as_deref(), &checkout.to_string_lossy(), 5).ok())
-        && n >= 2
+        && !none
+        && cfg.infer_work
+        && let Some(d) = &database
     {
-        for (w, c) in works.into_iter().filter(|(_, c)| c * 2 >= n) {
-            let from = format!("not declared; it queued while {c} of the last {n} runs of {jkey} in this checkout ran");
-            expects.push(queue::Expect { work: w, from, implied: true, ..Default::default() });
-        }
+        expects = inferred_work(d, &cfg, &jkey, pool.as_deref(), &checkout.to_string_lossy());
     }
+    let expect_wait = cfg.expect_wait.clamp(0.0, 60.0);
     let estimate_from = guess.as_ref().map(|g| g.from.clone());
     let est_dur = guess.as_ref().and_then(|g| g.dur_s);
 
@@ -490,7 +543,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         for x in &me.expects {
             let wait = me.expect_until.map(|_| format!("; it waits up to {expect_wait:.0}s for it to queue")).unwrap_or_default();
             if x.implied {
-                say(&format!("expects {} - {}: it books room only once that work queues{wait}", x.work, x.from));
+                say(&format!("expects {} - {} books {} for it ({}){wait}", x.work, me.key, report::gb(x.mem_kb), x.from));
             } else {
                 say(&format!("expects {} - {} books {} for it until it starts ({}){wait}", x.work, me.key, report::gb(x.mem_kb), x.from));
             }
@@ -592,15 +645,17 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 link_to_stack(&mut me, own_priority, &running, &waiting, &o.cmd, o.quiet);
                 // Work that queued for this long-lived job may need more than
-                // was booked for it: book that.
+                // was booked for it: book that. Work the history guessed that
+                // has queued is a guess no more.
                 for (i, x) in me.expects.iter_mut().enumerate() {
                     let theirs = waiting
                         .iter()
                         .filter(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me_pid && l.item == Some(i as u32)))
                         .max_by_key(|w| w.need_mem_kb);
-                    if let Some(w) = theirs.filter(|w| w.need_mem_kb > x.mem_kb) {
-                        x.mem_kb = w.need_mem_kb;
+                    if let Some(w) = theirs.filter(|w| w.need_mem_kb > x.mem_kb || x.implied) {
+                        x.mem_kb = x.mem_kb.max(w.need_mem_kb);
                         x.from = format!("the need of {}, which queued for it", w.key);
+                        (x.implied, x.expire_after_s) = (false, None);
                     }
                 }
                 let mut waiting = waiting;
@@ -862,6 +917,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 if n.pause == Some(true) {
                     say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
                 }
+            }
+            if expire_guesses(&mut me, now) {
+                let _ = q.write(&q.run_path(me_pid), &me);
+                say(&format!("expected {} - the work its history suggested did not come in time; it no longer books room for it", me.key));
             }
             if let Some(r) = tracker.sample(child_pid, now, &procs) {
                 me.live_cpu = r.used;
@@ -1255,6 +1314,59 @@ pub fn wait_pool(id: Option<&str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guess_of_the_history_ends_when_the_work_comes_or_its_time_is_up() {
+        let guess = queue::Expect { work: "browser".into(), mem_kb: 4, implied: true, expire_after_s: Some(600.0), ..Default::default() };
+        let declared = queue::Expect { work: "e2e".into(), mem_kb: 4, ..Default::default() };
+        let stack = Entry { started_at: Some(1000.0), expects: vec![declared, guess], ..Default::default() };
+        let mut s = stack.clone();
+        assert!(!expire_guesses(&mut s, 1600.0));
+        assert!(expire_guesses(&mut s, 1601.0));
+        assert!(!s.expects[0].expired && s.expects[1].expired, "only the guess expires");
+        // Work for the stack started: the guess goes with it.
+        let mut s = stack;
+        assert!(apply_work_started(&mut s, &queue::Nudge { work_started: vec![0], ..Default::default() }));
+        assert!(s.expects.iter().all(|x| x.started));
+    }
+
+    #[test]
+    fn the_history_infers_work_only_when_it_followed_often_enough() {
+        let d = Db::open(Path::new(":memory:")).unwrap();
+        let t = db::now() - 86400.0;
+        let at = |key: &str, pool: &str, cwd: &str, queued: f64, ended: Option<f64>| {
+            let id = d.insert_run(&NewRun { ns: "n", key, pool: Some(pool), cwd, need_mem_kb: 4_000_000, ..Default::default() }).unwrap();
+            d.conn.execute("UPDATE runs SET queued_at = ?2 WHERE id = ?1", rusqlite::params![id, queued]).unwrap();
+            d.mark_started(id, queued, 0.0, None).unwrap();
+            if let Some(e) = ended {
+                d.finish_run(id, &RunResult { ended_at: e, ..Default::default() }).unwrap();
+            }
+            id
+        };
+        let infer = |cfg: &Config| inferred_work(&d, cfg, "dev-env:stack", Some("stack"), "/w/dalp");
+        let cfg = Config::default();
+        // Two stacks, each followed by a browser run 6 minutes in: not yet 3 of 5.
+        for i in 0..3 {
+            let s = t + 3600.0 * i as f64;
+            at("dev-env:stack", "stack", "/w/dalp", s, Some(s + 1800.0));
+            if i < 2 {
+                at("pr.ts", "browser", "/w/dalp/e2e", s + 360.0, Some(s + 600.0));
+            }
+        }
+        assert!(infer(&cfg).is_empty());
+        let s = t + 3600.0 * 3.0;
+        at("dev-env:stack", "stack", "/w/dalp", s, Some(s + 1800.0));
+        at("pr.ts", "browser", "/w/dalp/e2e", s + 360.0, Some(s + 600.0));
+        // Now 3 of the last 4: it books the run's usual need, for twice its
+        // usual delay, ten minutes at most.
+        let x = infer(&cfg);
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!((x[0].work.as_str(), x[0].mem_kb, x[0].implied, x[0].expire_after_s), ("browser", 4_000_000, true, Some(600.0)));
+        assert!(x[0].from.starts_with("from history"), "{}", x[0].from);
+        // Stricter settings, or later than the window, infer nothing.
+        assert!(infer(&Config { infer_work_min: 4, ..Config::default() }).is_empty());
+        assert!(infer(&Config { infer_work_within: 300, ..Config::default() }).is_empty());
+    }
 
     #[test]
     fn jobs_like_sem() {

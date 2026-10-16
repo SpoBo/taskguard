@@ -486,6 +486,17 @@ pub fn doctor(args: &[String]) -> Result<i32> {
         "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  partial_fit {}  expect_wait {}s  hints {}",
         cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.partial_fit, cfg.expect_wait, cfg.hints
     );
+    println!(
+        "work from history: {}",
+        if cfg.infer_work {
+            format!(
+                "on, when it followed {} of a stack's last {} runs within {}s of its start (infer_work)",
+                cfg.infer_work_min, cfg.infer_work_of, cfg.infer_work_within
+            )
+        } else {
+            "off (infer_work = false)".into()
+        }
+    );
     for (k, v) in &cfg.origin {
         if v != "built-in" {
             println!("  {k} set by {v}");

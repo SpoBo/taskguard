@@ -30,12 +30,20 @@ and the versions follow [semver](https://semver.org).
   waits while its stack still waits. `taskguard status` shows `(for stack
   KEY)` on the work and `(expects WORK, books SIZE)` on the stack. Without a
   declaration nothing changes.
+- A long-lived job with no declared work books the work its history says
+  follows it: work of one kind (a pool, or a key outside any pool) that
+  queued in its checkout within `infer_work_within` (900) seconds of its
+  start on at least `infer_work_min` (3) of its last `infer_work_of` (5)
+  runs there. It books that work's usual need, shown as `(expects WORK from
+  history, ...)`, for twice its usual delay and ten minutes at most, and
+  drops it once work for the stack starts. The guess never stops the rule
+  for nothing running and never keeps out a stack started with no declared
+  work. A declaration wins; `--expect none` expects nothing;
+  `infer_work = false` turns it off.
 - `expect_wait` (5 seconds by default, 0 turns it off): a long-lived job that
-  declares work, or whose history in its checkout says work follows it (on at
-  least half of its last runs there, two at least), waits that long before it
+  expects work, declared or from its history, waits that long before it
   starts for the work to queue, so a stack and a run started together start
-  with room for both. Work the history implies books nothing until it
-  queues. A stack with neither starts at once.
+  with room for both. A stack that expects nothing starts at once.
 
 ### Changed
 

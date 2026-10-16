@@ -143,8 +143,14 @@ pub struct Agent {
     pub booking_kb: u64,
     /// The agent queues its run 2 s after its stack, not once the stack is up.
     pub with_stack: bool,
-    /// Undeclared, but the history says a browser run follows its stacks.
+    /// Undeclared, but the history says a browser run follows its stacks
+    /// (`infer_work`): the stack books the run's usual need, for at most
+    /// ten minutes.
     pub implied: bool,
+    /// A bad guess: the agent only wants the stack, for `hold_s`, and never
+    /// queues a run.
+    pub no_run: bool,
+    pub hold_s: f64,
 }
 
 pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
@@ -165,6 +171,8 @@ pub fn agent(first_at: f64, idle_gb: f64) -> Agent {
         booking_kb: 36 * GB / 10,
         with_stack: false,
         implied: false,
+        no_run: false,
+        hold_s: 1200.0,
     }
 }
 
@@ -221,6 +229,8 @@ pub struct Outcome {
     pub worst_stack_wait: f64,
     /// Runs that started while their stack did not run: they fail.
     pub runs_without_stack: usize,
+    /// The longest a lint waited.
+    pub worst_lint_wait: f64,
     /// When each of `Scenario::jobs` started, if it did.
     pub job_started: Vec<Option<f64>>,
 }
@@ -310,7 +320,13 @@ pub fn run(s: &Scenario) -> Outcome {
                     let expects = if a.declares {
                         vec![Expect { work: "browser".into(), mem_kb: a.booking_kb, ..Default::default() }]
                     } else if a.implied {
-                        vec![Expect { work: "browser".into(), implied: true, ..Default::default() }]
+                        vec![Expect {
+                            work: "browser".into(),
+                            mem_kb: a.run_need_kb,
+                            implied: true,
+                            expire_after_s: Some(600.0),
+                            ..Default::default()
+                        }]
                     } else {
                         Vec::new()
                     };
@@ -331,7 +347,7 @@ pub fn run(s: &Scenario) -> Outcome {
                         ..Default::default()
                     };
                     waiting.push((e, Kind::Stack(n)));
-                    phase[n] = Phase::StackQueued { run_at: a.with_stack.then_some(t + 2.0) };
+                    phase[n] = Phase::StackQueued { run_at: (a.with_stack && !a.no_run).then_some(t + 2.0) };
                 }
                 Phase::StackQueued { run_at } => {
                     if run_at.is_some_and(|at| t >= at) {
@@ -343,6 +359,10 @@ pub fn run(s: &Scenario) -> Outcome {
                     {
                         phase[n] = Phase::StackUp;
                     }
+                }
+                Phase::StackUp if a.no_run => {
+                    let started = running.iter().find(|r| r.kind == Kind::Stack(n)).map_or(t, |r| r.started);
+                    phase[n] = Phase::Down { at: started + a.hold_s };
                 }
                 Phase::StackUp => {
                     ticket += 1;
@@ -431,6 +451,12 @@ pub fn run(s: &Scenario) -> Outcome {
                 _ => None,
             };
             r.e.follow(mem, cpu, s.host.ncpu as f64, t, lived);
+            // As the owner does: a guess of the history that did not come
+            // true in time stops booking.
+            let age_now = t - r.started;
+            for x in r.e.expects.iter_mut().filter(|x| x.open() && x.expire_after_s.is_some_and(|a| age_now > a)) {
+                x.expired = true;
+            }
             if s.steady_books_live && r.e.steady() {
                 r.e.need_mem_kb = mem;
             }
@@ -490,6 +516,9 @@ pub fn run(s: &Scenario) -> Outcome {
                         .unwrap_or(0);
                     let item = &mut waiting[i].0.expects[x];
                     item.mem_kb = item.mem_kb.max(theirs);
+                    if theirs > 0 {
+                        (item.implied, item.expire_after_s) = (false, None);
+                    }
                 }
             }
             let all: Vec<Entry> = waiting.iter().map(|(e, _)| e.clone()).collect();
@@ -502,6 +531,9 @@ pub fn run(s: &Scenario) -> Outcome {
                     && let Some(st) = running.iter_mut().find(|r| r.e.pid == w.pid)
                 {
                     st.e.expects[i as usize].started = true;
+                    for x in st.e.expects.iter_mut().filter(|x| x.implied) {
+                        x.started = true;
+                    }
                 }
                 for (w, _) in waiting.iter_mut().filter(|(w, _)| w.ahead_of(&me) && w.bypassed_since.is_none()) {
                     w.bypassed_since = Some(t);
@@ -511,6 +543,9 @@ pub fn run(s: &Scenario) -> Outcome {
                 }
                 if let Kind::Job(n) = kind {
                     out.job_started[n] = Some(t);
+                }
+                if kind == Kind::Lint {
+                    out.worst_lint_wait = out.worst_lint_wait.max(t - me.queued_at);
                 }
                 if let Kind::Run(n) = kind
                     && !running.iter().any(|r| r.kind == Kind::Stack(n))
@@ -571,6 +606,25 @@ pub fn declared_morning(outside_gb: f64) -> Scenario {
     let mut s = morning(outside_gb);
     for a in &mut s.agents {
         a.declares = true;
+    }
+    s
+}
+
+/// The same morning, undeclared, with the history inferring each run.
+pub fn inferred_morning(outside_gb: f64) -> Scenario {
+    let mut s = morning(outside_gb);
+    for a in &mut s.agents {
+        a.implied = true;
+    }
+    s
+}
+
+/// A bad guess: the history says a run follows each stack, but the agents
+/// only want their stacks, for 20 minutes each, while the lints keep coming.
+pub fn bad_guess(outside_gb: f64, infer: bool) -> Scenario {
+    let mut s = morning(outside_gb);
+    for a in &mut s.agents {
+        (a.implied, a.no_run) = (infer, true);
     }
     s
 }
@@ -693,6 +747,8 @@ mod tests {
             eprintln!("{}", row(&format!("outside {outside} GB, outside cap 92%"), &run(&old)));
             let declared = run(&declared_morning(outside));
             eprintln!("{}", row(&format!("outside {outside} GB, declared"), &declared));
+            let inferred = run(&inferred_morning(outside));
+            eprintln!("{}", row(&format!("outside {outside} GB, inferred"), &inferred));
             // The scout's fallback, not taken: a steady stack books what it
             // holds. It gives runs up at 12.8 GB.
             let live = Scenario { steady_books_live: true, ..morning(outside) };
@@ -705,6 +761,9 @@ mod tests {
             assert_eq!(declared.runs_given_up, 0, "{outside} GB declared: {declared:?}");
             assert!(declared.runs_done >= 10, "{outside} GB declared: {declared:?}");
             assert!(declared.worst_mem_pct <= 95.0 && declared.over_limit_s == 0.0, "{outside} GB declared: {declared:?}");
+            // Nor does one whose run the history infers.
+            assert_eq!(inferred.runs_given_up, 0, "{outside} GB inferred: {inferred:?}");
+            assert!(inferred.worst_mem_pct <= 95.0, "{outside} GB inferred: {inferred:?}");
             // A caller that does not declare: the progress rule alone clears
             // the morning's load, never a second stack over the limit.
             if outside < 14.0 {
@@ -741,6 +800,34 @@ mod tests {
                     assert!(o.stack_idle_s <= 60.0 || outside < 12.0, "{outside} GB, {name}: {o:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_bad_guess_of_the_history_starves_nothing() {
+        eprintln!("{:<34} {:>6} {:>10} {:>6} {:>9} {:>11}", "variant", "lints", "worst lint", "worst", "stacks", "worst stack");
+        eprintln!("{:<34} {:>6} {:>10} {:>6} {:>9} {:>11}", "", "done", "wait", "mem", "at once", "wait");
+        for outside in [11.0, 12.8, 14.5] {
+            let plain = run(&bad_guess(outside, false));
+            let guessed = run(&bad_guess(outside, true));
+            for (name, o) in [("no run follows, no inference", &plain), ("no run follows, inferred", &guessed)] {
+                eprintln!(
+                    "{:<34} {:>6} {:>9.0}s {:>5.1}% {:>9} {:>10.0}s",
+                    format!("{outside} GB, {name}"),
+                    o.lints_done,
+                    o.worst_lint_wait,
+                    o.worst_mem_pct,
+                    o.max_stacks,
+                    o.worst_stack_wait
+                );
+            }
+            // The guess books room for ten minutes at most and never stops
+            // the progress rule: no lint waits longer than without it, give
+            // or take a minute, though fewer run while a guess books room.
+            assert!(guessed.worst_lint_wait <= plain.worst_lint_wait + 60.0, "{outside} GB: {guessed:?} vs {plain:?}");
+            assert!(guessed.lints_done * 10 >= plain.lints_done * 7, "{outside} GB: {guessed:?} vs {plain:?}");
+            // It never keeps a stack started with no work out.
+            assert!(guessed.worst_stack_wait <= plain.worst_stack_wait + 60.0, "{outside} GB: {guessed:?} vs {plain:?}");
         }
     }
 

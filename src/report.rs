@@ -550,7 +550,12 @@ pub fn link_text(e: &Entry, running: &[Entry]) -> String {
     if let Some(w) = &e.work_for {
         t += &format!(" (for stack {})", w.key);
     }
-    let open: Vec<&str> = e.expects.iter().filter(|x| !x.started && (!x.implied || x.mem_kb > 0)).map(|x| x.work.as_str()).collect();
+    let open: Vec<String> = e
+        .expects
+        .iter()
+        .filter(|x| x.open())
+        .map(|x| if x.implied { format!("{} from history", x.work) } else { x.work.clone() })
+        .collect();
     if !open.is_empty() {
         t += &format!(" (expects {}, books {})", open.join(", "), gb(booked(e, running)));
     }

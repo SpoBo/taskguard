@@ -41,6 +41,10 @@ pub struct Layer {
     pub max_bypass: Option<u64>,
     pub max_backfill: Option<u64>,
     pub expect_wait: Option<f64>,
+    pub infer_work: Option<bool>,
+    pub infer_work_min: Option<usize>,
+    pub infer_work_of: Option<usize>,
+    pub infer_work_within: Option<u64>,
     pub boost_runs: Option<usize>,
     pub outlier_ratio: Option<f64>,
     pub outlier_min: Option<String>,
@@ -143,6 +147,14 @@ pub struct Config {
     /// Seconds a long-lived job that expects work waits, before it starts,
     /// for that work to queue: see `queue::Entry::expect_until`. 0 = never.
     pub expect_wait: f64,
+    /// A long-lived job with no declared work books what its history says
+    /// follows it: work that queued within `infer_work_within` seconds of
+    /// its start on at least `infer_work_min` of its last `infer_work_of`
+    /// runs in that checkout.
+    pub infer_work: bool,
+    pub infer_work_min: usize,
+    pub infer_work_of: usize,
+    pub infer_work_within: u64,
     pub boost_runs: usize,
     /// A memory peak more than this many times the next one below it is an
     /// outlier, and counts by `outlier_weights`. At or under 1: no outliers.
@@ -204,6 +216,10 @@ impl Default for Config {
             max_bypass: 120,
             max_backfill: 600,
             expect_wait: 5.0,
+            infer_work: true,
+            infer_work_min: 3,
+            infer_work_of: 5,
+            infer_work_within: 900,
             boost_runs: 5,
             outlier_ratio: 1.5,
             outlier_min_kb: 1024 * 1024,
@@ -639,6 +655,10 @@ impl Config {
         set!(max_bypass);
         set!(max_backfill);
         set!(expect_wait);
+        set!(infer_work);
+        set!(infer_work_min);
+        set!(infer_work_of);
+        set!(infer_work_within);
         set!(boost_runs);
         set!(outlier_ratio);
         if let Some(v) = &l.outlier_min
