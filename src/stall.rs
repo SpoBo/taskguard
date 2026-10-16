@@ -6,8 +6,19 @@
 //! admitted while the first one's run waited, the runs never fit next to
 //! both stacks, and each agent gave up on its run after its 10-minute command
 //! timeout and took its stack down. This model replays that morning second
-//! by second through the real `decide()` and `Entry::follow()`, so a change
-//! to the rules shows what it does to it.
+//! by second through the real `decide()`, `Entry::follow()` and
+//! `link_work()`, so a change to the rules shows what it does to it:
+//!
+//! - `the_macbook_morning`: the agents queue the run once the stack is up,
+//!   with and without declaring it on the stack, at 11, 12.8 and 14.5 GB
+//!   held by programs outside taskguard.
+//! - `a_stack_and_its_run_queued_together`: the agents queue the run two
+//!   seconds after the stack, with no declaration, a declaration, or only
+//!   the history to go on.
+//! - `a_large_job_at_the_front_on_omarchy`: a second stack that does not fit
+//!   at the front of 25 jobs that do.
+//!
+//! `cargo test stall -- --nocapture --test-threads 1` prints the tables.
 
 use crate::machine::{MachineSample, PEAK_WINDOW};
 use crate::queue::{Decision, Entry, Expect, Limits, LongLived, decide, link_work};
@@ -680,11 +691,26 @@ mod tests {
             // 0.10.0 also capped outside_admit at pause_at, under mem_max.
             let old = Scenario { lim: Limits { outside_mem_max_pct: 92.0, ..macbook_limits() }, ..morning(outside) };
             eprintln!("{}", row(&format!("outside {outside} GB, outside cap 92%"), &run(&old)));
-            eprintln!("{}", row(&format!("outside {outside} GB, declared"), &run(&declared_morning(outside))));
+            let declared = run(&declared_morning(outside));
+            eprintln!("{}", row(&format!("outside {outside} GB, declared"), &declared));
+            // The scout's fallback, not taken: a steady stack books what it
+            // holds. It gives runs up at 12.8 GB.
             let live = Scenario { steady_books_live: true, ..morning(outside) };
             eprintln!("{}", row(&format!("outside {outside} GB, steady books live"), &run(&live)));
             let both = Scenario { steady_books_live: true, ..declared_morning(outside) };
             eprintln!("{}", row(&format!("outside {outside} GB, declared + live"), &run(&both)));
+
+            // A caller that declares its run never gives it up, and memory
+            // stays under the limit.
+            assert_eq!(declared.runs_given_up, 0, "{outside} GB declared: {declared:?}");
+            assert!(declared.runs_done >= 10, "{outside} GB declared: {declared:?}");
+            assert!(declared.worst_mem_pct <= 95.0 && declared.over_limit_s == 0.0, "{outside} GB declared: {declared:?}");
+            // A caller that does not declare: the progress rule alone clears
+            // the morning's load, never a second stack over the limit.
+            if outside < 14.0 {
+                assert_eq!(o.runs_given_up, 0, "{outside} GB: {o:?}");
+            }
+            assert!(o.worst_mem_pct <= 95.0, "{outside} GB: {o:?}");
         }
     }
 
@@ -704,6 +730,16 @@ mod tests {
                 }
                 let o = run(&s);
                 eprintln!("{} {:>3} without stack", row(&format!("together {outside} GB, {name}"), &o), o.runs_without_stack);
+                if declares || implied {
+                    // The run waits for its stack, and the two fit together.
+                    assert_eq!((o.runs_given_up, o.runs_without_stack), (0, 0), "{outside} GB, {name}: {o:?}");
+                    assert!(o.worst_mem_pct <= 95.0, "{outside} GB, {name}: {o:?}");
+                }
+                if implied {
+                    // A run the history implied waits at most a few seconds for
+                    // its stack after the stack has started.
+                    assert!(o.stack_idle_s <= 60.0 || outside < 12.0, "{outside} GB, {name}: {o:?}");
+                }
             }
         }
     }
@@ -719,5 +755,12 @@ mod tests {
             worst_small_wait(&s, &o),
             o.worst_mem_pct
         );
+        // 0.10.0 started the second stack at once, to 114% of RAM, and small
+        // jobs waited 1000 s. It does not fit next to the first: it waits,
+        // and holds nobody back.
+        assert_eq!(o.job_started[1], None);
+        assert!(o.worst_mem_pct < 100.0, "{o:?}");
+        assert!(jobs_started(&s, &o) >= 24, "{o:?}");
+        assert!(worst_small_wait(&s, &o) < 300.0, "{o:?}");
     }
 }
