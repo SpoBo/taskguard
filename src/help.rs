@@ -124,7 +124,8 @@ A peak is an outlier when it is more than R times the next peak below it, and
 at least SIZE above it. Jobs whose usual peak is under SIZE have no outliers:
 there a jump is mostly a full build after cache hits. Outliers count by
 outlier_weights: the first time not at all, the second time half, the third
-time in full. A run that failed (exit not 0) never counts.
+time in full. A run that failed (exit not 0) never counts above the runs that
+passed, outlier or not: it shows here as ignored.
 
 arguments:
   PATTERN         the keys to look at, as `taskguard history` shows them;
@@ -132,8 +133,8 @@ arguments:
                   shell leaves the * alone. Default: every key.
 
 options:
-  --ratio R       how many times the next peak (default outlier_ratio, 2).
-                  1.5 finds more outliers, 3 fewer.
+  --ratio R       how many times the next peak (default outlier_ratio, 1.5).
+                  1.2 finds more outliers, 2 fewer.
   --min SIZE      how far above the next peak (default outlier_min, 1G).
 
 columns:
@@ -145,7 +146,7 @@ columns:
 
 examples:
   taskguard outliers
-  taskguard outliers 'root:*' --ratio 1.5
+  taskguard outliers 'root:*' --ratio 1.2
 ";
 
 const PRUNE: &str = "\

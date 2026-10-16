@@ -75,9 +75,10 @@ boost_runs = 5        # runs that get +25% memory after a memory-starved run
 # A peak more than outlier_ratio times the next peak below it, and outlier_min
 # above it, is an outlier. Outliers count by outlier_weights: the first entry
 # when there is one, the second when there are two, in full past the list. A
-# run that failed never counts. Jobs that usually take under outlier_min have
-# no outliers. See them with taskguard outliers. 0 turns it off.
-outlier_ratio = 2
+# run that failed never counts above the runs that passed. Jobs that usually
+# take under outlier_min have no outliers. See them with taskguard outliers.
+# 0 turns it off.
+outlier_ratio = 1.5
 outlier_min = "1G"
 outlier_weights = [0, 0.5]
 # A job that falls short by this little starts anyway, with a warning.

@@ -200,7 +200,7 @@ impl Default for Config {
             max_bypass: 120,
             max_backfill: 600,
             boost_runs: 5,
-            outlier_ratio: 2.0,
+            outlier_ratio: 1.5,
             outlier_min_kb: 1024 * 1024,
             outlier_weights: vec![0.0, 0.5],
             noise_mem: 2.0,
@@ -370,6 +370,7 @@ impl Config {
             outlier_ratio: self.outlier_ratio,
             outlier_min_kb: self.outlier_min_kb,
             outlier_weights: self.outlier_weights.clone(),
+            new_job_mem_kb: self.new_job_mem_kb,
         }
     }
 

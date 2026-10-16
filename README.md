@@ -59,12 +59,17 @@ below).
   the need. A memory need never passes `mem_max`: a job that once took more
   is capped there, and says so.
 - **One wild run does not set the need.** A peak more than `outlier_ratio`
-  (2) times the next peak below it, and at least `outlier_min` (1 GB) above
+  (1.5) times the next peak below it, and at least `outlier_min` (1 GB) above
   it, is an outlier: a CI run that took 12 GB where it usually takes 4.5 GB.
   The first time it does not count, the second time it counts half, the third
-  time in full (`outlier_weights`). A run that failed never counts: a run that
-  goes wrong can take far more than the job needs, and on a real machine most
-  outliers were such runs. Jobs whose usual peak is under `outlier_min` have
+  time in full (`outlier_weights`). A run that failed (exit not 0) never
+  raises the need above the runs that passed, outlier or not, and with any
+  number of runs: a run that goes wrong can take far more than the job needs,
+  and on a real machine most outliers were such runs. When every recent run
+  failed, the need is the second-highest failed peak, at least `new_job_mem`
+  but never more than the highest: one failed peak alone does not set it.
+  A failed run that was starved of memory adds the 25% only when its peak
+  stayed within that 25% of its need. Jobs whose usual peak is under `outlier_min` have
   no outliers: there a jump is mostly a full build after cache hits, and
   holding it back would start the next full build into a full machine. The
   job's line says when its run was an outlier, `taskguard outliers` lists
@@ -531,7 +536,7 @@ most used ones:
 cpu_max = 100          # percent of all cores
 mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
-outlier_ratio = 2      # a peak this many times the next one is an outlier; 0 = off
+outlier_ratio = 1.5    # a peak this many times the next one is an outlier; 0 = off
 outside_admit = true   # start jobs that only other programs keep out
 partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
 max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
@@ -582,7 +587,9 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   similar jobs can still take more than its estimate before it is learned.
 - An outlier that is real growth is learned late: the next run still
   reserves the usual peak, and only the third high run counts in full. A run
-  that failed is never learned, even when it really needed that memory. Set
+  that failed is not learned above the runs that passed, even when it really
+  needed that memory: a job that only reaches its full size when it fails,
+  such as a type check that passes on small changes, can be under-reserved. Set
   `outlier_weights = [0.5]` to learn sooner, or `outlier_ratio = 0` to learn
   every peak at once.
 - A job that starts early on `noise_mem` or `outside_admit` can push memory
