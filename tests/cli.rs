@@ -605,8 +605,13 @@ fn a_stack_books_the_work_it_expects_and_that_work_goes_first() {
 
 #[test]
 fn a_stack_waits_for_the_work_it_expects_when_both_queue_together() {
-    let e =
-        Env::new("sample_every = 0.2\nexpect_wait = 20\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n");
+    // Both are first runs and book new_job_mem each. Small, so the stack and
+    // its run fit together also on a CI runner whose memory is mostly in use:
+    // a lone stack that does not fit in RAM waits, and this test is about the
+    // stack waiting for its work, not about room.
+    let e = Env::new(
+        "sample_every = 0.2\nexpect_wait = 20\nnew_job_mem = \"64M\"\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n",
+    );
     let mut stack = e.cmd(&["--id", "stack", "--expect", "browser", "--", "sh", "-c", "touch up; sleep 30"]);
     let mut stack = stack.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     let t = Instant::now();
