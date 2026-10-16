@@ -839,6 +839,14 @@ fn guessed(e: &Entry, running: &[Entry], waiting: &[Entry]) -> u64 {
     booked(&Entry { expects: expects.collect(), ..e.clone() }, running)
 }
 
+/// The part of `job`'s own booking that it leaves out when it starts: all
+/// it guessed, when `job` is a waiting long-lived job with no declared work.
+/// Such a stack starts as it would without the history.
+pub fn own_guess(job: &Entry, running: &[Entry], waiting: &[Entry]) -> u64 {
+    let undeclared = job.long_lived && (0..job.expects.len()).all(|i| is_guess(job, i, running, waiting));
+    if undeclared && job.started_at.is_none() { guessed(job, running, waiting) } else { 0 }
+}
+
 /// The memory `job` adds when it starts: its need, plus what it books for
 /// the work it expects, less what its long-lived job booked for it, which it
 /// takes over.
@@ -1405,13 +1413,12 @@ impl Room {
     /// guess out: such a stack starts as it would without the history, and
     /// books its guess from then on.
     fn mem_would_on(&self, job: &Entry, progress: bool) -> f64 {
-        let undeclared = job.long_lived && (0..job.expects.len()).all(|i| is_guess(job, i, &self.running, &self.linked));
         let guess = if progress && !job.long_lived {
             self.res_guessed.saturating_sub(guess_taken_over(job, &self.running, &self.linked))
         } else {
             0
         };
-        let own = if undeclared && job.started_at.is_none() { guessed(job, &self.running, &self.linked) } else { 0 };
+        let own = own_guess(job, &self.running, &self.linked);
         (self.mem_used + self.res_mem - guess.min(self.res_mem) + need_with_booking(job, &self.running) - own) as f64
     }
 

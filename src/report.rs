@@ -3,7 +3,7 @@
 //! the scheduler really thinks.
 
 use crate::machine::MachineSample;
-use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, reserve};
+use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, own_guess, reserve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -494,7 +494,7 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             ),
         ));
     }
-    let need = need_with_booking(e, &s.running);
+    let need = need_with_booking(e, &s.running).saturating_sub(own_guess(e, &s.running, &queued(s)));
     let mem_would = m.mem_used_kb + s.reserve_mem_kb + need;
     out.push((
         checked("memory", mem_would <= s.mem_limit_kb),
@@ -743,6 +743,29 @@ mod tests {
         let run = Entry { pid: 30, work_for: Some(link), ..Default::default() };
         assert_eq!(link_text(&stack, running, std::slice::from_ref(&run)), " (expects browser, books 1.0 GB)");
         assert_eq!(link_text(&run, running, &[]), " (for stack dev-env:stack)");
+    }
+
+    #[test]
+    fn the_memory_rule_leaves_out_what_a_waiting_stack_only_guessed() {
+        let lim = Limits { partial_fit: 0.0, max_backfill: 0.0, ..advice_limits() };
+        let m = MachineSample::fixed(1.0, 12, 20 * GB, 32 * GB);
+        let guess = crate::queue::Expect { work: "browser".into(), mem_kb: 43 * GB / 10, implied: true, ..Default::default() };
+        let stack = Entry {
+            ticket: 1,
+            pid: 11,
+            key: "dev-env:stack".into(),
+            long_lived: true,
+            need_mem_kb: 6 * GB,
+            known: true,
+            expects: vec![guess],
+            ..Default::default()
+        };
+        let s = Snapshot::build(m, lim, vec![], vec![stack], 1000.0, &[]);
+        assert!(matches!(s.waiting[0].decision, Decision::Admit { .. }), "26 GB of 27.2 fits without the guess");
+        let checks = rule_checks(&s, &s.waiting[0]);
+        let (ok, text) = checks.iter().find(|(_, t)| t.starts_with("memory:")).cloned().unwrap();
+        assert!(ok, "{text}");
+        assert!(text.contains("6.0 GB for this job"), "{text}");
     }
 
     /// Voyager: 18 cores at cpu_max 150 is 27 cores. A typecheck that needs
