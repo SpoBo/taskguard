@@ -10,6 +10,11 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `taskguard top` shows its version at the right of the key bar, in the
+  room the keys leave: `taskguard VERSION`, or `vVERSION` when narrow.
+
 ## [0.11.0-rc.1] - 2026-10-16
 
 ### Added

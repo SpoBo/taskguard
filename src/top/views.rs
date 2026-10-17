@@ -142,6 +142,20 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(format!(" {what}  "), DIM));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // The version of this binary at the right, in what room the keys leave.
+    let free = (area.x + area.width).saturating_sub(x);
+    if let Some(v) = version_label(free) {
+        let w = v.chars().count() as u16;
+        let at = Rect { x: area.x + area.width - w, width: w, ..area };
+        f.render_widget(Paragraph::new(v).style(DIM), at);
+    }
+}
+
+/// The version of this binary, as long as fits in `room` columns: in full,
+/// then the number alone, else nothing. The keys keep their room.
+fn version_label(room: u16) -> Option<String> {
+    let v = env!("CARGO_PKG_VERSION");
+    [format!("taskguard {v}"), format!("v{v}")].into_iter().find(|t| t.chars().count() as u16 <= room)
 }
 
 /// A key, what it does, and the key a click presses.
@@ -2032,6 +2046,24 @@ mod tests {
         let (y, x, _, _) = *app.hits.iter().rev().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
         app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
         assert!(app.paused && !app.keys_open, "a click on 'space' in the list pauses and closes it");
+    }
+
+    #[test]
+    fn the_footer_shows_the_version_at_the_right_when_the_keys_leave_room() {
+        let (_t, mut app) = fixture();
+        let v = env!("CARGO_PKG_VERSION");
+        let s = screen(&mut app, 200, 20);
+        let foot = s.lines().last().unwrap().trim_end();
+        assert!(foot.starts_with("? keys") && foot.ends_with(&format!("taskguard {v}")), "{foot:?}");
+        // Narrow, the keys keep their room: the number alone, or nothing.
+        for w in [40, 60, 80, 100, 120] {
+            let s = screen(&mut app, w, 20);
+            let foot = s.lines().last().unwrap();
+            assert!(foot.starts_with("? keys") && foot.chars().count() <= w as usize, "{w}: {foot:?}");
+            let keys = foot.trim_end().trim_end_matches(&format!("taskguard {v}")).trim_end_matches(&format!("v{v}")).trim_end();
+            let wide = screen(&mut app, 200, 20);
+            assert!(wide.lines().last().unwrap().starts_with(keys), "{w}: the version hid a key: {foot:?}");
+        }
     }
 
     #[test]

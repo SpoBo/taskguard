@@ -528,8 +528,9 @@ signs of starvation. `Esc` or `Backspace` goes back to the same row, and `j`
 opens the last job again.
 
 `?` lists every key of the view you are in, and the keys of every view; the
-bottom line starts with it and shows the keys of the view that fit. `?` or
-`Esc` closes the list, and any other key closes it and does its work.
+bottom line starts with it and shows the keys of the view that fit, with
+the version of taskguard at the right when room is left. `?` or `Esc`
+closes the list, and any other key closes it and does its work.
 
 Keys: `1`-`9`, `Tab`, or Shift, Option or Cmd with `←`/`→` change views. `t`
 time range (5m to 7d), `n` namespace, `/` filter, `←`/`→` time cursor,
