@@ -91,6 +91,21 @@ build or the tests need it.
 A local `rust-objcopy ... libLLVM.dylib` warning on macOS comes from the
 local toolchain. It does not affect the release: CI builds the binaries.
 
+### Pre-release
+
+A version with a suffix, such as `0.11.0-rc.1`, makes a pre-release. The
+steps are the same, with the suffix in `Cargo.toml`, the `CHANGELOG.md`
+section and the tag (`v0.11.0-rc.1`). The workflow marks a tag with a `-`
+as a pre-release and never as latest. Check it after the workflow:
+
+```sh
+gh release view vNEW -R SpoBo/taskguard --json isPrerelease --jq .isPrerelease   # true
+gh release view -R SpoBo/taskguard --json tagName --jq .tagName                   # the last full release
+```
+
+A pre-release can be tagged on a branch other than `master` when the user
+asks for it; the workflow builds the tagged commit.
+
 ### Dry run
 
 To test changes to `release.yml` without a release, start the workflow by

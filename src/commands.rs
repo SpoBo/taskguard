@@ -26,9 +26,18 @@ pub fn limits(cfg: &Config) -> Limits {
         noise_mem_pct: cfg.noise_mem,
         noise_cpu: cfg.noise_cpu,
         outside_admit: cfg.outside_admit,
-        outside_mem_max_pct: cfg.pause_at,
+        outside_mem_max_pct: outside_ceiling(cfg.mem_max, cfg.pause_at),
         partial_fit: cfg.partial_fit.clamp(0.0, 1.0),
     }
+}
+
+/// The share of RAM up to which `outside_admit` lets a job start: `pause_at`,
+/// where auto_pause would start pausing jobs. A job it lets start is over
+/// `mem_max` already, so with `mem_max` at or above `pause_at` the rule could
+/// never admit anything; then the ceiling is halfway from `mem_max` to all of
+/// RAM.
+pub fn outside_ceiling(mem_max: f64, pause_at: f64) -> f64 {
+    if pause_at > mem_max { pause_at } else { (mem_max + 100.0) / 2.0 }
 }
 
 /// Everything the status screen and the dashboard's Queue view show.
@@ -474,8 +483,19 @@ pub fn doctor(args: &[String]) -> Result<i32> {
     println!("namespace here: {}", key::namespace(&cwd));
     println!();
     println!(
-        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  partial_fit {}  hints {}",
-        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.partial_fit, cfg.hints
+        "limits: cpu_max {:.0}%  mem_max {:.0}%  learn_stagger {}s  max_bypass {}s  max_backfill {}s  partial_fit {}  expect_wait {}s  hints {}",
+        cfg.cpu_max, cfg.mem_max, cfg.learn_stagger, cfg.max_bypass, cfg.max_backfill, cfg.partial_fit, cfg.expect_wait, cfg.hints
+    );
+    println!(
+        "work from history: {}",
+        if cfg.infer_work {
+            format!(
+                "on, when it followed {} of a stack's last {} runs within {}s of its start (infer_work)",
+                cfg.infer_work_min, cfg.infer_work_of, cfg.infer_work_within
+            )
+        } else {
+            "off (infer_work = false)".into()
+        }
     );
     for (k, v) in &cfg.origin {
         if v != "built-in" {
@@ -733,5 +753,39 @@ mod tests {
         assert!(parse_prune(&args("a b")).is_err(), "an unquoted * the shell expanded");
         assert!(parse_prune(&args("--bogus")).is_err());
         assert!(parse_prune(&args("--ratio")).is_err());
+    }
+
+    #[test]
+    fn outside_admit_still_works_with_mem_max_above_pause_at() {
+        use crate::machine::MachineSample;
+        use crate::queue::{Decision, decide};
+        const GB: u64 = 1024 * 1024;
+        // The MacBook: mem_max 95, pause_at 92 by default.
+        let cfg = Config { mem_max: 95.0, noise_mem: 0.0, ..Config::default() };
+        let lim = limits(&cfg);
+        assert_eq!(lim.outside_mem_max_pct, 97.5);
+        assert_eq!(limits(&Config::default()).outside_mem_max_pct, 92.0, "under pause_at the ceiling stays pause_at");
+        // 29.5 GB held, 1 GB of it taskguard's; a 1 GB job would reach 95.3%
+        // of 32 GB, over mem_max only because of other programs. It starts,
+        // where a ceiling of 92% under a limit of 95% let nothing through.
+        let mut running =
+            Entry { key: "api".into(), need_mem_kb: GB, live_mem_kb: GB, known: true, started_at: Some(1.0), ..Default::default() };
+        running.need_cpu = 0.5;
+        let me =
+            Entry { ticket: 2, key: "worker".into(), need_cpu: 0.5, need_mem_kb: GB, known: true, queued_at: 1.0, ..Default::default() };
+        let m = MachineSample::fixed(1.0, 12, 29 * GB + GB / 2, 32 * GB);
+        let d = decide(&m, &lim, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 2.0, &[]);
+        assert!(matches!(&d, Decision::Admit { early: Some(why), .. } if why.contains("outside_admit")), "{d:?}");
+        let old = crate::queue::Limits { outside_mem_max_pct: 92.0, ..lim };
+        assert!(matches!(
+            decide(&m, &old, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 2.0, &[]),
+            Decision::Wait { .. }
+        ));
+        // Above the new ceiling memory stays a hard rule.
+        let m = MachineSample::fixed(1.0, 12, 30 * GB + GB / 2, 32 * GB);
+        assert!(matches!(
+            decide(&m, &lim, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 2.0, &[]),
+            Decision::Wait { .. }
+        ));
     }
 }

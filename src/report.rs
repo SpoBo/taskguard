@@ -3,7 +3,7 @@
 //! the scheduler really thinks.
 
 use crate::machine::MachineSample;
-use crate::queue::{Blocker, Decision, Entry, Limits, reserve};
+use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, own_guess, reserve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -61,6 +61,12 @@ pub fn blocker_text(b: &Blocker) -> String {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
         Blocker::Paused { key } => format!("{key} is paused for memory; it resumes before anything new starts"),
+        Blocker::Stack { key } => format!("work for {key}, which has not started yet; it starts after it"),
+        Blocker::Expect { work, wait_s } => format!(
+            "waits up to {:.0}s more for the work it expects ({}) to queue, so it starts with room for both",
+            wait_s.ceil(),
+            work.join(", ")
+        ),
         Blocker::Memory { would_pct, limit_pct, short_kb, .. } => {
             format!("memory: would reach {would_pct:.0}% (limit {limit_pct:.0}%), {} short", gb(*short_kb))
         }
@@ -131,28 +137,32 @@ pub fn eta_text(eta: f64) -> String {
 
 fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
     let remaining = |e: &Entry| e.remaining(now);
-    let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<(String, Option<f64>)> {
+    let first_to_free = |need: &dyn Fn(&Entry) -> f64, short: f64| -> Option<&Entry> {
         let mut rs: Vec<&Entry> = running.iter().collect();
-        rs.sort_by(|a, b| remaining(a).unwrap_or(f64::MAX).total_cmp(&remaining(b).unwrap_or(f64::MAX)));
+        // A long-lived job comes last: it ends only when someone stops it.
+        rs.sort_by(|a, b| {
+            a.lasting().cmp(&b.lasting()).then(remaining(a).unwrap_or(f64::MAX).total_cmp(&remaining(b).unwrap_or(f64::MAX)))
+        });
         let mut freed = 0.0;
         for e in rs {
             freed += need(e);
             if freed >= short {
-                return Some((e.key.clone(), remaining(e)));
+                return Some(e);
             }
         }
         None
     };
-    let when = |key: String, rem: Option<f64>| match rem {
-        Some(r) => (format!("starts when {key} finishes (about {} left)", dur(r)), Some(r)),
-        None => (format!("starts when {key} finishes"), None),
+    let when = |e: &Entry| match remaining(e) {
+        _ if e.lasting() => (format!("starts when {} is stopped (long-lived: it does not end by itself)", e.key), None),
+        Some(r) => (format!("starts when {} finishes (about {} left)", e.key, dur(r)), Some(r)),
+        None => (format!("starts when {} finishes", e.key), None),
     };
     match b {
         Blocker::Older { key } | Blocker::Reserved { key, .. } | Blocker::Priority { key, .. } | Blocker::Pipeline { key, .. } => {
             (format!("starts after {key} has started"), None)
         }
-        Blocker::Slots { holders, .. } => match holders.first() {
-            Some(h) => when(h.clone(), running.iter().find(|e| &e.key == h).and_then(remaining)),
+        Blocker::Slots { holders, .. } => match holders.first().and_then(|h| running.iter().find(|e| &e.key == h)) {
+            Some(e) => when(e),
             None => ("starts when a slot frees up".into(), None),
         },
         Blocker::LearnStagger { wait_s } => (format!("starts in about {:.0}s", wait_s.ceil()), Some(*wait_s)),
@@ -163,17 +173,19 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         Blocker::Pressure { paced: true, .. } => ("starts when memory fits".into(), None),
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
         Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
+        Blocker::Stack { key } => (format!("starts after {key} has started"), None),
+        Blocker::Expect { wait_s, .. } => (format!("decides in at most {:.0}s", wait_s.ceil()), Some(*wait_s)),
         Blocker::Memory { short_kb, .. } => {
             let need = |e: &Entry| e.need_mem_kb.max(e.live_mem_kb) as f64;
             match first_to_free(&need, *short_kb as f64) {
-                Some((k, r)) => when(k, r),
+                Some(e) => when(e),
                 None => (format!("starts when {} of memory frees up", gb(*short_kb)), None),
             }
         }
         Blocker::Cpu { short, .. } => {
             let need = |e: &Entry| e.need_cpu.max(e.live_cpu);
             match first_to_free(&need, *short) {
-                Some((k, r)) => when(k, r),
+                Some(e) => when(e),
                 None => (format!("starts when {short:.1} cores free up"), None),
             }
         }
@@ -482,14 +494,16 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             ),
         ));
     }
-    let mem_would = m.mem_used_kb + s.reserve_mem_kb + e.need_mem_kb;
+    let need = need_with_booking(e, &s.running).saturating_sub(own_guess(e, &s.running, &queued(s)));
+    let mem_would = m.mem_used_kb + s.reserve_mem_kb + need;
     out.push((
         checked("memory", mem_would <= s.mem_limit_kb),
         format!(
-            "memory: {} held + {} promised + {} for this job = {:.0}% (limit {:.0}%)",
+            "memory: {} held + {} promised + {} for this job{} = {:.0}% (limit {:.0}%)",
             gb(m.mem_used_kb),
             gb(s.reserve_mem_kb),
-            gb(e.need_mem_kb),
+            gb(need),
+            link_text(e, &s.running, &queued(s)),
             mem_would as f64 * 100.0 / m.mem_total_kb.max(1) as f64,
             s.limits.mem_max_pct
         ),
@@ -526,6 +540,33 @@ pub fn bar(used: f64, over: f64, reserved: f64, total: f64, limit: f64, width: u
             }
         })
         .collect()
+}
+
+/// The entries of the jobs that wait.
+fn queued(s: &Snapshot) -> Vec<Entry> {
+    s.waiting.iter().map(|w| w.entry.clone()).collect()
+}
+
+/// What a job's link to a long-lived job adds to its line: the work a
+/// long-lived job expects and books room for, or the long-lived job a job
+/// is work for. Empty for any other job. Work the history guessed reads
+/// "from history" until a job queues for it and makes it come true.
+pub fn link_text(e: &Entry, running: &[Entry], waiting: &[Entry]) -> String {
+    let mut t = String::new();
+    if let Some(w) = &e.work_for {
+        t += &format!(" (for stack {})", w.key);
+    }
+    let open: Vec<String> = e
+        .expects
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| x.open())
+        .map(|(i, x)| if is_guess(e, i, running, waiting) { format!("{} from history", x.work) } else { x.work.clone() })
+        .collect();
+    if !open.is_empty() {
+        t += &format!(" (expects {}, books {})", open.join(", "), gb(booked(e, running)));
+    }
+    t
 }
 
 /// The job's key cut to `n` characters, with its priority when it has one: "api:tsc p2".
@@ -577,6 +618,7 @@ pub fn render_status(s: &Snapshot) -> String {
     let _ = writeln!(o);
     let _ =
         writeln!(o, "RUNNING ({})                          pool          time   CPU now / needs      MEMORY now / needs", s.running.len());
+    let queue = queued(s);
     if s.running.is_empty() {
         let _ = writeln!(o, "  (nothing running)");
     }
@@ -593,14 +635,15 @@ pub fn render_status(s: &Snapshot) -> String {
         let min = if e.raised_by_min { " min" } else { "" };
         let _ = writeln!(
             o,
-            "  {:<36} {:<12} {:>6}   {:>4.1} / {:<9}  {:>8} / {}{min}{tag}",
+            "  {:<36} {:<12} {:>6}   {:>4.1} / {:<9}  {:>8} / {}{min}{tag}{}",
             job_name(e, 36),
             trunc(e.pool.as_deref().unwrap_or("-"), 12),
             dur(s.now - e.started_at.unwrap_or(s.now)),
             e.live_cpu,
             needs_cpu,
             gb(e.live_mem_kb),
-            needs_mem
+            needs_mem,
+            link_text(e, &s.running, &queue)
         );
     }
     let _ = writeln!(o);
@@ -628,6 +671,7 @@ pub fn render_status(s: &Snapshot) -> String {
         if e.stalled {
             blocked += " [stalled: holds no job back]";
         }
+        blocked += &link_text(e, &s.running, &queue);
         let _ = writeln!(
             o,
             "  {:<36} {:<12} {:>6}   {:<21} {}",
@@ -687,6 +731,41 @@ mod tests {
             outside_mem_max_pct: 95.0,
             partial_fit: 0.5,
         }
+    }
+
+    #[test]
+    fn a_guess_reads_from_history_until_work_queues_for_it() {
+        let guess = crate::queue::Expect { work: "browser".into(), mem_kb: GB, implied: true, ..Default::default() };
+        let stack = Entry { pid: 11, long_lived: true, expects: vec![guess], ..Default::default() };
+        let running = std::slice::from_ref(&stack);
+        assert_eq!(link_text(&stack, running, &[]), " (expects browser from history, books 1.0 GB)");
+        let link = crate::queue::WorkFor { pid: 11, key: "dev-env:stack".into(), item: Some(0) };
+        let run = Entry { pid: 30, work_for: Some(link), ..Default::default() };
+        assert_eq!(link_text(&stack, running, std::slice::from_ref(&run)), " (expects browser, books 1.0 GB)");
+        assert_eq!(link_text(&run, running, &[]), " (for stack dev-env:stack)");
+    }
+
+    #[test]
+    fn the_memory_rule_leaves_out_what_a_waiting_stack_only_guessed() {
+        let lim = Limits { partial_fit: 0.0, max_backfill: 0.0, ..advice_limits() };
+        let m = MachineSample::fixed(1.0, 12, 20 * GB, 32 * GB);
+        let guess = crate::queue::Expect { work: "browser".into(), mem_kb: 43 * GB / 10, implied: true, ..Default::default() };
+        let stack = Entry {
+            ticket: 1,
+            pid: 11,
+            key: "dev-env:stack".into(),
+            long_lived: true,
+            need_mem_kb: 6 * GB,
+            known: true,
+            expects: vec![guess],
+            ..Default::default()
+        };
+        let s = Snapshot::build(m, lim, vec![], vec![stack], 1000.0, &[]);
+        assert!(matches!(s.waiting[0].decision, Decision::Admit { .. }), "26 GB of 27.2 fits without the guess");
+        let checks = rule_checks(&s, &s.waiting[0]);
+        let (ok, text) = checks.iter().find(|(_, t)| t.starts_with("memory:")).cloned().unwrap();
+        assert!(ok, "{text}");
+        assert!(text.contains("6.0 GB for this job"), "{text}");
     }
 
     /// Voyager: 18 cores at cpu_max 150 is 27 cores. A typecheck that needs
@@ -887,5 +966,27 @@ mod tests {
         assert!(text.contains("1.8 GB short (may start in about 43s)"), "the waiting row says when:\n{text}");
         assert_eq!(s.waiting[0].eta_s.map(|t| t.round()), Some(43.0));
         assert!(text.contains("packages/api:tsc"));
+    }
+
+    #[test]
+    fn a_long_lived_holder_is_named_as_stopped_not_finished() {
+        let stack = Entry {
+            key: "dev-env:stack".into(),
+            need_mem_kb: 9 * GB,
+            live_mem_kb: 7 * GB,
+            long_lived: true,
+            started_at: Some(0.0),
+            ..Default::default()
+        };
+        let b = Blocker::Memory {
+            would_pct: 100.0,
+            limit_pct: 95.0,
+            short_kb: 2 * GB,
+            used_kb: 0,
+            reserve_kb: 0,
+            need_kb: 0,
+            total_kb: 32 * GB,
+        };
+        assert_eq!(unblock_text(&b, &[stack], 1000.0), "starts when dev-env:stack is stopped (long-lived: it does not end by itself)");
     }
 }

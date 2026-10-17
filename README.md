@@ -107,8 +107,10 @@ below).
   so the next job waits until it has shown what it takes (at most two
   minutes). A job with a history has its whole need booked from its first
   second, so the next job may start at once. So the job that needs that
-  stack does not wait behind it. `warn_admit = false` makes warning stop
-  every new job again.
+  stack does not wait behind it. When nothing runs but long-lived jobs past
+  their start-up, the rule below for nothing running decides at warning too,
+  up to all of RAM. `warn_admit = false` makes warning stop every new job
+  again.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
@@ -127,12 +129,21 @@ below).
   starts anyway: readings move by that much from one second to the next.
   So does a job that only programs outside taskguard keep out, while
   taskguard's own jobs fit under the limits (`outside_admit`). Memory stays a
-  hard rule at `pause_at` (92%). Each such start prints a warning with what
-  the job lacks and the rule that let it start.
-- **Nothing running means the job starts,** whatever the CPU and memory
-  readings say, so the queue cannot deadlock on a wrong reading. Memory
-  pressure is the one exception: then the load comes from other programs, and
-  jobs wait until it eases.
+  hard rule at `pause_at` (92%), or, when `mem_max` is at or above `pause_at`,
+  halfway from `mem_max` to all of RAM (97.5% for `mem_max = 95`). Each such
+  start prints a warning with what the job lacks and the rule that let it
+  start.
+- **Nothing running means the first job in line that fits starts,** whatever
+  the CPU reading says and up to all of RAM, so the queue cannot deadlock on
+  a wrong reading or on programs outside taskguard. The same holds when
+  nothing runs but long-lived jobs past their start-up. A job that would not
+  fit in RAM even so waits for memory and holds nobody back: the jobs behind
+  it that fit start. Next to long-lived jobs, a long-lived job must fit under
+  `mem_max` (with `noise_mem`), or the ceiling `outside_admit` allows: it does
+  not end by itself, so starting it over the limit is no progress but load
+  that stays. Memory pressure is the one exception:
+  then the load comes from other programs, and jobs wait until it eases
+  (at macOS warning, see above).
 - **Any order, oldest first.** A small job may pass a big one that does not
   fit yet. This is safe: a job only reaches taskguard when its launcher has
   decided that it may run. Turbo starts a task only after the tasks it depends
@@ -181,7 +192,7 @@ below).
   its learned duration says it ends before the reserved job could start
   anyway: before the running jobs have freed the room it lacks, or, when
   programs outside taskguard keep it out, before none of them runs (then the
-  first in line starts whatever the readings say). Such a job takes no room
+  first in line that fits in RAM starts). Such a job takes no room
   the reserved one could use, so a steady stream of small jobs cannot keep it
   out, and a lint is not held up for half an hour behind a job that waits for
   two long test runs. A job with no learned duration waits. For a reserved job
@@ -190,6 +201,14 @@ below).
   when no other job runs, also when its need is above the whole limit. On by
   default for 10 minutes (`max_backfill = 600`); `0` turns it off, `1800`
   lets every job that fits through for half an hour.
+- **A job that only a stopped stack can make room for holds nobody back.**
+  A job ahead in line that would not fit by the rule for nothing running even
+  once every job that ends by itself has ended can only start when a
+  long-lived job is stopped, or when programs outside taskguard free memory.
+  Holding the jobs behind it gains it nothing, so it holds none of them back,
+  whatever its priority or reservation: on Omarchy one 5.5 GB lint that only
+  fit once a dev stack stopped kept two dozen others out, among them a test of
+  189 MB.
 - **Pools** add a slot ceiling where jobs share something: one database, one
   set of services, one lock file. A slot ceiling only stops such jobs from
   running at the same time and breaking each other; CPU and memory are always
@@ -202,15 +221,81 @@ below).
   a job starts when there is room for its start-up peak, and holds that peak
   for its start-up (`startup`, 300 seconds by default). Then its needs start
   again from what it uses: its CPU need is what it wanted over the last 10
-  seconds, up or down, and its memory need what it holds plus 25%, or what
-  its past runs grew to after their start-up when that is more, and it follows
-  its peak from there. A DALP dev stack wants almost every core while it
+  seconds, up or down, and its memory need what it holds plus 25%, up or
+  down with each reading, so an idle stack releases its booking. A DALP dev
+  stack wants almost every core while it
   starts and seeds, then idles at a few percent; without this it kept every
   core for hours. Its history keeps both: the start-up peak, which the next
   run is admitted against, and what it took after. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
-  nothing else runs, the first in line starts whatever the readings say.
-  `auto_pause` leaves it alone. `taskguard status` marks it `STEADY`.
+  nothing else runs, the first in line that fits starts. A waiting long-lived
+  job itself starts that way next to it only under `mem_max`, or, when only
+  programs outside taskguard keep it out, up to the ceiling `outside_admit`
+  allows. With nothing of taskguard's running at all, it starts up to all of
+  RAM: nothing taskguard runs would free that memory. `auto_pause` leaves it
+  alone. `taskguard status` marks it `STEADY`, and a job it keeps out says it
+  starts when the stack is stopped, not when it finishes.
+- **Work for a long-lived job goes first.** The caller that starts a dev
+  stack usually knows what will run on it: the browser run it brings the
+  stack up for. It can say so, with `--expect WORK` on the stack's job
+  (repeatable) or `TASKGUARD_EXPECT=WORK,WORK` in its environment, so it
+  passes through scripts such as `devenv up`. WORK is a pool name, a job key,
+  or a command pattern as in `[[job]] match`. The stack then books room for
+  each piece of work, learned as that work learns its own need: the need
+  jobs of the pool typically started with (their peak with headroom, or a
+  minimum), or the history or first guess of the command. It
+  starts only when the machine has room for itself and that work, so the
+  whole load is known before it starts. A job that queues in the same
+  checkout and matches WORK is that work: it goes one priority above the
+  stack, so it starts before the jobs that queued for room meanwhile and
+  before a next stack, and when it starts it takes over the room booked for
+  it, which the stack then drops. `taskguard status` shows both ends: `(for
+  stack dev-env:stack)` on the work, `(expects browser, books 4.3 GB)` on the
+  stack. Work that queues while its stack still waits waits for the stack and
+  holds nobody back meanwhile. A stack with work queued for it, and work whose
+  stack runs, hold their turn as a strict reservation, also while they do not
+  fit yet: lints that fit do not take the room meanwhile, unless the stack
+  could only start once another stack is stopped. A stack started without
+  `--expect` books only what its history infers (below); the variable means
+  nothing to any other job.
+- **Without a declaration, the history says what work follows a stack.**
+  When at least `infer_work_min` (3) of a stack's last `infer_work_of` (5)
+  runs in its checkout had work of one kind queue there within
+  `infer_work_within` (900) seconds of their start, that work is expected
+  again. A kind of work is a pool, or the key of a job outside any pool. The
+  stack books that work's usual need, which `taskguard status` shows as
+  `(expects browser from history, books 4.3 GB)` until work queues for
+  it, and while the guess is open the work links and goes first as declared
+  work does. It is a guess, so it is bounded:
+  - it books room for twice the work's usual delay after the stack started,
+    ten minutes at most, and drops it once work for the stack starts or the
+    stack stops;
+  - once it has expired or its work has started, no work links to it, and
+    work linked to it drops back to its own priority and holds its turn no
+    more;
+  - no job that ends by itself waits for it by the rule for nothing running,
+    so it can never stop the queue, and such a job waits for it at most up
+    to all of RAM;
+  - another stack respects it while it is open, also one whose caller
+    declared no work, so the room is there when the work comes. Such a stack
+    leaves only its own guess out, starts at once when it still fits next to
+    the open guess, and otherwise waits at most until the guess expires or
+    its work starts;
+  - a declaration always wins: a stack with `--expect` books only what was
+    declared, and `--expect none` expects nothing at all;
+  - `infer_work = false` turns it off.
+
+  Once the work has queued and linked to it, its room is no guess any more
+  and is booked as declared work is, by every rule, also the rule for
+  nothing running: it does not expire while that work waits, and it ends
+  when the work starts, or, past its time, when the work leaves the queue.
+- **A stack waits a few seconds for its work.** A caller may start the stack
+  and its work at the same moment, not one after the other. So a long-lived
+  job that expects work, declared or from its history, waits up to
+  `expect_wait` (5) seconds, before it starts, for that work to queue, and
+  starts as soon as it has: with room for both, and the work right after it.
+  A stack that expects nothing starts at once, as before: sometimes you only
+  want the stack. `expect_wait = 0` turns the wait off.
 
 ### What is measured
 
@@ -302,6 +387,7 @@ taskguard --wait [--id NAME]
 | `--min-cpu N` | Never start with fewer than N free cores. |
 | `--min-mem SIZE` | Never start with less than SIZE free (`6G`, `512M`). |
 | `--priority N` | Higher starts first. The default is 0, or `priority` from the config. |
+| `--expect WORK` | For a long-lived job: work that will run on it (a pool name, job key or command pattern). It books room for it, and that work goes first. Repeatable; also `TASKGUARD_EXPECT=WORK,WORK`. `none`: no work, not even what its history suggests. |
 | `--now` | Skip the queue, but still measure and learn. |
 | `--bg` | Wait for room, then return and let the job run on. |
 | `--pipe` | With `--bg`: pass stdin to the command. |
@@ -442,8 +528,9 @@ signs of starvation. `Esc` or `Backspace` goes back to the same row, and `j`
 opens the last job again.
 
 `?` lists every key of the view you are in, and the keys of every view; the
-bottom line starts with it and shows the keys of the view that fit. `?` or
-`Esc` closes the list, and any other key closes it and does its work.
+bottom line starts with it and shows the keys of the view that fit, with
+the version of taskguard at the right when room is left. `?` or `Esc`
+closes the list, and any other key closes it and does its work.
 
 Keys: `1`-`9`, `Tab`, or Shift, Option or Cmd with `←`/`→` change views. `t`
 time range (5m to 7d), `n` namespace, `/` filter, `←`/`→` time cursor,
@@ -541,6 +628,8 @@ outlier_ratio = 1.5    # a peak this many times the next one is an outlier; 0 = 
 outside_admit = true   # start jobs that only other programs keep out
 partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
 max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
+expect_wait = 5        # a dev stack waits this long for the work it expects to queue
+infer_work = true      # a dev stack books the work its history says follows it
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -594,8 +683,19 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   `outlier_weights = [0.5]` to learn sooner, or `outlier_ratio = 0` to learn
   every peak at once.
 - A job that starts early on `noise_mem` or `outside_admit` can push memory
-  past `mem_max`, up to `pause_at`. Set `outside_admit = false` and
+  past `mem_max`, up to `pause_at` (or halfway from `mem_max` to all of RAM
+  when `mem_max` is at or above `pause_at`). Set `outside_admit = false` and
   `noise_mem = 0` to keep `mem_max` a hard rule.
+- A stack that expects work (`--expect`) books room for it until it starts,
+  however long that takes: work that never comes keeps that room booked
+  while the stack runs. A stack plus its work that do not fit next to another
+  stack wait for room, where before the stack started and its work waited.
+  Work only links to a stack in its own checkout.
+- A guess of the history that does not come true books room for up to ten
+  minutes per stack: while it does, jobs that do not fit next to it wait,
+  unless nothing but long-lived jobs runs. In the model, when no run follows
+  any stack, about a quarter fewer lints ran at 14.5 GB held by other
+  programs, and none waited more than a minute longer.
 
 ## Moving from tsc-queue
 
@@ -654,6 +754,18 @@ A version only follows the rules it knows. A version that does not know
 `long_lived` runs such a job as any other: it holds its start-up peak until it
 ends. Its waiting jobs do read the lower needs of a long-lived job that a newer
 version runs, but they still wait for it to end when nothing else runs.
+Versions up to 0.10.0 start the first in line whatever the readings say when
+nothing runs but long-lived jobs past their start-up, also a second dev stack
+over `mem_max`, and skip that rule at macOS warning; their jobs decide so
+whatever newer versions do. They do not know `--expect` either: they ignore
+`TASKGUARD_EXPECT`, do not see what a newer stack books for its work,
+declared or from its history, and may start their own jobs into that room.
+Nor do they know `expect_wait`: they see a stack that waits a few seconds for
+its work as one that could start, and mark it as stalled only after 10
+seconds, so keep `expect_wait` under 10 while such versions share the
+machine. The priority a newer job takes as work
+for a stack is an ordinary priority, so their waiting jobs do let it go
+first.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not

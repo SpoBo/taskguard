@@ -555,6 +555,18 @@ fn median(v: &mut [f64]) -> Option<f64> {
     Some(if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 })
 }
 
+/// Work that followed runs of a long-lived job: see `Db::followers`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Follower {
+    pub work: String,
+    /// On how many of the runs looked at it followed.
+    pub runs: usize,
+    /// How long after the start it first queued, the median.
+    pub lag_s: f64,
+    /// The memory it queued with, the median.
+    pub need_kb: Option<u64>,
+}
+
 pub fn median_of(mut v: Vec<f64>) -> Option<f64> {
     median(&mut v)
 }
@@ -1006,7 +1018,11 @@ impl Db {
         if let Some(p) = pool {
             tiers.push((None, None, Some(p), None, format!("jobs in {p}")));
         }
-        tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
+        // A guess without a program (work named only by its pool) does not
+        // fall back on every job there is.
+        if !tool.is_empty() {
+            tiers.push((None, None, None, Some(tool), format!("{tool} jobs")));
+        }
         for (same, l, p, t, what) in tiers {
             let mut stmt = self.conn.prepare_cached(
                 "SELECT max(peak_mem_kb), avg(coalesce(cores_used, cores_wanted)), avg(ended_at - started_at - coalesce(paused_s, 0)) FROM runs
@@ -1036,6 +1052,82 @@ impl Db {
             return Ok(Some(Estimate { mem_kb: mem, cpu, dur_s, from }));
         }
         Ok(None)
+    }
+
+    /// The memory jobs of `pool` typically started with, over the last 30
+    /// days: the 90th percentile of each key's highest need, and how many
+    /// keys that is. A need is what a job is admitted with (its peak with
+    /// headroom, or a minimum), so it is what room booked for such a job
+    /// must cover; their peaks would leave the difference unbooked.
+    pub fn pool_need(&self, pool: &str) -> Result<Option<(u64, usize)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT max(need_mem_kb) FROM runs
+             WHERE pool = ?1 AND need_mem_kb > 0 AND started_at IS NOT NULL AND queued_at > ?2
+             GROUP BY key",
+        )?;
+        let mut v: Vec<i64> =
+            stmt.query_map(params![pool, now() - 30.0 * 86400.0], |r| r.get(0))?.collect::<std::result::Result<_, _>>()?;
+        if v.is_empty() {
+            return Ok(None);
+        }
+        v.sort();
+        Ok(Some((v[((v.len() as f64 * 0.9) as usize).min(v.len() - 1)] as u64, v.len())))
+    }
+
+    /// The work that followed a long-lived job before: for the last `of`
+    /// runs of `key` in `checkout` (of the last two weeks), every job of
+    /// another kind that queued in that checkout within `within` seconds of
+    /// the run's start, while it ran. Work is a job's pool, or its key when
+    /// it has none. Returns how many runs were looked at, and for each kind
+    /// of work on how many of them it followed, how long after the start it
+    /// first queued (the median), and the need it queued with (the median),
+    /// most often first.
+    pub fn followers(&self, key: &str, pool: Option<&str>, checkout: &str, of: usize, within: f64) -> Result<(usize, Vec<Follower>)> {
+        let now = now();
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, started_at, coalesce(ended_at, ?3) FROM runs
+             WHERE key = ?1 AND started_at IS NOT NULL AND started_at > ?3 - 14 * 86400
+               AND (cwd = ?2 OR substr(cwd, 1, length(?2) + 1) = ?2 || '/')
+             ORDER BY started_at DESC LIMIT ?4",
+        )?;
+        let runs: Vec<(i64, f64, f64)> = stmt
+            .query_map(params![key, checkout, now, of as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT coalesce(pool, key), min(queued_at) - ?3, need_mem_kb FROM runs
+             WHERE id != ?1 AND key != ?2 AND (pool IS NULL OR ?5 IS NULL OR pool != ?5)
+               AND queued_at >= ?3 AND queued_at <= ?4
+               AND (cwd = ?6 OR substr(cwd, 1, length(?6) + 1) = ?6 || '/')
+             GROUP BY coalesce(pool, key)",
+        )?;
+        let mut seen: Vec<(String, Vec<f64>, Vec<f64>)> = Vec::new();
+        for (id, from, to) in &runs {
+            let rows: Vec<(String, f64, Option<i64>)> = stmt
+                .query_map(params![id, key, from, to.min(from + within), pool, checkout], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            for (w, lag, need) in rows {
+                let i = match seen.iter().position(|(s, _, _)| *s == w) {
+                    Some(i) => i,
+                    None => {
+                        seen.push((w, Vec::new(), Vec::new()));
+                        seen.len() - 1
+                    }
+                };
+                seen[i].1.push(lag);
+                seen[i].2.extend(need.filter(|n| *n > 0).map(|n| n as f64));
+            }
+        }
+        let mut out: Vec<Follower> = seen
+            .into_iter()
+            .map(|(work, lags, needs)| Follower {
+                work,
+                runs: lags.len(),
+                lag_s: median_of(lags).unwrap_or(0.0),
+                need_kb: median_of(needs).map(|n| n as u64),
+            })
+            .collect();
+        out.sort_by(|a, b| b.runs.cmp(&a.runs).then(a.work.cmp(&b.work)));
+        Ok((runs.len(), out))
     }
 
     /// How many of the key's most recent runs in a row were starved.
@@ -1853,6 +1945,42 @@ mod tests {
         run(&db, "k", 1000, 1.0, 10.0, None);
         let l = db.learned("k", &Learn::default()).unwrap();
         assert_eq!((l.steady_mem_kb, l.steady_cpu), (None, None));
+    }
+
+    #[test]
+    fn the_work_that_followed_a_stack_in_its_checkout() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let t = now() - 86400.0;
+        let at = |key: &str, pool: Option<&str>, cwd: &str, need: u64, queued: f64, started: f64, ended: Option<f64>| {
+            let id = db.insert_run(&NewRun { ns: "n", key, pool, cwd, need_mem_kb: need, ..Default::default() }).unwrap();
+            db.conn
+                .execute(
+                    "UPDATE runs SET queued_at = ?2, started_at = ?3, ended_at = ?4 WHERE id = ?1",
+                    params![id, queued, started, ended],
+                )
+                .unwrap();
+        };
+        // Four stacks in /w/dalp. A browser run followed three of them, 6 to
+        // 8 minutes after their start, and the fourth only after 20 minutes.
+        // A lint followed each. The last stack still runs.
+        for (i, lag) in [(0, 360.0), (1, 420.0), (2, 480.0), (3, 1200.0)] {
+            let s = t + 3600.0 * i as f64;
+            at("dev-env:stack", Some("stack"), "/w/dalp", 9000, s - 10.0, s, (i < 3).then_some(s + 1800.0));
+            at("e2e/agentic:pr.ts", Some("browser"), "/w/dalp/e2e/agentic", 4000 + i as u64, s + lag, s + lag, Some(s + lag + 300.0));
+            at(&format!("pkg{i}:oxlint"), None, "/w/dalp/pkg", 5000, s + 60.0, s + 60.0, Some(s + 70.0));
+        }
+        // Nothing of another checkout counts, nor whatever ran before a stack.
+        at("e2e/agentic:pr.ts", Some("browser"), "/w/dalp-2/e2e/agentic", 4000, t + 7300.0, t + 7300.0, Some(t + 7400.0));
+        at("root:tsc", None, "/w/dalp", 1000, t - 600.0, t - 600.0, Some(t - 500.0));
+        let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/dalp", 5, 900.0).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(works[0], Follower { work: "browser".into(), runs: 3, lag_s: 420.0, need_kb: Some(4001) });
+        assert!(works[1..].iter().all(|f| f.work.ends_with(":oxlint") && f.runs == 1), "{works:?}");
+        // Only the last three stacks: two browser runs within the window.
+        let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/dalp", 3, 900.0).unwrap();
+        assert_eq!((n, works[0].runs), (3, 2));
+        let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/elsewhere", 5, 900.0).unwrap();
+        assert_eq!((n, works.len()), (0, 0));
     }
 
     #[test]

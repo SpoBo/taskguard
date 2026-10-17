@@ -21,6 +21,8 @@ mod report;
 mod runner;
 #[cfg(test)]
 mod sim;
+#[cfg(test)]
+mod stall;
 mod sys;
 mod top;
 
@@ -122,6 +124,7 @@ pub fn parse_opts(args: &[String]) -> Result<Opts> {
                 o.min_cpu = Some(v.parse().map_err(|_| anyhow::anyhow!("--min-cpu needs a number of cores"))?);
             }
             "--min-mem" => o.min_mem_kb = Some(config::parse_size_kb(&take_value(args, &mut i, name)?)?),
+            "--expect" => o.expect.push(take_value(args, &mut i, name)?),
             "--priority" => {
                 let v = take_value(args, &mut i, name)?;
                 o.priority = Some(v.parse().map_err(|_| anyhow::anyhow!("--priority needs a whole number"))?);
