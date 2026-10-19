@@ -17,8 +17,9 @@ and the versions follow [semver](https://semver.org).
   may start with memory over RAM: as the only job in the queue after
   `overcommit_after` (120) seconds, or as the first in line after
   `overcommit_stuck_after` (1800) seconds while other jobs queue too. Work
-  that takes over the room its running stack booked for it starts so at
-  once. Never at critical pressure (on Linux, never at `pressure_max`), up
+  for a running stack counts as alone next to it. Work that takes over the
+  room a stack declared for it starts so at once only when that stack itself
+  started by over-commit; otherwise it waits as any other job. Never at critical pressure (on Linux, never at `pressure_max`), up
   to `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM,
   and with the part over RAM in at most half the free swap; on macOS the
   swap counts the free space of the volume its swap files grow on.

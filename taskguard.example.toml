@@ -110,8 +110,9 @@ partial_fit = 0.5
 # Over-commit: a job that only memory keeps out, with nothing of taskguard's
 # running, may start with memory over RAM once it has waited overcommit_after
 # seconds as the only job in the queue, or overcommit_stuck_after seconds as
-# the first in line while other jobs queue too. Work that takes over the room
-# its running stack booked for it does so at once. Never at critical pressure
+# the first in line while other jobs queue too; work for a running stack
+# counts as alone next to it. Work that takes over the room declared for it
+# by a stack that itself started so does so at once. Never at critical pressure
 # (on Linux, never at pressure_max). Memory may reach overcommit_max_macos or
 # overcommit_max_linux percent of RAM, by the OS taskguard runs on, and the
 # part over RAM must fit in half the free swap (macOS: what its swap files

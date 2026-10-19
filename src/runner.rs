@@ -687,9 +687,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
                     me.need_cpu = queue::cpu_to_book(&decision, me.need_cpu);
-                    me.over_ram = match &decision {
-                        Decision::Admit { over_ram, .. } => *over_ram,
-                        Decision::Wait { .. } => queue::over_ram(&m, &limits, &running, &waiting, &me),
+                    (me.over_ram, me.overcommitted) = match &decision {
+                        Decision::Admit { over_ram, overcommitted, .. } => (*over_ram, *overcommitted),
+                        Decision::Wait { .. } => (queue::over_ram(&m, &limits, &running, &waiting, &me), false),
                     };
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);

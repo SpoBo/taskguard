@@ -125,6 +125,11 @@ pub struct Entry {
     /// hand. On Linux the kernel's OOM killer picks it first. Older versions
     /// leave it out.
     pub over_ram: bool,
+    /// It started by the over-commit rule itself (`Room::overcommit`), as
+    /// the only job in the queue or stuck first in line, not by --st or by
+    /// hand. Work that takes over what it declared for it inherits that.
+    /// Older versions leave it out.
+    pub overcommitted: bool,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -823,6 +828,9 @@ pub enum Decision {
         /// Memory would go over RAM: it starts by `Room::overcommit`.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         over_ram: bool,
+        /// It starts by `Room::overcommit`.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        overcommitted: bool,
     },
     Wait {
         blockers: Vec<Blocker>,
@@ -990,6 +998,9 @@ pub fn decide(
     // A stalled job holds nobody back: it does not start whatever we wait.
     let mut older: Vec<&Entry> = waiting.iter().filter(|w| !w.stalled && w.ahead_of(me)).collect();
     older.sort_by(|a, b| a.line_order(b));
+    // First in line, for `overcommit`: work queued for `me` cannot start
+    // before it, whatever its place.
+    let first = older.iter().all(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid));
 
     // The kernel's own alarm comes first and holds back every job, even when
     // taskguard runs nothing: then the pressure comes from other programs, and
@@ -1025,10 +1036,9 @@ pub fn decide(
             if let Some(mem) =
                 room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
             {
-                if let Overcommit::Now(why) = room.overcommit(m, lim, waiting, me, false, now) {
-                    return over_committed(m, &room, me, why);
+                if !matches!(room.overcommit(m, lim, waiting, me, first, now), Overcommit::Now(_)) {
+                    return Decision::Wait { blockers: vec![mem, pressure] };
                 }
-                return Decision::Wait { blockers: vec![mem, pressure] };
             }
         }
     }
@@ -1066,21 +1076,23 @@ pub fn decide(
     // with nothing of taskguard's running, up to all of RAM: nothing taskguard
     // runs would free that.
     let room = Room::new(m, lim, running, waiting);
-    // First in line, for `overcommit`: work queued for `me` cannot start
-    // before it, whatever its place.
-    let first = older.iter().all(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid));
     if running.iter().all(Entry::steady) {
         let fits = |w: &Entry| room.fits_on_progress(m, lim, running, w);
         let head = older.iter().copied().chain(std::iter::once(me)).find(|w| fits(w));
         return match head {
-            Some(h) if !h.ahead_of(me) && running.is_empty() => {
-                Decision::Admit { reason: "nothing else is running".into(), early: None, booked_cpu: None, over_ram: false }
-            }
+            Some(h) if !h.ahead_of(me) && running.is_empty() => Decision::Admit {
+                reason: "nothing else is running".into(),
+                early: None,
+                booked_cpu: None,
+                over_ram: false,
+                overcommitted: false,
+            },
             Some(h) if !h.ahead_of(me) => Decision::Admit {
                 reason: "nothing else is running but long-lived jobs past their start-up".into(),
                 early: None,
                 booked_cpu: None,
                 over_ram: false,
+                overcommitted: false,
             },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
             None => {
@@ -1194,7 +1206,7 @@ pub fn decide(
             lim.mem_max_pct
         );
         let (early, booked_cpu) = early.unzip();
-        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten(), over_ram: false }
+        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten(), over_ram: false, overcommitted: false }
     } else if blockers.iter().all(|b| matches!(b, Blocker::Memory { .. }))
         && let Overcommit::Now(why) = room.overcommit(m, lim, waiting, me, first, now)
     {
@@ -1207,12 +1219,8 @@ pub fn decide(
 /// The admission of a job that `Room::overcommit` lets start.
 fn over_committed(m: &MachineSample, room: &Room, me: &Entry, why: String) -> Decision {
     let over_ram = room.mem_would_on(me, true) > m.mem_total_kb as f64;
-    let reason = if room.running.is_empty() {
-        "nothing else is running; only memory keeps it out, and it waited long enough (overcommit)"
-    } else {
-        "it takes over the room its long-lived job booked for it (overcommit)"
-    };
-    Decision::Admit { reason: reason.into(), early: Some(why), booked_cpu: None, over_ram }
+    let reason = "only memory keeps it out, and over-commit lets it start (overcommit)";
+    Decision::Admit { reason: reason.into(), early: Some(why), booked_cpu: None, over_ram, overcommitted: true }
 }
 
 /// In how many seconds a job that `blockers` keep out could start at the
@@ -1419,7 +1427,7 @@ pub fn overcommit_ceiling(m: &MachineSample, lim: &Limits) -> f64 {
 /// Would `me` take memory over RAM if it started now? A job started so,
 /// by any rule or by hand, is made the OOM killer's first pick on Linux.
 pub fn over_ram(m: &MachineSample, lim: &Limits, running: &[Entry], waiting: &[Entry], me: &Entry) -> bool {
-    Room::new(m, lim, running, waiting).mem_would(me) > m.mem_total_kb as f64
+    Room::new(m, lim, running, waiting).mem_would_on(me, true) > m.mem_total_kb as f64
 }
 
 /// What `Room::overcommit` says of a job that only memory keeps out.
@@ -1577,14 +1585,16 @@ impl Room {
     /// `pressure_max`), while memory would stay under `overcommit_max` of
     /// RAM and the part over RAM fits in half the free swap
     /// (`overcommit_ceiling`), when either:
-    /// - nothing of taskguard's runs and it is first in line (`head`): it has
-    ///   waited `overcommit_after` as the only job in the queue, or
-    ///   `overcommit_stuck_after` with other jobs queued behind it. Then only
-    ///   programs outside taskguard keep it out, and nothing taskguard runs
-    ///   would ever free the room;
-    /// - it takes over what its running long-lived job booked for it, and
-    ///   adds no more than `noise_mem` to that: the stack started with that
-    ///   room, so its work starts at once.
+    /// - nothing of taskguard's runs but the long-lived job it is work for,
+    ///   and it is first in line (`head`): it has waited `overcommit_after`
+    ///   as the only job in the queue, or `overcommit_stuck_after` with
+    ///   other jobs queued behind it. Then only programs outside taskguard
+    ///   keep it out, and nothing taskguard runs would ever free the room;
+    /// - it takes over what its running long-lived job declared and booked
+    ///   for it, adds no more than `noise_mem` to that, and that long-lived
+    ///   job itself started by this rule (`overcommitted`): it started over
+    ///   RAM with that room booked, so its work starts at once. A booking
+    ///   the history guessed was never part of that start.
     fn overcommit(&self, m: &MachineSample, lim: &Limits, waiting: &[Entry], job: &Entry, head: bool, now: f64) -> Overcommit {
         let critical = m.mem_pressure.is_some_and(|p| p >= 100.0 || (!lim.warn_admit && p >= lim.pressure_max));
         if lim.overcommit_max_pct <= 100.0 || critical {
@@ -1604,15 +1614,22 @@ impl Room {
             gb((would - total).max(0.0)),
             gb(m.swap_free_kb.unwrap_or(0) as f64)
         );
+        let stack = job.work_for.as_ref().and_then(|w| self.running.iter().find(|e| e.pid == w.pid));
+        let item = job.work_for.as_ref().and_then(|w| w.item).zip(stack).and_then(|(i, s)| s.expects.get(i as usize));
+        let declared = item.is_some_and(|x| !x.implied);
         let taken = booking_taken_over(job, &self.running);
-        if taken > 0 && need_with_booking(job, &self.running) as f64 <= total * lim.noise_mem_pct / 100.0 {
+        if taken > 0
+            && declared
+            && stack.is_some_and(|s| s.overcommitted)
+            && need_with_booking(job, &self.running) as f64 <= total * lim.noise_mem_pct / 100.0
+        {
             let key = job.work_for.as_ref().map(|w| w.key.as_str()).unwrap_or_default();
             return Overcommit::Now(format!(
-                "it takes over the {:.1} GB {key} booked for it, and {key} started with that room ({fit})",
+                "it takes over the {:.1} GB {key} declared for it, and {key} started over RAM with that room by over-commit ({fit})",
                 gb(taken as f64)
             ));
         }
-        if !self.running.is_empty() || !head {
+        if self.running.iter().any(|e| stack.is_none_or(|s| s.pid != e.pid)) || !head {
             return Overcommit::No;
         }
         let alone = !waiting.iter().any(|w| w.pid != job.pid && !w.stalled && w.work_for.as_ref().is_none_or(|l| l.pid != job.pid));
@@ -2159,7 +2176,7 @@ mod tests {
         // A job that fits books its need; a partial fit books what it got.
         let fits = decide(&machine(1.0, 4), &LIM, &[], std::slice::from_ref(&small), &small, 1010.0, &[]);
         assert_eq!(cpu_to_book(&fits, 1.0), 1.0);
-        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0), over_ram: false };
+        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0), over_ram: false, overcommitted: false };
         assert_eq!(cpu_to_book(&partial, 14.0), 6.0);
     }
 
@@ -2928,29 +2945,81 @@ mod tests {
     }
 
     #[test]
-    fn the_run_of_a_stack_inherits_the_over_commit_at_once() {
+    fn the_run_of_a_stack_started_over_ram_inherits_the_over_commit_at_once() {
         let lim = overcommit_limits();
-        // The stack runs, steady at 7 GB (8 GB need), with 4.3 GB booked for
-        // its run; 20 GB outside: 27 + 1 + 4.3 GB = 101% of RAM.
-        let stack = expecting(steady_stack(11, 7));
+        // The stack started by over-commit and runs, steady at 7 GB (8 GB
+        // need), with 4.3 GB declared for its run; 20 GB outside:
+        // 27 + 1 + 4.3 GB = 101% of RAM.
+        let stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
         let r = std::slice::from_ref(&stack);
         let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
         let w = std::slice::from_ref(&run);
         let off = Limits { overcommit_max_pct: 0.0, ..lim };
         assert_eq!(blockers(decide(&macbook(27.0, 0.0), &off, r, w, &run, 1000.0, &[])), vec!["memory"], "0.11.0-rc.2 waits");
         let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
-        assert!(matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("takes over the 4.3 GB")), "{d:?}");
+        let inherits = |why: &str| why.contains("takes over the 4.3 GB");
+        assert!(matches!(&d, Decision::Admit { over_ram: true, overcommitted: true, early: Some(why), .. } if inherits(why)), "{d:?}");
         assert!(matches!(decide(&macbook(27.0, 50.0), &lim, r, w, &run, 1000.0, &[]), Decision::Admit { .. }));
         // Never at critical; never above the cap.
         assert_eq!(blockers(decide(&macbook(27.0, 100.0), &lim, r, w, &run, 1000.0, &[])), vec!["pressure"]);
         assert_eq!(blockers(decide(&macbook(34.0, 0.0), &lim, r, w, &run, 1000.0, &[])), vec!["memory"]);
         // A run that needs more than was booked for it does not inherit.
         let big = Entry { need_mem_kb: 8 * GB, ..run.clone() };
-        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, std::slice::from_ref(&big), &big, 5000.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, std::slice::from_ref(&big), &big, 1000.0, &[])), vec!["memory"]);
         // Also while the stack is still in its start-up.
         let starting = Entry { steady_since: None, started_at: Some(990.0), ..stack.clone() };
         let d = decide(&macbook(27.0, 0.0), &lim, std::slice::from_ref(&starting), w, &run, 1000.0, &[]);
         assert!(matches!(d, Decision::Admit { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn the_run_of_a_stack_that_started_normally_over_commits_only_by_the_queue_rule() {
+        let lim = overcommit_limits();
+        let stack = expecting(steady_stack(11, 7));
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(s), .. } if (*s - 120.0).abs() < 1e-6), "{d:?}");
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1130.0, &[]);
+        assert!(matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("only job in the queue")), "{d:?}");
+        // With another job of taskguard's running, never.
+        let other = Entry { pid: 21, started_at: Some(900.0), ..job(21, "lint", 0.5, 0) };
+        let both = [stack.clone(), other];
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, &both, w, &run, 9000.0, &[])), vec!["memory"]);
+        // With another job queued, only once stuck.
+        let compile = Entry { pid: 2, queued_at: 1010.0, ..job(2, "compile", 2.0, 20) };
+        let queued = [run.clone(), compile];
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, &queued, &run, 1130.0, &[])), vec!["memory"]);
+        assert!(matches!(decide(&macbook(27.0, 0.0), &lim, r, &queued, &run, 2810.0, &[]), Decision::Admit { .. }));
+    }
+
+    #[test]
+    fn the_run_of_a_guessed_booking_does_not_inherit_the_over_commit() {
+        let lim = overcommit_limits();
+        let mut stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(_), .. }), "{d:?}");
+    }
+
+    #[test]
+    fn at_macos_warning_the_takeover_still_waits_for_its_slot_and_a_paused_job() {
+        let lim = overcommit_limits();
+        let stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
+        let compile = Entry { pid: 21, started_at: Some(900.0), ..job(21, "compile", 0.5, 0) };
+        let run = Entry { queued_at: 1000.0, pool_key: Some("browser".into()), pool_slots: Some(1), ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let m = macbook(27.0, 50.0);
+        assert!(matches!(decide(&m, &lim, &[stack.clone(), compile.clone()], w, &run, 1000.0, &[]), Decision::Admit { .. }));
+        let other_run = Entry { pid: 22, started_at: Some(900.0), pool_key: Some("browser".into()), ..job(22, "other run", 0.5, 0) };
+        let d = decide(&m, &lim, &[stack.clone(), compile.clone(), other_run], w, &run, 1000.0, &[]);
+        assert!(!matches!(d, Decision::Admit { .. }), "{d:?}");
+        let paused = Entry { paused_since: Some(950.0), ..compile };
+        assert_eq!(blockers(decide(&m, &lim, &[stack, paused], w, &run, 1000.0, &[])), vec!["paused"]);
     }
 
     #[test]
@@ -2985,6 +3054,13 @@ mod tests {
         let w = std::slice::from_ref(&me);
         assert!(over_ram(&macbook(20.0, 0.0), &lim, &[], w, &me));
         assert!(!over_ram(&macbook(18.0, 0.0), &lim, &[], w, &me));
+        // A history guess another stack books is not memory in use: a job
+        // forced next to it is over RAM only by the progress measure.
+        let mut guessing = Entry { pid: 12, ..expecting(steady_stack(12, 7)) };
+        guessing.expects[0].implied = true;
+        let lint = job(3, "lint", 0.5, 18);
+        let r = std::slice::from_ref(&guessing);
+        assert!(!over_ram(&macbook(10.0, 0.0), &lim, r, std::slice::from_ref(&lint), &lint));
     }
 
     #[test]

@@ -152,9 +152,11 @@ below).
   held 18 GB. So the only job in the queue may start with memory over RAM
   after `overcommit_after` (120) seconds, and the first in line after
   `overcommit_stuck_after` (1800) seconds while other jobs queue behind it.
-  Work that takes over the room its running stack booked for it, and needs
-  no more than `noise_mem` beyond it, starts so at once: the stack started
-  with that room. Memory may reach `overcommit_max_macos` or
+  Work for a running stack counts as alone next to it. Work that takes over
+  the room its running stack declared for it (not a guess of the history),
+  and needs no more than `noise_mem` beyond it, starts so at once only when
+  that stack itself started by over-commit: it started over RAM with that
+  room booked. Otherwise the work waits as any other job does. Memory may reach `overcommit_max_macos` or
   `overcommit_max_linux` (120) percent of RAM, and the part over RAM must
   fit in half the free swap. macOS compresses cold memory and swaps to files
   that grow while their volume has space, so there the swap counts that
