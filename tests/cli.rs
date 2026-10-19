@@ -189,6 +189,21 @@ fn a_minimum_makes_a_job_wait_for_room() {
     holder.wait_with_output().unwrap();
 }
 
+/// A job started with memory over RAM, here by --st, is the OOM killer's
+/// first pick; a job that fits keeps the score it inherits.
+#[cfg(target_os = "linux")]
+#[test]
+fn only_a_start_over_ram_raises_the_oom_score() {
+    let e = Env::new("");
+    let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap().trim().to_string();
+    let fits = e.run(&["--", "sh", "-c", "cat /proc/self/oom_score_adj"]);
+    assert_eq!(String::from_utf8_lossy(&fits.stdout).trim(), own, "{}", stderr(&fits));
+    let over = e.run(&["--st", "1", "--min-mem", "100000G", "--", "sh", "-c", "cat /proc/self/oom_score_adj"]);
+    assert!(over.status.success(), "{}", stderr(&over));
+    assert_eq!(String::from_utf8_lossy(&over.stdout).trim(), "800", "{}", stderr(&over));
+    assert!(stderr(&over).contains("OOM killer's first pick"), "{}", stderr(&over));
+}
+
 #[test]
 fn a_nested_call_does_not_take_a_second_slot() {
     let e = Env::new("");

@@ -144,6 +144,34 @@ below).
   that stays. Memory pressure is the one exception:
   then the load comes from other programs, and jobs wait until it eases
   (at macOS warning, see above).
+- **A job that only programs outside taskguard keep out starts over RAM
+  once it has waited (`overcommit`).** With nothing of taskguard's running,
+  a job short of all of RAM waits for programs outside taskguard to free
+  memory, and nothing taskguard runs would make that room: on a 32 GB Mac a
+  dev stack that books its browser run waited for good once other programs
+  held 18 GB. So the only job in the queue may start with memory over RAM
+  after `overcommit_after` (120) seconds, and the first in line after
+  `overcommit_stuck_after` (1800) seconds while other jobs queue behind it.
+  Work that takes over the room its running stack booked for it, and needs
+  no more than `noise_mem` beyond it, starts so at once: the stack started
+  with that room. Memory may reach `overcommit_max_macos` or
+  `overcommit_max_linux` (120) percent of RAM, and the part over RAM must
+  fit in half the free swap. macOS compresses cold memory and swaps to files
+  that grow while their volume has space, so there the swap counts that
+  free space too; over RAM costs speed, not processes. Linux has only its
+  swap: with none, nothing starts over RAM. Never at critical pressure, and
+  on Linux never at `pressure_max`. A second stack next to a running one
+  still waits. On Linux a job that starts over RAM, by this rule, by `--st`
+  or by hand, gets `oom_score_adj` 800: when memory runs out, the OOM killer
+  takes it, not the browser or the agents that ran first. `taskguard top`
+  marks it `OVER`, `taskguard status` `OVER-RAM`. `overcommit = false` turns
+  it off.
+- **A long wait for memory says who holds it.** A job that has waited five
+  minutes for memory with nothing of taskguard's running gets a line in
+  `taskguard top` and `taskguard status` that names the programs outside
+  taskguard that hold the most, how far the job is short of the ceiling it
+  really waits for, and when over-commit starts it or how to start it by
+  hand.
 - **Any order, oldest first.** A small job may pass a big one that does not
   fit yet. This is safe: a job only reaches taskguard when its launcher has
   decided that it may run. Turbo starts a task only after the tasks it depends
@@ -630,6 +658,7 @@ partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = 
 max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
 expect_wait = 5        # a dev stack waits this long for the work it expects to queue
 infer_work = true      # a dev stack books the work its history says follows it
+overcommit = true      # a lone job that only other programs keep out starts over RAM after a while
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -686,6 +715,10 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   past `mem_max`, up to `pause_at` (or halfway from `mem_max` to all of RAM
   when `mem_max` is at or above `pause_at`). Set `outside_admit = false` and
   `noise_mem = 0` to keep `mem_max` a hard rule.
+- Over-commit (`overcommit`) lets a job take memory over RAM. On macOS that
+  makes the machine slower until the job ends; on Linux it goes into swap
+  and, should that run out, the OOM killer takes the job. It reads the free
+  swap when it decides, not what other programs swap out after.
 - A stack that expects work (`--expect`) books room for it until it starts,
   however long that takes: work that never comes keeps that room booked
   while the stack runs. A stack plus its work that do not fit next to another
@@ -766,6 +799,10 @@ seconds, so keep `expect_wait` under 10 while such versions share the
 machine. The priority a newer job takes as work
 for a stack is an ordinary priority, so their waiting jobs do let it go
 first.
+Versions up to 0.11.0-rc.2 do not over-commit: a job of theirs waits where a
+newer version would start it over RAM. With nothing of taskguard's running a
+job that does not fit in RAM holds nobody back in any version, but while it
+is first in line, a newer job behind it does not over-commit either.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not

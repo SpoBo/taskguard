@@ -28,7 +28,18 @@ pub fn limits(cfg: &Config) -> Limits {
         outside_admit: cfg.outside_admit,
         outside_mem_max_pct: outside_ceiling(cfg.mem_max, cfg.pause_at),
         partial_fit: cfg.partial_fit.clamp(0.0, 1.0),
+        overcommit_max_pct: overcommit_max(cfg),
+        overcommit_after: cfg.overcommit_after.max(0.0),
+        overcommit_stuck_after: cfg.overcommit_stuck_after.max(0.0),
     }
+}
+
+/// The share of RAM a lone job may take memory to (`overcommit`), for this
+/// OS: a repo file serves macOS and Linux alike, and their swap differs.
+/// 0 when it is off.
+pub fn overcommit_max(cfg: &Config) -> f64 {
+    let max = if cfg!(target_os = "macos") { cfg.overcommit_max_macos } else { cfg.overcommit_max_linux };
+    if cfg.overcommit { max } else { 0.0 }
 }
 
 /// The share of RAM up to which `outside_admit` lets a job start: `pause_at`,
@@ -495,6 +506,19 @@ pub fn doctor(args: &[String]) -> Result<i32> {
             )
         } else {
             "off (infer_work = false)".into()
+        }
+    );
+    println!(
+        "over-commit:    {}",
+        if overcommit_max(&cfg) > 100.0 {
+            format!(
+                "on, up to {:.0}% of RAM and half the free swap, after {:.0}s as the only job in the queue or {:.0}s first in line",
+                overcommit_max(&cfg),
+                cfg.overcommit_after,
+                cfg.overcommit_stuck_after
+            )
+        } else {
+            "off".into()
         }
     );
     for (k, v) in &cfg.origin {

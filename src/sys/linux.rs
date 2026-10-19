@@ -22,6 +22,25 @@ pub fn mem_used_kb() -> u64 {
     total.saturating_sub(meminfo_kb("MemAvailable").unwrap_or(total))
 }
 
+pub fn swap_free_kb() -> Option<u64> {
+    meminfo_kb("SwapFree")
+}
+
+/// Make the process that calls it, and every process it starts from then
+/// on, the OOM killer's first pick. Raising the score needs no privilege.
+/// Only async-signal-safe calls: it runs between fork and exec.
+pub fn raise_oom_score() {
+    let path = c"/proc/self/oom_score_adj";
+    let value = b"800";
+    unsafe {
+        let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, value.as_ptr() as *const libc::c_void, value.len());
+            libc::close(fd);
+        }
+    }
+}
+
 pub fn cpu_ticks() -> CpuTicks {
     let Ok(text) = fs::read_to_string("/proc/stat") else {
         return CpuTicks::default();

@@ -687,6 +687,10 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
                     me.need_cpu = queue::cpu_to_book(&decision, me.need_cpu);
+                    me.over_ram = match &decision {
+                        Decision::Admit { over_ram, .. } => *over_ram,
+                        Decision::Wait { .. } => queue::over_ram(&m, &limits, &running, &waiting, &me),
+                    };
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);
                     me.start_need_mem_kb = Some(me.need_mem_kb);
@@ -796,7 +800,23 @@ pub fn run(mut o: Opts) -> Result<i32> {
     }
 
     // ---- run and measure
-    let mut child = match Command::new(&o.cmd[0]).args(&o.cmd[1..]).env("TASKGUARD_HELD", "1").env_remove("TASKGUARD_BG_FD").spawn() {
+    let mut cmd = Command::new(&o.cmd[0]);
+    cmd.args(&o.cmd[1..]).env("TASKGUARD_HELD", "1").env_remove("TASKGUARD_BG_FD");
+    // A job started over RAM is the one to go when memory runs out, not the
+    // browser or the editor that already ran: every process of it inherits
+    // the score.
+    if me.over_ram {
+        if cfg!(target_os = "linux") {
+            say(&format!("{} starts with memory over RAM; it is the OOM killer's first pick (oom_score_adj 800)", me.key));
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                sys::raise_oom_score();
+                Ok(())
+            });
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             cleanup_files(&q, &me);

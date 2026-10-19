@@ -107,6 +107,21 @@ outside_admit = true
 # machine is near its lowest CPU use of the last two minutes. It books the
 # cores it got. Memory is still checked. 0 turns it off. Set it per machine.
 partial_fit = 0.5
+# Over-commit: a job that only memory keeps out, with nothing of taskguard's
+# running, may start with memory over RAM once it has waited overcommit_after
+# seconds as the only job in the queue, or overcommit_stuck_after seconds as
+# the first in line while other jobs queue too. Work that takes over the room
+# its running stack booked for it does so at once. Never at critical pressure
+# (on Linux, never at pressure_max). Memory may reach overcommit_max_macos or
+# overcommit_max_linux percent of RAM, by the OS taskguard runs on, and the
+# part over RAM must fit in half the free swap (macOS: what its swap files
+# have free plus the free space of their volume). On Linux such a job is the
+# OOM killer's first pick. taskguard 0.11.0-rc.2 and older ignore these.
+overcommit = true
+overcommit_after = 120
+overcommit_stuck_after = 1800
+overcommit_max_macos = 120
+overcommit_max_linux = 120
 
 # ---------------------------------------------------------------- timing ----
 sample_every = 2      # seconds between measurements of a running job

@@ -86,6 +86,9 @@ pub fn macbook_limits() -> Limits {
         outside_admit: true,
         outside_mem_max_pct: crate::commands::outside_ceiling(95.0, 92.0),
         partial_fit: 0.5,
+        overcommit_max_pct: 120.0,
+        overcommit_after: 120.0,
+        overcommit_stuck_after: 1800.0,
     }
 }
 

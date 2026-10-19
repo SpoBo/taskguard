@@ -121,6 +121,10 @@ pub struct Entry {
     /// it starts, for that work to queue (`expect_wait`), so it starts with
     /// room for both. Older versions leave it out.
     pub expect_until: Option<f64>,
+    /// It started with memory over RAM: by `overcommit`, by --st, or by
+    /// hand. On Linux the kernel's OOM killer picks it first. Older versions
+    /// leave it out.
+    pub over_ram: bool,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -682,6 +686,16 @@ pub struct Limits {
     /// it has waited past `max_bypass`) starts on this share of its CPU need,
     /// when the machine is near its recent low. 0 turns it off.
     pub partial_fit: f64,
+    /// A job that only programs outside taskguard keep out may start over RAM
+    /// (`Room::overcommit`), while memory would stay under this share of RAM
+    /// and the part over RAM fits in half the free swap. At or under 100 it
+    /// is off.
+    pub overcommit_max_pct: f64,
+    /// Seconds the only job in the queue waits before it may start over RAM.
+    pub overcommit_after: f64,
+    /// Seconds the first job in line waits before it may start over RAM
+    /// while other jobs queue too.
+    pub overcommit_stuck_after: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -749,6 +763,10 @@ pub enum Blocker {
         work: Vec<String>,
         wait_s: f64,
     },
+    /// `limit_pct` is the ceiling the job really waits for: `mem_max`, or
+    /// all of RAM for the first in line with nothing of taskguard's
+    /// running. `overcommit_in` is set when `Room::overcommit` would let it
+    /// start over RAM in that many seconds.
     Memory {
         would_pct: f64,
         limit_pct: f64,
@@ -757,6 +775,8 @@ pub enum Blocker {
         reserve_kb: u64,
         need_kb: u64,
         total_kb: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        overcommit_in: Option<f64>,
     },
     Cpu {
         would: f64,
@@ -800,6 +820,9 @@ pub enum Decision {
         /// the cores it books instead of its whole need.
         #[serde(skip_serializing_if = "Option::is_none")]
         booked_cpu: Option<f64>,
+        /// Memory would go over RAM: it starts by `Room::overcommit`.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        over_ram: bool,
     },
     Wait {
         blockers: Vec<Blocker>,
@@ -1002,6 +1025,9 @@ pub fn decide(
             if let Some(mem) =
                 room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
             {
+                if let Overcommit::Now(why) = room.overcommit(m, lim, waiting, me, false, now) {
+                    return over_committed(m, &room, me, why);
+                }
                 return Decision::Wait { blockers: vec![mem, pressure] };
             }
         }
@@ -1040,27 +1066,42 @@ pub fn decide(
     // with nothing of taskguard's running, up to all of RAM: nothing taskguard
     // runs would free that.
     let room = Room::new(m, lim, running, waiting);
+    // First in line, for `overcommit`: work queued for `me` cannot start
+    // before it, whatever its place.
+    let first = older.iter().all(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid));
     if running.iter().all(Entry::steady) {
         let fits = |w: &Entry| room.fits_on_progress(m, lim, running, w);
         let head = older.iter().copied().chain(std::iter::once(me)).find(|w| fits(w));
         return match head {
             Some(h) if !h.ahead_of(me) && running.is_empty() => {
-                Decision::Admit { reason: "nothing else is running".into(), early: None, booked_cpu: None }
+                Decision::Admit { reason: "nothing else is running".into(), early: None, booked_cpu: None, over_ram: false }
             }
             Some(h) if !h.ahead_of(me) => Decision::Admit {
                 reason: "nothing else is running but long-lived jobs past their start-up".into(),
                 early: None,
                 booked_cpu: None,
+                over_ram: false,
             },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
             None => {
                 let mut blockers: Vec<Blocker> = room
                     .blockers(m, lim, running, me, now, unknown_starts)
                     .into_iter()
-                    .filter(|b| matches!(b, Blocker::Memory { .. } | Blocker::Slots { .. } | Blocker::Stack { .. }))
+                    .filter(|b| matches!(b, Blocker::Slots { .. } | Blocker::Stack { .. }))
                     .collect();
-                if blockers.is_empty() {
-                    blockers.push(room.memory_blocker(m, lim, me));
+                if blockers.is_empty() || room.mem_would_on(me, true) > room.progress_ceiling(m, lim, me) {
+                    blockers.push(room.progress_memory_blocker(m, lim, me));
+                }
+                if blockers.iter().all(|b| matches!(b, Blocker::Memory { .. })) {
+                    match room.overcommit(m, lim, waiting, me, first, now) {
+                        Overcommit::Now(why) => return over_committed(m, &room, me, why),
+                        Overcommit::In(s) => {
+                            if let Some(Blocker::Memory { overcommit_in, .. }) = blockers.first_mut() {
+                                *overcommit_in = Some(s);
+                            }
+                        }
+                        Overcommit::No => {}
+                    }
                 }
                 if let Some(p) = m.mem_pressure.filter(|p| *p >= lim.pressure_max) {
                     blockers.push(Blocker::Pressure { level: p, limit: lim.pressure_max, paced: true, after: None, next_in: None });
@@ -1153,10 +1194,25 @@ pub fn decide(
             lim.mem_max_pct
         );
         let (early, booked_cpu) = early.unzip();
-        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten() }
+        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten(), over_ram: false }
+    } else if blockers.iter().all(|b| matches!(b, Blocker::Memory { .. }))
+        && let Overcommit::Now(why) = room.overcommit(m, lim, waiting, me, first, now)
+    {
+        over_committed(m, &room, me, why)
     } else {
         Decision::Wait { blockers }
     }
+}
+
+/// The admission of a job that `Room::overcommit` lets start.
+fn over_committed(m: &MachineSample, room: &Room, me: &Entry, why: String) -> Decision {
+    let over_ram = room.mem_would_on(me, true) > m.mem_total_kb as f64;
+    let reason = if room.running.is_empty() {
+        "nothing else is running; only memory keeps it out, and it waited long enough (overcommit)"
+    } else {
+        "it takes over the room its long-lived job booked for it (overcommit)"
+    };
+    Decision::Admit { reason: reason.into(), early: Some(why), booked_cpu: None, over_ram }
 }
 
 /// In how many seconds a job that `blockers` keep out could start at the
@@ -1351,6 +1407,30 @@ pub fn signal_tree(root: i32, sig: i32) {
     }
 }
 
+/// The most memory a job may take the machine to over RAM: `overcommit_max`
+/// of RAM, and no more than RAM plus half the free swap. Half, so the swap
+/// keeps room for the pages the rest of the machine moves out as it fills.
+/// With no swap (or none read) nothing goes over RAM.
+pub fn overcommit_ceiling(m: &MachineSample, lim: &Limits) -> f64 {
+    let total = m.mem_total_kb as f64;
+    (total * lim.overcommit_max_pct / 100.0).min(total + m.swap_free_kb.unwrap_or(0) as f64 / 2.0)
+}
+
+/// Would `me` take memory over RAM if it started now? A job started so,
+/// by any rule or by hand, is made the OOM killer's first pick on Linux.
+pub fn over_ram(m: &MachineSample, lim: &Limits, running: &[Entry], waiting: &[Entry], me: &Entry) -> bool {
+    Room::new(m, lim, running, waiting).mem_would(me) > m.mem_total_kb as f64
+}
+
+/// What `Room::overcommit` says of a job that only memory keeps out.
+enum Overcommit {
+    /// It may start over RAM now, for this reason.
+    Now(String),
+    /// It may, once it has waited this many seconds more.
+    In(f64),
+    No,
+}
+
 /// The room the running jobs leave, read once per decision.
 #[derive(Clone)]
 struct Room {
@@ -1466,16 +1546,86 @@ impl Room {
 
     /// The memory blocker for `job`, whether or not it fits under the limit.
     fn memory_blocker(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> Blocker {
-        let mem_would = self.mem_would(job);
+        self.memory_blocker_at(m, job, self.mem_would(job), self.mem_limit, lim.mem_max_pct)
+    }
+
+    /// The memory blocker for `job` by the progress rule: measured against
+    /// the ceiling that rule really holds it to, all of RAM when nothing of
+    /// taskguard's runs, not `mem_max`.
+    fn progress_memory_blocker(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> Blocker {
+        let ceiling = self.progress_ceiling(m, lim, job);
+        self.memory_blocker_at(m, job, self.mem_would_on(job, true), ceiling, pct(ceiling, m.mem_total_kb as f64))
+    }
+
+    fn memory_blocker_at(&self, m: &MachineSample, job: &Entry, mem_would: f64, ceiling: f64, limit_pct: f64) -> Blocker {
         Blocker::Memory {
             would_pct: pct(mem_would, m.mem_total_kb as f64),
-            limit_pct: lim.mem_max_pct,
-            short_kb: (mem_would - self.mem_limit).max(0.0) as u64,
+            limit_pct,
+            short_kb: (mem_would - ceiling).max(0.0) as u64,
             used_kb: self.mem_used,
             reserve_kb: self.res_mem,
             need_kb: need_with_booking(job, &self.running),
             total_kb: m.mem_total_kb,
+            overcommit_in: None,
         }
+    }
+
+    /// May `job`, which only memory keeps out, start over RAM? macOS
+    /// compresses and swaps cold memory, so a job over RAM costs speed, not
+    /// processes; Linux has only its swap, and the OOM killer when that is
+    /// gone. So it may, never at critical pressure (on Linux, never at
+    /// `pressure_max`), while memory would stay under `overcommit_max` of
+    /// RAM and the part over RAM fits in half the free swap
+    /// (`overcommit_ceiling`), when either:
+    /// - nothing of taskguard's runs and it is first in line (`head`): it has
+    ///   waited `overcommit_after` as the only job in the queue, or
+    ///   `overcommit_stuck_after` with other jobs queued behind it. Then only
+    ///   programs outside taskguard keep it out, and nothing taskguard runs
+    ///   would ever free the room;
+    /// - it takes over what its running long-lived job booked for it, and
+    ///   adds no more than `noise_mem` to that: the stack started with that
+    ///   room, so its work starts at once.
+    fn overcommit(&self, m: &MachineSample, lim: &Limits, waiting: &[Entry], job: &Entry, head: bool, now: f64) -> Overcommit {
+        let critical = m.mem_pressure.is_some_and(|p| p >= 100.0 || (!lim.warn_admit && p >= lim.pressure_max));
+        if lim.overcommit_max_pct <= 100.0 || critical {
+            return Overcommit::No;
+        }
+        let total = m.mem_total_kb as f64;
+        let would = self.mem_would_on(job, true);
+        let ceiling = overcommit_ceiling(m, lim);
+        if would > ceiling {
+            return Overcommit::No;
+        }
+        let gb = |kb: f64| kb / (1024.0 * 1024.0);
+        let fit = format!(
+            "memory would reach {:.0}% of RAM, under overcommit_max {:.0}%, {:.1} GB into swap with {:.1} GB free",
+            pct(would, total),
+            lim.overcommit_max_pct,
+            gb((would - total).max(0.0)),
+            gb(m.swap_free_kb.unwrap_or(0) as f64)
+        );
+        let taken = booking_taken_over(job, &self.running);
+        if taken > 0 && need_with_booking(job, &self.running) as f64 <= total * lim.noise_mem_pct / 100.0 {
+            let key = job.work_for.as_ref().map(|w| w.key.as_str()).unwrap_or_default();
+            return Overcommit::Now(format!(
+                "it takes over the {:.1} GB {key} booked for it, and {key} started with that room ({fit})",
+                gb(taken as f64)
+            ));
+        }
+        if !self.running.is_empty() || !head {
+            return Overcommit::No;
+        }
+        let alone = !waiting.iter().any(|w| w.pid != job.pid && !w.stalled && w.work_for.as_ref().is_none_or(|l| l.pid != job.pid));
+        let after = if alone { lim.overcommit_after } else { lim.overcommit_stuck_after };
+        let waited = now - job.queued_at;
+        if waited < after {
+            return Overcommit::In(after - waited);
+        }
+        Overcommit::Now(format!(
+            "only programs outside taskguard keep it out, and it waited {} {} ({fit})",
+            crate::report::dur(waited),
+            if alone { "as the only job in the queue (overcommit_after)" } else { "first in line (overcommit_stuck_after)" }
+        ))
     }
 
     /// What keeps `job` from starting, after the leeway: a job that falls
@@ -1739,6 +1889,9 @@ mod tests {
         outside_admit: false,
         outside_mem_max_pct: 95.0,
         partial_fit: 0.0,
+        overcommit_max_pct: 0.0,
+        overcommit_after: 120.0,
+        overcommit_stuck_after: 1800.0,
     };
 
     /// A running entry exactly as v0.1.2 writes it.
@@ -2006,7 +2159,7 @@ mod tests {
         // A job that fits books its need; a partial fit books what it got.
         let fits = decide(&machine(1.0, 4), &LIM, &[], std::slice::from_ref(&small), &small, 1010.0, &[]);
         assert_eq!(cpu_to_book(&fits, 1.0), 1.0);
-        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0) };
+        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0), over_ram: false };
         assert_eq!(cpu_to_book(&partial, 14.0), 6.0);
     }
 
@@ -2659,6 +2812,179 @@ mod tests {
         let mut done = stack.clone();
         done.expects[0].started = true;
         assert_eq!(reserve(std::slice::from_ref(&done)).1, grows);
+    }
+
+    /// The MacBook (32 GB, mem_max 95, warn_admit) with over-commit on at
+    /// its defaults: 120% of RAM, after 120 s alone or 1800 s first in line.
+    fn overcommit_limits() -> Limits {
+        Limits {
+            mem_max_pct: 95.0,
+            warn_admit: true,
+            noise_mem_pct: 2.0,
+            outside_admit: true,
+            outside_mem_max_pct: 97.5,
+            overcommit_max_pct: 120.0,
+            ..LIM
+        }
+    }
+
+    /// `outside_gb` held by programs outside taskguard, at `pressure`, with
+    /// 16 GB of swap free.
+    fn macbook(outside_gb: f64, pressure: f64) -> MachineSample {
+        MachineSample {
+            mem_pressure: Some(pressure),
+            swap_free_kb: Some(16 * GB),
+            ..MachineSample::fixed(1.0, 10, (outside_gb * GB as f64) as u64, 32 * GB)
+        }
+    }
+
+    /// A lone dev stack of 9.5 GB, queued at 1000, that declared its 4.3 GB
+    /// browser run: it books 13.8 GB.
+    fn lone_stack() -> Entry {
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, need_mem_kb: 95 * GB / 10, ..job(1, "dev-env:stack", 3.0, 0) };
+        expecting(stack)
+    }
+
+    fn memory_of(d: &Decision) -> &Blocker {
+        match d {
+            Decision::Wait { blockers } => blockers.iter().find(|b| b.name() == "memory").expect("a memory blocker"),
+            Decision::Admit { .. } => panic!("admitted: {d:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lone_stack_that_only_programs_outside_keep_out_starts_over_ram_after_a_while() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        // 20 GB outside + 13.8 GB = 106% of RAM. For its first two minutes
+        // it waits, and says how far it is from the real ceiling: all of
+        // RAM, not mem_max.
+        let d = decide(&macbook(20.0, 0.0), &lim, &[], w, &me, 1060.0, &[]);
+        let b = memory_of(&d);
+        assert!(
+            matches!(b, Blocker::Memory { limit_pct, overcommit_in: Some(s), .. } if *limit_pct == 100.0 && (*s - 60.0).abs() < 1e-6),
+            "{b:?}"
+        );
+        let text = crate::report::blocker_text(b);
+        assert!(text.contains("(limit 100%), 1.8 GB short") && text.contains("over RAM in 1m00s"), "{text}");
+        // After that it starts, at normal pressure and at macOS warning.
+        for p in [0.0, 50.0] {
+            let d = decide(&macbook(20.0, p), &lim, &[], w, &me, 1130.0, &[]);
+            assert!(
+                matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("only job in the queue")),
+                "{p}: {d:?}"
+            );
+        }
+        // Up to the cap: 24 GB outside is 118%, 25 GB 121%.
+        assert!(matches!(decide(&macbook(24.0, 50.0), &lim, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        let d = decide(&macbook(25.0, 0.0), &lim, &[], w, &me, 1130.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: None, .. }), "{d:?}");
+        // Never at critical.
+        assert_eq!(blockers(decide(&macbook(18.5, 100.0), &lim, &[], w, &me, 5000.0, &[])), vec!["pressure"]);
+        // Its run, queued for it, does not count as another job in line.
+        let run = Entry { queued_at: 1100.0, ..run_for(None) };
+        let both = [me.clone(), run];
+        assert!(matches!(decide(&macbook(20.0, 0.0), &lim, &[], &both, &me, 1130.0, &[]), Decision::Admit { over_ram: true, .. }));
+    }
+
+    #[test]
+    fn over_ram_goes_only_into_half_the_free_swap() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        let with_swap = |gb: u64| MachineSample { swap_free_kb: Some(gb * GB), ..macbook(20.0, 0.0) };
+        // 1.8 GB over RAM: 4 GB of swap holds it, 3 GB does not, none at all
+        // keeps it out for good.
+        assert!(matches!(decide(&with_swap(4), &lim, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        assert_eq!(blockers(decide(&with_swap(3), &lim, &[], w, &me, 1130.0, &[])), vec!["memory"]);
+        let none = MachineSample { swap_free_kb: None, ..macbook(20.0, 0.0) };
+        assert_eq!(blockers(decide(&none, &lim, &[], w, &me, 5000.0, &[])), vec!["memory"]);
+        // Linux: no warning level, so any pressure at pressure_max (PSI)
+        // keeps it out, whatever the swap.
+        let linux = Limits { warn_admit: false, ..lim };
+        assert!(matches!(decide(&with_swap(4), &linux, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        let psi = MachineSample { mem_pressure: Some(25.0), ..with_swap(16) };
+        assert_eq!(blockers(decide(&psi, &linux, &[], w, &me, 5000.0, &[])), vec!["pressure"]);
+    }
+
+    #[test]
+    fn with_other_jobs_queued_the_first_in_line_starts_over_ram_only_once_stuck() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        // A 20 GB compile queued behind it: it cannot start either.
+        let compile = Entry { queued_at: 1010.0, ..job(2, "compile", 2.0, 20) };
+        let waiting = [me.clone(), compile.clone()];
+        let m = macbook(20.0, 0.0);
+        let d = decide(&m, &lim, &[], &waiting, &me, 1130.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(s), .. } if (*s - 1670.0).abs() < 1e-6), "{d:?}");
+        let d = decide(&m, &lim, &[], &waiting, &me, 2800.0, &[]);
+        assert!(matches!(&d, Decision::Admit { early: Some(why), .. } if why.contains("first in line")), "{d:?}");
+        // The job behind it never starts over RAM by the first-in-line rule.
+        assert_eq!(blockers(decide(&m, &lim, &[], &waiting, &compile, 5000.0, &[])), vec!["memory"]);
+        // A stalled job behind it does not count.
+        let stalled = [me.clone(), Entry { stalled: true, ..compile }];
+        assert!(matches!(decide(&m, &lim, &[], &stalled, &me, 1130.0, &[]), Decision::Admit { .. }));
+    }
+
+    #[test]
+    fn the_run_of_a_stack_inherits_the_over_commit_at_once() {
+        let lim = overcommit_limits();
+        // The stack runs, steady at 7 GB (8 GB need), with 4.3 GB booked for
+        // its run; 20 GB outside: 27 + 1 + 4.3 GB = 101% of RAM.
+        let stack = expecting(steady_stack(11, 7));
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let off = Limits { overcommit_max_pct: 0.0, ..lim };
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &off, r, w, &run, 1000.0, &[])), vec!["memory"], "0.11.0-rc.2 waits");
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        assert!(matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("takes over the 4.3 GB")), "{d:?}");
+        assert!(matches!(decide(&macbook(27.0, 50.0), &lim, r, w, &run, 1000.0, &[]), Decision::Admit { .. }));
+        // Never at critical; never above the cap.
+        assert_eq!(blockers(decide(&macbook(27.0, 100.0), &lim, r, w, &run, 1000.0, &[])), vec!["pressure"]);
+        assert_eq!(blockers(decide(&macbook(34.0, 0.0), &lim, r, w, &run, 1000.0, &[])), vec!["memory"]);
+        // A run that needs more than was booked for it does not inherit.
+        let big = Entry { need_mem_kb: 8 * GB, ..run.clone() };
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, std::slice::from_ref(&big), &big, 5000.0, &[])), vec!["memory"]);
+        // Also while the stack is still in its start-up.
+        let starting = Entry { steady_since: None, started_at: Some(990.0), ..stack.clone() };
+        let d = decide(&macbook(27.0, 0.0), &lim, std::slice::from_ref(&starting), w, &run, 1000.0, &[]);
+        assert!(matches!(d, Decision::Admit { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn a_second_stack_next_to_a_running_one_still_waits() {
+        let lim = overcommit_limits();
+        let a = expecting(steady_stack(11, 7));
+        let b = Entry { pid: 12, ..lone_stack() };
+        let w = std::slice::from_ref(&b);
+        for now in [1130.0, 2900.0, 9000.0] {
+            // 9 GB outside + the first stack's 7 GB, 5.3 GB it reserves, and 13.8 GB.
+            assert_eq!(blockers(decide(&macbook(16.0, 0.0), &lim, std::slice::from_ref(&a), w, &b, now, &[])), vec!["memory"]);
+        }
+    }
+
+    #[test]
+    fn with_over_commit_off_a_lone_job_waits_as_in_0_11_0_rc_2() {
+        let lim = Limits { overcommit_max_pct: 0.0, ..overcommit_limits() };
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        for now in [1130.0, 2900.0, 90000.0] {
+            let d = decide(&macbook(20.0, 0.0), &lim, &[], w, &me, now, &[]);
+            assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: None, .. }), "{d:?}");
+        }
+        // Under the limit it still starts at once, as before.
+        assert!(matches!(decide(&macbook(18.0, 0.0), &lim, &[], w, &me, 1000.0, &[]), Decision::Admit { over_ram: false, .. }));
+    }
+
+    #[test]
+    fn a_forced_start_over_ram_is_seen_as_such() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        assert!(over_ram(&macbook(20.0, 0.0), &lim, &[], w, &me));
+        assert!(!over_ram(&macbook(18.0, 0.0), &lim, &[], w, &me));
     }
 
     #[test]

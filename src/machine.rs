@@ -31,6 +31,10 @@ pub struct MachineSample {
     pub recent_cpu: Vec<(f64, f64)>,
     pub(crate) ticks_busy: u64,
     pub(crate) ticks_total: u64,
+    /// Room in swap: on Linux the free swap; on macOS, whose swap files grow
+    /// while their disk has space, what they have free plus that space.
+    /// Older versions leave it out.
+    pub swap_free_kb: Option<u64>,
 }
 
 impl MachineSample {
@@ -143,6 +147,7 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
         recent_cpu,
         ticks_busy: t.busy,
         ticks_total: t.total,
+        swap_free_kb: sys::swap_free_kb(),
     }
 }
 
@@ -160,7 +165,8 @@ pub fn current(dir: &Path, max_age: f64, ours_kb: u64) -> MachineSample {
     if let Some(c) = &cached
         && crate::db::now() - c.ts <= max_age
     {
-        return c.clone();
+        // A recorder of an older version reads no swap.
+        return MachineSample { swap_free_kb: c.swap_free_kb.or_else(sys::swap_free_kb), ..c.clone() };
     }
     let s = measure(cached.as_ref(), ours_kb);
     write_cache(dir, &s);

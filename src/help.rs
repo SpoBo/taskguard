@@ -38,7 +38,10 @@ command named like a subcommand, such as a script called `top`.
 
 A job that is short of room by only a little (noise_mem, noise_cpu), or only
 because programs outside taskguard hold the room (outside_admit), starts
-anyway and prints a warning that says what it lacks.
+anyway and prints a warning that says what it lacks. With nothing of
+taskguard's running, a job that only memory keeps out may start over RAM
+once it has waited (overcommit), never at critical pressure; on Linux it is
+then the OOM killer's first pick.
 
 Options go before the command. Words after the command, --help too, belong
 to the command.

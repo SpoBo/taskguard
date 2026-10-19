@@ -47,6 +47,8 @@ struct Outcome {
     ours_worst_pct: f64,
     /// Jobs started while the kernel reported pressure and others were running.
     started_under_pressure: usize,
+    /// Jobs started while the kernel reported critical pressure.
+    started_at_critical: usize,
     /// Seconds until the last job ended.
     finished_at: f64,
     all_ran: bool,
@@ -132,6 +134,7 @@ fn run_in(s: &Scenario, lim: &Limits, run_of: impl Fn(usize) -> Option<(String, 
             mem_total_kb: TOTAL,
             mem_pressure: Some(pressure(pct)),
             recent_mem: recent.clone(),
+            swap_free_kb: Some(16 * GB),
             ..Default::default()
         };
         // Every waiting job checks once per tick, oldest first, as the runners do.
@@ -142,6 +145,9 @@ fn run_in(s: &Scenario, lim: &Limits, run_of: impl Fn(usize) -> Option<(String, 
             if matches!(decide(&m, lim, &run_now, &waiting, &me, t, &starts), Decision::Admit { .. }) {
                 if pressure(pct) >= lim.pressure_max && !run_now.is_empty() {
                     out.started_under_pressure += 1;
+                }
+                if pressure(pct) >= 100.0 {
+                    out.started_at_critical += 1;
                 }
                 if !me.known {
                     starts.push(t);
@@ -284,6 +290,21 @@ fn behind_long_jobs(by_cpu: bool) -> Scenario {
     }
 }
 
+/// A dev stack and its run, 14 GB together, queue alone while programs
+/// outside taskguard hold 20 GB of 32: 106% of RAM with it, so it never fits.
+/// `critical_until` holds the machine at critical pressure (31 GB outside)
+/// until then.
+fn lone_stack(critical_until: f64) -> Scenario {
+    let mut stack = known(14, 3.0, 600.0, 0.0);
+    stack.est_dur = None;
+    Scenario {
+        name: "a lone 14 GB stack, 20 GB outside",
+        jobs: vec![stack],
+        other_mem: Box::new(move |t| if t < critical_until { 31 * GB } else { 20 * GB }),
+        other_cpu: Box::new(|_| 2.0),
+    }
+}
+
 /// The longest any small job (all but the scenario's large ones) waited.
 fn worst_small_wait(s: &Scenario, o: &Outcome) -> f64 {
     s.jobs
@@ -312,6 +333,9 @@ mod tests {
         outside_admit: false,
         outside_mem_max_pct: 95.0,
         partial_fit: 0.0,
+        overcommit_max_pct: 0.0,
+        overcommit_after: 120.0,
+        overcommit_stuck_after: 1800.0,
     };
 
     #[test]
@@ -403,6 +427,27 @@ mod tests {
             assert!(head <= head_strict + 1.0, "{}: the head starts no later: {head:.0}s vs {head_strict:.0}s", s.name);
             assert!(head <= if by_cpu { 2400.0 } else { 1800.0 } + 1.0, "{}: {head:.0}s", s.name);
         }
+    }
+
+    #[test]
+    fn a_lone_job_that_only_programs_outside_keep_out_starts_over_ram_but_never_at_critical() {
+        let lim = Limits { overcommit_max_pct: 120.0, ..LIM };
+        // Without over-commit it waits for good.
+        let o = run(&lone_stack(0.0), &LIM);
+        assert_eq!(o.started[0], None, "0.11.0-rc.2 never starts it");
+        // With it, it starts once it has waited overcommit_after.
+        let o = run(&lone_stack(0.0), &lim);
+        let t = o.started[0].expect("it starts");
+        eprintln!("lone stack, 20 GB outside: starts at {t:.0}s, memory then {:.0}%", o.worst_pct);
+        assert!((lim.overcommit_after..lim.overcommit_after + 10.0).contains(&t), "{t:.0}s");
+        assert!(o.worst_pct <= lim.overcommit_max_pct, "{:.0}%", o.worst_pct);
+        assert_eq!(o.started_at_critical, 0);
+        // While programs outside hold the machine at critical, it waits; it
+        // starts as soon as that eases, as it has waited long enough.
+        let o = run(&lone_stack(400.0), &lim);
+        let t = o.started[0].expect("it starts");
+        assert!((400.0..410.0).contains(&t), "{t:.0}s");
+        assert_eq!(o.started_at_critical, 0);
     }
 
     #[test]

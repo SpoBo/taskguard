@@ -53,6 +53,11 @@ pub struct Layer {
     pub noise_cpu: Option<f64>,
     pub outside_admit: Option<bool>,
     pub partial_fit: Option<f64>,
+    pub overcommit: Option<bool>,
+    pub overcommit_after: Option<f64>,
+    pub overcommit_stuck_after: Option<f64>,
+    pub overcommit_max_macos: Option<f64>,
+    pub overcommit_max_linux: Option<f64>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -175,6 +180,17 @@ pub struct Config {
     /// A job that cannot fit now starts on this share of its CPU need, when
     /// the machine is near its recent low. 0 turns it off.
     pub partial_fit: f64,
+    /// A job that only memory keeps out may start over RAM: the only job in
+    /// the queue after `overcommit_after` seconds, the first in line after
+    /// `overcommit_stuck_after`, with nothing of taskguard's running; and
+    /// work for a running long-lived job at once. Never at critical pressure,
+    /// up to `overcommit_max_*` of RAM on this OS, and over RAM only into
+    /// half the free swap (see `queue::overcommit_ceiling`).
+    pub overcommit: bool,
+    pub overcommit_after: f64,
+    pub overcommit_stuck_after: f64,
+    pub overcommit_max_macos: f64,
+    pub overcommit_max_linux: f64,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -228,6 +244,11 @@ impl Default for Config {
             noise_cpu: 0.5,
             outside_admit: true,
             partial_fit: 0.5,
+            overcommit: true,
+            overcommit_after: 120.0,
+            overcommit_stuck_after: 1800.0,
+            overcommit_max_macos: 120.0,
+            overcommit_max_linux: 120.0,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -672,6 +693,11 @@ impl Config {
         set!(noise_cpu);
         set!(outside_admit);
         set!(partial_fit);
+        set!(overcommit);
+        set!(overcommit_after);
+        set!(overcommit_stuck_after);
+        set!(overcommit_max_macos);
+        set!(overcommit_max_linux);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);
