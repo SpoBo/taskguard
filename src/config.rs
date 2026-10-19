@@ -40,6 +40,11 @@ pub struct Layer {
     pub new_job_mem: Option<String>,
     pub max_bypass: Option<u64>,
     pub max_backfill: Option<u64>,
+    pub expect_wait: Option<f64>,
+    pub infer_work: Option<bool>,
+    pub infer_work_min: Option<usize>,
+    pub infer_work_of: Option<usize>,
+    pub infer_work_within: Option<u64>,
     pub boost_runs: Option<usize>,
     pub outlier_ratio: Option<f64>,
     pub outlier_min: Option<String>,
@@ -48,6 +53,11 @@ pub struct Layer {
     pub noise_cpu: Option<f64>,
     pub outside_admit: Option<bool>,
     pub partial_fit: Option<f64>,
+    pub overcommit: Option<bool>,
+    pub overcommit_after: Option<f64>,
+    pub overcommit_stuck_after: Option<f64>,
+    pub overcommit_max_macos: Option<f64>,
+    pub overcommit_max_linux: Option<f64>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -139,6 +149,17 @@ pub struct Config {
     pub new_job_mem_kb: u64,
     pub max_bypass: u64,
     pub max_backfill: u64,
+    /// Seconds a long-lived job that expects work waits, before it starts,
+    /// for that work to queue: see `queue::Entry::expect_until`. 0 = never.
+    pub expect_wait: f64,
+    /// A long-lived job with no declared work books what its history says
+    /// follows it: work that queued within `infer_work_within` seconds of
+    /// its start on at least `infer_work_min` of its last `infer_work_of`
+    /// runs in that checkout.
+    pub infer_work: bool,
+    pub infer_work_min: usize,
+    pub infer_work_of: usize,
+    pub infer_work_within: u64,
     pub boost_runs: usize,
     /// A memory peak more than this many times the next one below it is an
     /// outlier, and counts by `outlier_weights`. At or under 1: no outliers.
@@ -154,11 +175,23 @@ pub struct Config {
     /// A job short of CPU by at most this many cores starts anyway.
     pub noise_cpu: f64,
     /// A job that only programs outside taskguard keep out starts anyway,
-    /// while memory stays under `pause_at`.
+    /// while memory stays under `pause_at` (see `commands::outside_ceiling`).
     pub outside_admit: bool,
     /// A job that cannot fit now starts on this share of its CPU need, when
     /// the machine is near its recent low. 0 turns it off.
     pub partial_fit: f64,
+    /// A job that only memory keeps out may start over RAM: the only job in
+    /// the queue after `overcommit_after` seconds, the first in line after
+    /// `overcommit_stuck_after`, with nothing of taskguard's running but the
+    /// long-lived job it is work for (see `Room::overcommit` for work that
+    /// inherits its stack's over-commit). Never at critical pressure, up to
+    /// `overcommit_max_*` of RAM on this OS, and over RAM only into half the
+    /// free swap (see `queue::overcommit_ceiling`).
+    pub overcommit: bool,
+    pub overcommit_after: f64,
+    pub overcommit_stuck_after: f64,
+    pub overcommit_max_macos: f64,
+    pub overcommit_max_linux: f64,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -199,6 +232,11 @@ impl Default for Config {
             new_job_mem_kb: 1536 * 1024,
             max_bypass: 120,
             max_backfill: 600,
+            expect_wait: 5.0,
+            infer_work: true,
+            infer_work_min: 3,
+            infer_work_of: 5,
+            infer_work_within: 900,
             boost_runs: 5,
             outlier_ratio: 1.5,
             outlier_min_kb: 1024 * 1024,
@@ -207,6 +245,11 @@ impl Default for Config {
             noise_cpu: 0.5,
             outside_admit: true,
             partial_fit: 0.5,
+            overcommit: true,
+            overcommit_after: 120.0,
+            overcommit_stuck_after: 1800.0,
+            overcommit_max_macos: 120.0,
+            overcommit_max_linux: 120.0,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -633,6 +676,11 @@ impl Config {
         }
         set!(max_bypass);
         set!(max_backfill);
+        set!(expect_wait);
+        set!(infer_work);
+        set!(infer_work_min);
+        set!(infer_work_of);
+        set!(infer_work_within);
         set!(boost_runs);
         set!(outlier_ratio);
         if let Some(v) = &l.outlier_min
@@ -646,6 +694,11 @@ impl Config {
         set!(noise_cpu);
         set!(outside_admit);
         set!(partial_fit);
+        set!(overcommit);
+        set!(overcommit_after);
+        set!(overcommit_stuck_after);
+        set!(overcommit_max_macos);
+        set!(overcommit_max_linux);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);

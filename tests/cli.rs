@@ -189,6 +189,21 @@ fn a_minimum_makes_a_job_wait_for_room() {
     holder.wait_with_output().unwrap();
 }
 
+/// A job started with memory over RAM, here by --st, is the OOM killer's
+/// first pick; a job that fits keeps the score it inherits.
+#[cfg(target_os = "linux")]
+#[test]
+fn only_a_start_over_ram_raises_the_oom_score() {
+    let e = Env::new("");
+    let own = std::fs::read_to_string("/proc/self/oom_score_adj").unwrap().trim().to_string();
+    let fits = e.run(&["--", "sh", "-c", "cat /proc/self/oom_score_adj"]);
+    assert_eq!(String::from_utf8_lossy(&fits.stdout).trim(), own, "{}", stderr(&fits));
+    let over = e.run(&["--st", "1", "--min-mem", "100000G", "--", "sh", "-c", "cat /proc/self/oom_score_adj"]);
+    assert!(over.status.success(), "{}", stderr(&over));
+    assert_eq!(String::from_utf8_lossy(&over.stdout).trim(), "800", "{}", stderr(&over));
+    assert!(stderr(&over).contains("OOM killer's first pick"), "{}", stderr(&over));
+}
+
 #[test]
 fn a_nested_call_does_not_take_a_second_slot() {
     let e = Env::new("");
@@ -564,6 +579,71 @@ fn a_long_lived_job_holds_its_peak_only_through_its_start_up() {
     assert!(steady_mem > 0);
     let explain = String::from_utf8_lossy(&e.run(&["doctor", "--explain", "sh -c x"]).stdout).into_owned();
     assert!(!explain.contains("long-lived"), "only the stack pool is: {explain}");
+}
+
+#[test]
+fn a_stack_books_the_work_it_expects_and_that_work_goes_first() {
+    let e = Env::new(
+        "sample_every = 0.2\nnew_job_mem = \"700M\"\nexpect_wait = 0.5\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n",
+    );
+    // The caller of the stack says a browser run will follow (DALP passes the
+    // variable through `devenv up`).
+    let mut stack = e.cmd(&["--id", "stack", "--priority", "10", "--", "sh", "-c", "touch up; sleep 30"]);
+    stack.env("TASKGUARD_EXPECT", "browser");
+    let mut stack = stack.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    wait_for(&e.file("up"));
+    let r = running_job(&e).unwrap();
+    assert_eq!(r["expects"][0]["work"], "browser", "{r}");
+    assert_eq!(r["expects"][0]["mem_kb"], 700 * 1024, "no browser run is known yet: new_job_mem: {r}");
+    let status = String::from_utf8_lossy(&e.run(&["status"]).stdout).into_owned();
+    assert!(status.contains("(expects browser, books 700 MB)"), "{status}");
+
+    // The run queues in the same checkout: it is the work the stack expects,
+    // and goes one priority above it.
+    let run = e.spawn(&["--id", "browser", "--", "sh", "-c", "touch ran; sleep 1"]);
+    wait_for(&e.file("ran"));
+    let out = e.run(&["status", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = v["running"].as_array().unwrap().iter().find(|r| r["pool"] == "browser").cloned().unwrap();
+    assert_eq!((r["priority"].as_i64(), r["work_for"]["item"].as_i64()), (Some(11), Some(0)), "{r}");
+    let run = run.wait_with_output().unwrap();
+    assert!(run.status.success() && stderr(&run).contains("for stack "), "{}", stderr(&run));
+    // Once it has started, the stack books nothing for it any more.
+    wait_until("the stack drops its booking", || running_job(&e).is_some_and(|r| r["expects"][0]["started"] == true));
+
+    // Any other job ignores the variable; --expect on it says so.
+    let other = e.run(&["--expect", "browser", "--", "true"]);
+    assert!(stderr(&other).contains("--expect is for a long-lived job"), "{}", stderr(&other));
+    unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    let _ = stack.wait();
+}
+
+#[test]
+fn a_stack_waits_for_the_work_it_expects_when_both_queue_together() {
+    // Both are first runs and book new_job_mem each. Small, so the stack and
+    // its run fit together also on a CI runner whose memory is mostly in use:
+    // a lone stack that does not fit in RAM waits, and this test is about the
+    // stack waiting for its work, not about room.
+    let e = Env::new(
+        "sample_every = 0.2\nexpect_wait = 20\nnew_job_mem = \"64M\"\n[pool.stack]\nlong_lived = true\nstartup = 1\n[pool.browser]\nunlimited = true\n",
+    );
+    let mut stack = e.cmd(&["--id", "stack", "--expect", "browser", "--", "sh", "-c", "touch up; sleep 30"]);
+    let mut stack = stack.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let t = Instant::now();
+    // The run queues a moment later: the stack, which waits for it, starts
+    // at once, and the run after it.
+    wait_until("the stack queues", || {
+        let out = e.run(&["status", "--json"]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok_and(|v| v["waiting"].as_array().is_some_and(|w| !w.is_empty()))
+    });
+    let run = e.run(&["--id", "browser", "--", "true"]);
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert!(t.elapsed() < Duration::from_secs(15), "the stack did not wait out expect_wait: {:?}", t.elapsed());
+    assert!(stderr(&run).contains("for stack "), "{}", stderr(&run));
+    let started = |pool: &str| -> f64 { e.db().query_row("SELECT started_at FROM runs WHERE pool = ?1", [pool], |r| r.get(0)).unwrap() };
+    assert!(started("browser") >= started("stack"), "the run starts only once its stack runs");
+    unsafe { libc::kill(stack.id() as i32, libc::SIGTERM) };
+    let _ = stack.wait();
 }
 
 #[test]

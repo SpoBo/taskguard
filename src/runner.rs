@@ -45,7 +45,78 @@ pub struct Opts {
     pub wait: bool,
     /// Higher goes first; the default comes from the config, else 0.
     pub priority: Option<i32>,
+    /// For a long-lived job: the work that will run on it (`--expect`).
+    pub expect: Vec<String>,
     pub cmd: Vec<String>,
+}
+
+/// Work a long-lived job's caller says will run on it: `--expect`, then
+/// `TASKGUARD_EXPECT` (comma-separated). Any other job inherits the variable
+/// from whoever started it and leaves it alone. `none` says it expects no
+/// work, not even what its history suggests.
+fn declared_work(o: &Opts) -> Vec<String> {
+    let env = std::env::var("TASKGUARD_EXPECT").unwrap_or_default();
+    o.expect.iter().cloned().chain(env.split(',').map(str::trim).filter(|w| !w.is_empty()).map(str::to_string)).collect()
+}
+
+/// Is this job the work `work` names: its pool, its key, or its command?
+fn is_work(work: &str, me: &Entry, cmd: &[String]) -> bool {
+    me.pool.as_deref() == Some(work) || me.key == work || matcher::matches(work, cmd)
+}
+
+/// Mark the expected work a nudge says has started.
+/// Once work for it has started, a long-lived job also drops what it booked
+/// on the history's guess (`queue::is_guess`): the work came.
+fn apply_work_started(me: &mut Entry, n: &queue::Nudge, running: &[Entry], waiting: &[Entry]) -> bool {
+    let mut changed = false;
+    for i in &n.work_started {
+        if let Some(x) = me.expects.get_mut(*i as usize).filter(|x| !x.started) {
+            x.started = true;
+            changed = true;
+        }
+    }
+    if !n.work_started.is_empty() {
+        for i in (0..me.expects.len()).filter(|&i| me.expects[i].open() && queue::is_guess(me, i, running, waiting)).collect::<Vec<_>>() {
+            me.expects[i].started = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// The longest a booking on the history's guess lasts after its job started.
+const GUESS_MAX_S: f64 = 600.0;
+
+/// The work the history says follows a long-lived job `key` in `checkout`:
+/// each kind of work that queued within `infer_work_within` seconds of its
+/// start on at least `infer_work_min` of its last `infer_work_of` runs there.
+/// It books that work's usual need, for twice its usual delay at most.
+fn inferred_work(d: &Db, cfg: &Config, key: &str, pool: Option<&str>, checkout: &str) -> Vec<queue::Expect> {
+    let within = cfg.infer_work_within as f64;
+    let Ok((n, works)) = d.followers(key, pool, checkout, cfg.infer_work_of.max(1), within) else { return Vec::new() };
+    works
+        .into_iter()
+        .filter(|f| f.runs >= cfg.infer_work_min.max(1))
+        .map(|f| {
+            let mem_kb = f.need_kb.unwrap_or(cfg.new_job_mem_kb);
+            let expire = (2.0 * f.lag_s).clamp(60.0, GUESS_MAX_S);
+            queue::Expect {
+                from: format!(
+                    "from history: it queued within {}s of the start of {} of the last {n} runs of {key} here, after {} as a rule, needing {}; booked for {} at most",
+                    within,
+                    f.runs,
+                    report::dur(f.lag_s),
+                    report::gb(mem_kb),
+                    report::dur(expire)
+                ),
+                work: f.work,
+                mem_kb,
+                implied: true,
+                expire_after_s: Some(expire),
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// sem's `-j`: N, +N (cores + N), -N (cores - N) or N% of cores, at least 1.
@@ -80,6 +151,30 @@ fn apply_nudge(me: &mut Entry, n: &queue::Nudge, database: Option<&Db>) {
     me.known = true;
     if let Some(d) = database {
         let _ = d.set_need(me.run_id, cpu, mem);
+    }
+}
+
+/// Link a waiting job to the long-lived job in its checkout that expects it,
+/// or drop the link when that job is gone, or only guessed the work and the
+/// guess has expired or come true. Work for a long-lived job goes one
+/// priority above it, so it starts before the jobs that queued for room
+/// meanwhile, and before a next stack.
+fn link_to_stack(me: &mut Entry, own_priority: i32, running: &[Entry], waiting: &[Entry], cmd: &[String], quiet: bool) {
+    if queue::link_lapsed(me, running, waiting, |w| is_work(w, me, cmd)) {
+        me.work_for = None;
+        me.priority = own_priority;
+    }
+    if me.work_for.is_some() {
+        return;
+    }
+    let probe = me.clone();
+    if let Some((link, priority)) = queue::link_work(&probe, running, waiting, |w| is_work(w, &probe, cmd)) {
+        if !quiet {
+            let booked = if link.item.is_some() { "; it takes over the room booked for it" } else { "" };
+            say(&format!("for stack {} - {} is work it expects, and goes first{booked}", link.key, me.key));
+        }
+        me.priority = own_priority.max(priority + 1);
+        me.work_for = Some(link);
     }
 }
 
@@ -318,6 +413,30 @@ pub fn run(mut o: Opts) -> Result<i32> {
     }
     let (need_cpu, need_mem, raised) = (need.cpu, need.mem_kb, need.raised_by_min);
     let need_why = serde_json::to_string(&need).ok();
+    // A long-lived job books room for the work its caller says will run on
+    // it, learned as that work would learn it.
+    let work = declared_work(&o);
+    if startup.is_none() && !o.expect.is_empty() && !o.quiet {
+        say(&format!("warning {jkey} - --expect is for a long-lived job (long_lived = true); ignored"));
+    }
+    let mut expects: Vec<queue::Expect> = match startup {
+        Some(_) => work.iter().map(|w| need::expected(database.as_ref(), &cfg, &cwd, w)).collect(),
+        None => Vec::new(),
+    };
+    // `--expect none`: no work, not even what the history suggests.
+    let none = work.iter().any(|w| w == "none");
+    expects.retain(|x| x.work != "none");
+    // Without a declaration, the history may say what work follows this job
+    // in this checkout: it books that, as a guess with a time limit.
+    if startup.is_some()
+        && expects.is_empty()
+        && !none
+        && cfg.infer_work
+        && let Some(d) = &database
+    {
+        expects = inferred_work(d, &cfg, &jkey, pool.as_deref(), &checkout.to_string_lossy());
+    }
+    let expect_wait = cfg.expect_wait.clamp(0.0, 60.0);
     let estimate_from = guess.as_ref().map(|g| g.from.clone());
     let est_dur = guess.as_ref().and_then(|g| g.dur_s);
 
@@ -388,6 +507,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
         // until someone stops it, so no one counts on it ending.
         est_dur_s: learned.dur_s.or(est_dur).filter(|_| startup.is_none()),
         priority: o.priority.or(cls.priority).unwrap_or(cfg.priority),
+        long_lived: startup.is_some(),
+        expects,
         pausable: true,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
@@ -401,6 +522,24 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let conf_path = config::user_config_path();
     let conf_mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let mut seen_mtime = conf_mtime(&conf_path);
+
+    // It waits a few seconds for that work to queue, so it starts with room
+    // for both; a job with nothing to expect starts as before.
+    if !me.expects.is_empty() && expect_wait > 0.0 {
+        me.expect_until = Some(me.queued_at + expect_wait);
+    }
+    if !o.quiet {
+        for x in &me.expects {
+            let wait = me.expect_until.map(|_| format!("; it waits up to {expect_wait:.0}s for it to queue")).unwrap_or_default();
+            if x.implied {
+                say(&format!("expects {} - {} books {} for it ({}){wait}", x.work, me.key, report::gb(x.mem_kb), x.from));
+            } else {
+                say(&format!("expects {} - {} books {} for it until it starts ({}){wait}", x.work, me.key, report::gb(x.mem_kb), x.from));
+            }
+        }
+    }
+    // The priority without the lift that work for a long-lived job gets.
+    let own_priority = me.priority;
 
     // ---- wait for room
     let t0 = db::now();
@@ -490,12 +629,29 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 }
                 if let Some(n) = q.take_nudge(me_pid) {
                     apply_nudge(&mut me, &n, database.as_ref());
+                    apply_work_started(&mut me, &n, &running, &waiting);
                     started_by_hand |= n.start;
+                }
+                link_to_stack(&mut me, own_priority, &running, &waiting, &o.cmd, o.quiet);
+                // Work that queued for this long-lived job may need more than
+                // was booked for it: book that.
+                for (i, x) in me.expects.iter_mut().enumerate() {
+                    let theirs = waiting
+                        .iter()
+                        .filter(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me_pid && l.item == Some(i as u32)))
+                        .max_by_key(|w| w.need_mem_kb);
+                    if let Some(w) = theirs.filter(|w| w.need_mem_kb > x.mem_kb) {
+                        x.mem_kb = w.need_mem_kb;
+                        x.from = format!("the need of {}, which queued for it", w.key);
+                    }
                 }
                 let mut waiting = waiting;
                 if let Some(w) = waiting.iter_mut().find(|w| w.pid == me_pid) {
                     w.need_cpu = me.need_cpu;
                     w.need_mem_kb = me.need_mem_kb;
+                    w.priority = me.priority;
+                    w.work_for = me.work_for.clone();
+                    w.expects = me.expects.clone();
                 }
                 let unknown_starts = q.unknown_starts();
                 decision = queue::decide(&m, &limits, &running, &waiting, &me, now, &unknown_starts);
@@ -531,12 +687,20 @@ pub fn run(mut o: Opts) -> Result<i32> {
                         q.add_unknown_start(now, cfg.learn_stagger);
                     }
                     me.need_cpu = queue::cpu_to_book(&decision, me.need_cpu);
+                    (me.over_ram, me.overcommitted) = match &decision {
+                        Decision::Admit { over_ram, overcommitted, .. } => (*over_ram, *overcommitted),
+                        Decision::Wait { .. } => (queue::over_ram(&m, &limits, &running, &waiting, &me), false),
+                    };
                     me.started_at = Some(now);
                     me.start_need_cpu = Some(me.need_cpu);
                     me.start_need_mem_kb = Some(me.need_mem_kb);
                     me.blocker = None;
                     q.write(&q.run_path(me_pid), &me)?;
                     let _ = std::fs::remove_file(q.wait_path(&me));
+                    // The long-lived job this is work for drops what it booked for it.
+                    if let Some(queue::WorkFor { pid, item: Some(i), .. }) = &me.work_for {
+                        let _ = q.nudge(*pid, |n| n.work_started.push(*i));
+                    }
                     q.touch_activity();
                 } else {
                     let text = report::main_blocker(&decision).map(report::blocker_text);
@@ -636,7 +800,23 @@ pub fn run(mut o: Opts) -> Result<i32> {
     }
 
     // ---- run and measure
-    let mut child = match Command::new(&o.cmd[0]).args(&o.cmd[1..]).env("TASKGUARD_HELD", "1").env_remove("TASKGUARD_BG_FD").spawn() {
+    let mut cmd = Command::new(&o.cmd[0]);
+    cmd.args(&o.cmd[1..]).env("TASKGUARD_HELD", "1").env_remove("TASKGUARD_BG_FD");
+    // A job started over RAM is the one to go when memory runs out, not the
+    // browser or the editor that already ran: every process of it inherits
+    // the score.
+    if me.over_ram {
+        if cfg!(target_os = "linux") {
+            say(&format!("{} starts with memory over RAM; it is the OOM killer's first pick (oom_score_adj 800)", me.key));
+        }
+        unsafe {
+            cmd.pre_exec(|| {
+                sys::raise_oom_score();
+                Ok(())
+            });
+        }
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             cleanup_files(&q, &me);
@@ -725,6 +905,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
             }
             if let Some(n) = q.take_nudge(me_pid) {
                 apply_nudge(&mut me, &n, database.as_ref());
+                if !n.work_started.is_empty() && apply_work_started(&mut me, &n, &q.running(), &q.waiting()) {
+                    let _ = q.write(&q.run_path(me_pid), &me);
+                }
                 match (n.pause, me.paused_since.is_some()) {
                     (Some(true), false) => pause_cmd(&q, &mut me, now, true),
                     // An auto pause becomes a pause by hand: it stays until a resume by hand.
@@ -741,6 +924,12 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 if n.pause == Some(true) {
                     say(&format!("paused {} - by hand; it stays paused until taskguard resume, or p in taskguard top", me.key));
                 }
+            }
+            if me.expects.iter().any(|x| x.due(me.started_at.unwrap_or(now), now))
+                && queue::expire_guesses(&mut me, &q.running(), &q.waiting(), now)
+            {
+                let _ = q.write(&q.run_path(me_pid), &me);
+                say(&format!("expected {} - the work its history suggested did not come in time; it no longer books room for it", me.key));
             }
             if let Some(r) = tracker.sample(child_pid, now, &procs) {
                 me.live_cpu = r.used;
@@ -1078,6 +1267,9 @@ fn run_bg(o: &Opts) -> Result<i32> {
     if let Some(v) = o.priority {
         args.extend(["--priority".into(), v.to_string()]);
     }
+    for w in &o.expect {
+        args.extend(["--expect".into(), w.clone()]);
+    }
     if o.now {
         args.push("--now".into());
     }
@@ -1131,6 +1323,59 @@ pub fn wait_pool(id: Option<&str>) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guess_of_the_history_ends_when_the_work_comes_or_its_time_is_up() {
+        let guess = queue::Expect { work: "browser".into(), mem_kb: 4, implied: true, expire_after_s: Some(600.0), ..Default::default() };
+        let declared = queue::Expect { work: "e2e".into(), mem_kb: 4, ..Default::default() };
+        let stack = Entry { started_at: Some(1000.0), expects: vec![declared, guess], ..Default::default() };
+        let mut s = stack.clone();
+        assert!(!queue::expire_guesses(&mut s, &[], &[], 1600.0));
+        assert!(queue::expire_guesses(&mut s, &[], &[], 1601.0));
+        assert!(!s.expects[0].expired && s.expects[1].expired, "only the guess expires");
+        // Work for the stack started: the guess goes with it.
+        let mut s = stack;
+        assert!(apply_work_started(&mut s, &queue::Nudge { work_started: vec![0], ..Default::default() }, &[], &[]));
+        assert!(s.expects.iter().all(|x| x.started));
+    }
+
+    #[test]
+    fn the_history_infers_work_only_when_it_followed_often_enough() {
+        let d = Db::open(Path::new(":memory:")).unwrap();
+        let t = db::now() - 86400.0;
+        let at = |key: &str, pool: &str, cwd: &str, queued: f64, ended: Option<f64>| {
+            let id = d.insert_run(&NewRun { ns: "n", key, pool: Some(pool), cwd, need_mem_kb: 4_000_000, ..Default::default() }).unwrap();
+            d.conn.execute("UPDATE runs SET queued_at = ?2 WHERE id = ?1", rusqlite::params![id, queued]).unwrap();
+            d.mark_started(id, queued, 0.0, None).unwrap();
+            if let Some(e) = ended {
+                d.finish_run(id, &RunResult { ended_at: e, ..Default::default() }).unwrap();
+            }
+            id
+        };
+        let infer = |cfg: &Config| inferred_work(&d, cfg, "dev-env:stack", Some("stack"), "/w/dalp");
+        let cfg = Config::default();
+        // Two stacks, each followed by a browser run 6 minutes in: not yet 3 of 5.
+        for i in 0..3 {
+            let s = t + 3600.0 * i as f64;
+            at("dev-env:stack", "stack", "/w/dalp", s, Some(s + 1800.0));
+            if i < 2 {
+                at("pr.ts", "browser", "/w/dalp/e2e", s + 360.0, Some(s + 600.0));
+            }
+        }
+        assert!(infer(&cfg).is_empty());
+        let s = t + 3600.0 * 3.0;
+        at("dev-env:stack", "stack", "/w/dalp", s, Some(s + 1800.0));
+        at("pr.ts", "browser", "/w/dalp/e2e", s + 360.0, Some(s + 600.0));
+        // Now 3 of the last 4: it books the run's usual need, for twice its
+        // usual delay, ten minutes at most.
+        let x = infer(&cfg);
+        assert_eq!(x.len(), 1, "{x:?}");
+        assert_eq!((x[0].work.as_str(), x[0].mem_kb, x[0].implied, x[0].expire_after_s), ("browser", 4_000_000, true, Some(600.0)));
+        assert!(x[0].from.starts_with("from history"), "{}", x[0].from);
+        // Stricter settings, or later than the window, infer nothing.
+        assert!(infer(&Config { infer_work_min: 4, ..Config::default() }).is_empty());
+        assert!(infer(&Config { infer_work_within: 300, ..Config::default() }).is_empty());
+    }
 
     #[test]
     fn jobs_like_sem() {

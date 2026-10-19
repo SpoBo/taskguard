@@ -12,6 +12,11 @@ options (sem style; the default is to run in the foreground):
   --min-cpu N             never start with fewer than N free cores
   --min-mem SIZE          never start with less than SIZE free (6G, 512M)
   --priority N            higher starts first (default 0; negative is allowed)
+  --expect WORK           a long-lived job (a dev stack): work that will run on
+                          it, a pool name, job key or command pattern; it books
+                          room for that work and the work goes first once it
+                          queues. Repeatable; also TASKGUARD_EXPECT=WORK,WORK.
+                          none: no work, not even what its history suggests
   --now                   skip the queue, but still measure and learn
   --wraps                 COMMAND runs other taskguard jobs (turbo, a package
                           script): run it straight through and let them queue
@@ -33,7 +38,10 @@ command named like a subcommand, such as a script called `top`.
 
 A job that is short of room by only a little (noise_mem, noise_cpu), or only
 because programs outside taskguard hold the room (outside_admit), starts
-anyway and prints a warning that says what it lacks.
+anyway and prints a warning that says what it lacks. With nothing of
+taskguard's running, a job that only memory keeps out may start over RAM
+once it has waited (overcommit), never at critical pressure; on Linux it is
+then the OOM killer's first pick.
 
 Options go before the command. Words after the command, --help too, belong
 to the command.

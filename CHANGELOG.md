@@ -12,6 +12,50 @@ and the versions follow [semver](https://semver.org).
 
 ### Added
 
+- Over-commit for a lone job (`overcommit`, on by default). A job that only
+  programs outside taskguard keep out, with nothing of taskguard's running,
+  may start with memory over RAM: as the only job in the queue after
+  `overcommit_after` (120) seconds, or as the first in line after
+  `overcommit_stuck_after` (1800) seconds while other jobs queue too. Work
+  for a running stack counts as alone next to it. Work that takes over the
+  room a stack declared for it starts so at once only when that stack itself
+  started by over-commit; otherwise it waits as any other job. Never at
+  critical pressure (on Linux, never at `pressure_max`), up to
+  `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM, and
+  with the part over RAM in at most half the free swap; on macOS the swap
+  counts the free space of the volume its swap files grow on.
+  `overcommit = false` turns it off.
+- On Linux a job that starts with memory over RAM (by over-commit, by `--st`,
+  or by hand) is the OOM killer's first pick: its processes get
+  `oom_score_adj` 800.
+- `taskguard top` and `taskguard status` mark a job that started over RAM
+  (`OVER`, `OVER-RAM`), and a job that has waited five minutes for memory
+  with nothing of taskguard's running gets a line that names the programs
+  outside taskguard that hold it, how far it is short, and when or how it
+  starts. The memory rule of the Why panel shows a waiting stack's own need
+  and what it books for its work apart, and how much of what running jobs
+  hold back is booked for work their stacks expect.
+
+### Fixed
+
+- A lone job, such as a dev stack that books its browser run, no longer
+  waits for ever when only programs outside taskguard keep it out.
+- The wait text measures the gap of the first job in line against the
+  ceiling it really waits for, all of RAM with nothing of taskguard's
+  running, not `mem_max`: a lone stack at 18.5 GB held outside taskguard on
+  a 32 GB Mac is 307 MB short, where it said 1.9 GB.
+
+## [0.11.0-rc.2] - 2026-10-17
+
+### Added
+
+- `taskguard top` shows its version at the right of the key bar, in the
+  room the keys leave: `taskguard VERSION`, or `vVERSION` when narrow.
+
+## [0.11.0-rc.1] - 2026-10-16
+
+### Added
+
 - `taskguard dump PATTERN | --cmd "COMMAND" | --run ID` prints everything
   taskguard knows about a job as one JSON document: how the command matches,
   the rules in force and which file set them, what the next run reserves and
@@ -21,6 +65,68 @@ and the versions follow [semver](https://semver.org).
   Use it to find out why a job reserved what it did.
 - Each run now stores how its need was made (`runs.need_why`), so `dump`
   can explain an old run too, not only the next one.
+- A long-lived job can declare the work that will run on it:
+  `--expect WORK` (repeatable) or `TASKGUARD_EXPECT=WORK,WORK`, where WORK is
+  a pool name, a job key or a command pattern. The stack books room for that
+  work (learned as the work learns its own need; for a pool, the need its
+  jobs typically started with) and starts only with room for both. A job in the same checkout that matches is its work: it goes one
+  priority above the stack, takes over the booked room when it starts, and
+  waits while its stack still waits. `taskguard status` shows `(for stack
+  KEY)` on the work and `(expects WORK, books SIZE)` on the stack. Without a
+  declaration, only what the history infers applies (`infer_work`, below).
+- A long-lived job with no declared work books the work its history says
+  follows it: work of one kind (a pool, or a key outside any pool) that
+  queued in its checkout within `infer_work_within` (900) seconds of its
+  start on at least `infer_work_min` (3) of its last `infer_work_of` (5)
+  runs there. It books that work's usual need, shown as `(expects WORK from
+  history, ...)` until work queues for it, for twice its usual delay and ten
+  minutes at most, and drops it once work for the stack starts. While the
+  guess is open the stack waits `expect_wait` for the work, and matching work
+  links to it and goes first; an expired or started guess links nothing, and
+  work linked to it drops back to its own priority. A guess whose work has queued and
+  linked to it came true: it is declared work from then on, also for the
+  rule for nothing running, and does not expire while that work waits. The
+  guess never stops the rule for nothing running. Another stack respects it
+  while it is open, also one started with no declared work, so such a stack
+  waits at most until the guess expires or its work starts; a stack that
+  still fits next to it starts at once. A declaration wins; `--expect none`
+  expects nothing; `infer_work = false` turns it off.
+- `expect_wait` (5 seconds by default, 0 turns it off): a long-lived job that
+  expects work, declared or from its history, waits that long before it
+  starts for the work to queue, so a stack and a run started together start
+  with room for both. A stack that expects nothing starts at once.
+
+### Changed
+
+- With nothing running, or nothing but long-lived jobs past their start-up,
+  the first job in line that fits starts, up to all of RAM, rather than the
+  first in line whatever the memory reading says. Next to long-lived jobs, a
+  long-lived job, such as a second dev stack, starts that way only under
+  `mem_max`, or, when only programs outside taskguard keep it out, up to the
+  ceiling `outside_admit` allows. With nothing of taskguard's running, it
+  starts up to all of RAM, as before. A job that does not fit holds nobody
+  back, so the jobs behind it that fit start. At macOS warning this rule
+  still decides when only long-lived jobs run.
+- A waiting job that would not fit even once every job that ends by itself
+  has ended holds nobody back, whatever its priority or reservation: it can
+  only start once a long-lived job is stopped or other programs free memory,
+  and the small jobs behind it start meanwhile.
+- A stack with work queued for it, and work whose stack runs, hold their turn
+  as a strict reservation, also while they do not fit yet, rather than letting
+  jobs that fit start meanwhile (backfill).
+
+### Fixed
+
+- A second dev stack is no longer started over memory while the first one's
+  run waits: the rule for "nothing runs but long-lived jobs" started the head
+  of the line whatever the readings said, and skipped itself at macOS
+  warning, so the run waited until its caller gave up.
+- The NEXT line names a long-lived job that holds the room as one that must
+  be stopped, not as one that will finish.
+- `outside_admit` works again when `mem_max` is at or above `pause_at`
+  (92% by default), as with `mem_max = 95`. It capped memory at `pause_at`,
+  under the limit, so it could never let a job start; the cap is now
+  halfway from `mem_max` to all of RAM in that case.
 
 ## [0.10.0] - 2026-10-16
 
@@ -336,7 +442,9 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.11.0-rc.2...HEAD
+[0.11.0-rc.2]: https://github.com/SpoBo/taskguard/compare/v0.11.0-rc.1...v0.11.0-rc.2
+[0.11.0-rc.1]: https://github.com/SpoBo/taskguard/compare/v0.10.0...v0.11.0-rc.1
 [0.10.0]: https://github.com/SpoBo/taskguard/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/SpoBo/taskguard/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/SpoBo/taskguard/compare/v0.7.1...v0.8.0

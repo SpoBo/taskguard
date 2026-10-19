@@ -185,6 +185,38 @@ pub fn guess(db: Option<&Db>, cfg: &Config, package: Option<&str>, argv: &[Strin
     }
 }
 
+/// What a long-lived job books for work it expects (`--expect WORK`): the
+/// need that work will start with, learned as the work itself learns it.
+/// WORK is a pool name, a job key, or a command (pattern) run from `cwd`.
+/// A pool books what jobs of that pool typically started with; a key or
+/// command its history, else a first guess as for a new job, with the
+/// minimums of the job rules it matches.
+pub fn expected(db: Option<&Db>, cfg: &Config, cwd: &Path, work: &str) -> crate::queue::Expect {
+    let expect = |mem_kb: u64, from: String| crate::queue::Expect { work: work.to_string(), mem_kb, from, ..Default::default() };
+    if cfg.pools.iter().any(|p| p.name == work) {
+        return match db.and_then(|d| d.pool_need(work).ok().flatten()) {
+            Some((m, n)) => expect(m, format!("the need of {n} jobs in {work}")),
+            None => expect(cfg.new_job_mem_kb, format!("no jobs in pool {work} yet: the new_job_mem default")),
+        };
+    }
+    let argv = crate::matcher::split_shell(work);
+    let has_history = |k: &str| db.and_then(|d| d.learned(k, &cfg.learn()).ok()).is_some_and(|l| l.runs > 0);
+    let key = if has_history(work) { work.to_string() } else { crate::key::run_key(cwd, &argv) };
+    let cls = cfg.classify(&argv, &key).unwrap_or_default();
+    let (learned, history_key) = match db {
+        Some(d) => history(d, cfg, cwd, &argv, &key),
+        None => (Default::default(), key.clone()),
+    };
+    let pool = cls.pool.as_ref().map(|p| p.0.as_str());
+    let guess = (learned.runs == 0).then(|| self::guess(db, cfg, None, &argv, cls.label.as_deref(), pool));
+    let need = derive(&inputs(cfg, &learned, Some(&history_key), guess.as_ref(), cls.min_cpu, cls.min_mem_kb));
+    let from = match need.steps.last() {
+        Some(s) => format!("{}: {}", s.step, s.why),
+        None => "nothing known".into(),
+    };
+    expect(need.mem_kb, from)
+}
+
 /// The program a command runs: `tsc` for `bunx tsc -p .`.
 pub fn tool(argv: &[String]) -> String {
     crate::matcher::effective(argv).first().map(|c| c.rsplit('/').next().unwrap_or(c).to_string()).unwrap_or_default()
@@ -285,6 +317,38 @@ mod tests {
         let n = derive(&i);
         assert_eq!((n.cpu, n.mem_kb), (1.0, 2 * GB));
         assert_eq!(n.steps[0].why, "no runs yet: typical of 3 tsc jobs");
+    }
+
+    #[test]
+    fn a_pool_of_expected_work_books_what_its_jobs_started_with() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Db::open_dir(tmp.path()).unwrap();
+        // Browser runs peak at 3 GB, but start with 4.3 GB (a min_mem).
+        for i in 0..4 {
+            let key = format!("e2e:pr_{i}");
+            let run = crate::db::NewRun { ns: "n", key: &key, pool: Some("browser"), need_mem_kb: 43 * GB / 10, ..Default::default() };
+            let id = db.insert_run(&run).unwrap();
+            db.mark_started(id, crate::db::now() - 60.0, 0.0, None).unwrap();
+            let done = crate::db::RunResult { ended_at: crate::db::now(), peak_mem_kb: 3 * GB, measured: true, ..Default::default() };
+            db.finish_run(id, &done).unwrap();
+        }
+        let pool = crate::config::Pool {
+            name: "browser".into(),
+            max_slots: None,
+            per_checkout: true,
+            patterns: Vec::new(),
+            long_lived: false,
+            startup: None,
+        };
+        let empty = crate::config::Pool { name: "storybook".into(), ..pool.clone() };
+        let cfg = Config { pools: vec![pool, empty], ..Config::default() };
+        let x = expected(Some(&db), &cfg, Path::new("/w"), "browser");
+        // Booked at their peak, a run would find 1.3 GB of its room taken.
+        assert_eq!(x.mem_kb, 43 * GB / 10, "{}", x.from);
+        assert_eq!(x.from, "the need of 4 jobs in browser");
+        // No jobs in the pool yet: the default for a new job.
+        let x = expected(Some(&db), &cfg, Path::new("/w"), "storybook");
+        assert_eq!(x.mem_kb, cfg.new_job_mem_kb, "{}", x.from);
     }
 
     #[test]

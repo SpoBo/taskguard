@@ -81,6 +81,34 @@ fn pages_used_kb() -> u64 {
     pages * page_size() / 1024
 }
 
+/// Room in swap. macOS swaps to files that grow while their volume has
+/// space, so it is what the swap files have free plus the free space of
+/// that volume.
+pub fn swap_free_kb() -> Option<u64> {
+    #[repr(C)]
+    struct XswUsage {
+        total: u64,
+        avail: u64,
+        used: u64,
+        pagesize: u32,
+        encrypted: u32,
+    }
+    let cname = c"vm.swapusage";
+    let mut v: XswUsage = unsafe { zeroed() };
+    let mut len = size_of::<XswUsage>();
+    let r = unsafe { libc::sysctlbyname(cname.as_ptr(), &mut v as *mut XswUsage as *mut c_void, &mut len, std::ptr::null_mut(), 0) };
+    let files = if r == 0 { v.avail / 1024 } else { 0 };
+    let disk = ["/System/Volumes/VM", "/"].iter().find_map(|p| {
+        let cpath = std::ffi::CString::new(*p).ok()?;
+        let mut st: libc::statvfs = unsafe { zeroed() };
+        (unsafe { libc::statvfs(cpath.as_ptr(), &mut st) } == 0).then(|| (st.f_bavail as u128 * st.f_frsize as u128 / 1024) as u64)
+    })?;
+    Some(files + disk)
+}
+
+/// macOS has no OOM killer to steer: it compresses and swaps instead.
+pub fn raise_oom_score() {}
+
 pub fn cpu_ticks() -> CpuTicks {
     let mut info: libc::host_cpu_load_info = unsafe { zeroed() };
     let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;

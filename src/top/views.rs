@@ -142,6 +142,20 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(format!(" {what}  "), DIM));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // The version of this binary at the right, in what room the keys leave.
+    let free = (area.x + area.width).saturating_sub(x);
+    if let Some(v) = version_label(free) {
+        let w = v.chars().count() as u16;
+        let at = Rect { x: area.x + area.width - w, width: w, ..area };
+        f.render_widget(Paragraph::new(v).style(DIM), at);
+    }
+}
+
+/// The version of this binary, as long as fits in `room` columns: in full,
+/// then the number alone, else nothing. The keys keep their room.
+fn version_label(room: u16) -> Option<String> {
+    let v = env!("CARGO_PKG_VERSION");
+    [format!("taskguard {v}"), format!("v{v}")].into_iter().find(|t| t.chars().count() as u16 <= room)
 }
 
 /// A key, what it does, and the key a click presses.
@@ -625,14 +639,24 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
     let mut mem = vec![Span::raw("MEMORY  [")];
     mem.extend(color_bar(m.mem_used_kb as f64, over_mem as f64, s.reserve_mem_kb as f64, m.mem_total_kb as f64, s.mem_limit_kb as f64, 24));
     mem.push(Span::raw(format!(
-        "]  {} held  +{} promised  of {}  limit {:.0}%",
+        "]  {} held  +{} promised{}  of {}  limit {:.0}%",
         gb(m.mem_used_kb),
         gb(s.reserve_mem_kb),
+        report::booked_text(s),
         gb(m.mem_total_kb),
         s.limits.mem_max_pct
     )));
     mem.push(Span::styled(over_text(gb(over_mem), over_mem >= 1024), Style::default().fg(Color::Red)));
-    let bars = vec![
+    let holders: Vec<String> = app
+        .data
+        .groups_now
+        .iter()
+        .filter(|g| g.mem_kb >= 256 * 1024)
+        .take(3)
+        .map(|g| format!("{} {} ({})", g.group, gb(g.mem_kb), g.top))
+        .collect();
+    let lone = report::lone_wait_line(s, &holders);
+    let mut bars = vec![
         Line::from(cpu),
         Line::from(mem),
         Line::from(vec![
@@ -647,10 +671,20 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(" limit", DIM),
         ]),
     ];
+    // A job that only programs outside taskguard keep out says so up here,
+    // with who they are: no rule of taskguard's will make that room.
+    let lone_h = match &lone {
+        Some(line) => {
+            bars.push(Line::styled(line.clone(), Style::default().fg(Color::Yellow)));
+            (line.chars().count() as u16 / area.width.max(1)) + 1
+        }
+        None => 0,
+    };
     let n_rows = app.queue_tree().rows.len();
     let [top, list, why] =
-        Layout::vertical([Constraint::Length(4), Constraint::Length((n_rows as u16 + 2).clamp(3, 14)), Constraint::Min(6)]).areas(area);
-    f.render_widget(Paragraph::new(bars), top);
+        Layout::vertical([Constraint::Length(4 + lone_h), Constraint::Length((n_rows as u16 + 2).clamp(3, 14)), Constraint::Min(6)])
+            .areas(area);
+    f.render_widget(Paragraph::new(bars).wrap(Wrap { trim: false }), top);
 
     let est = |e: &crate::queue::Entry| {
         if e.by_hand.is_some() {
@@ -694,6 +728,7 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
                     match (e.paused_since, e.now) {
                         (Some(_), _) => Cell::from("PAUSE").style(Style::default().fg(Color::LightMagenta)),
                         (None, true) => Cell::from("NOW").style(Style::default().fg(Color::Green)),
+                        (None, false) if e.over_ram => Cell::from("OVER").style(Style::default().fg(Color::Yellow)),
                         (None, false) => Cell::from("RUN").style(Style::default().fg(Color::Green)),
                     },
                     Cell::from(format!("{lead}{fold}{}", report::job_name(e, room.saturating_sub(fold.chars().count())))),
@@ -892,6 +927,15 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         }
         if e.now {
             lines.push(Line::raw("it skipped the queue (--now); it is measured like any other job"));
+        }
+        if e.over_ram {
+            lines.push(Line::styled(
+                format!(
+                    "it started with memory over RAM (overcommit, --st, or by hand){}",
+                    if cfg!(target_os = "linux") { "; the OOM killer picks it first" } else { "; macOS compresses and swaps to make room" }
+                ),
+                Style::default().fg(Color::Yellow),
+            ));
         }
         if let Some(since) = e.paused_since.filter(|_| e.paused_by_hand) {
             lines.push(Line::styled(
@@ -1765,6 +1809,42 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_job_that_waits_long_is_explained_and_a_start_over_ram_is_marked() {
+        let (_t, mut app) = fixture();
+        let q = crate::queue::Queue::open(&app.dir).unwrap();
+        let pid = std::process::id() as i32;
+        // No swap: it cannot start over RAM, whatever this host has.
+        let m = crate::machine::MachineSample {
+            mem_pressure: Some(0.0),
+            swap_free_kb: Some(0),
+            ..crate::machine::MachineSample::fixed(1.0, 10, 20 << 20, 32 << 20)
+        };
+        crate::machine::write_cache(&app.dir, &crate::machine::MachineSample { ts: now(), ..m });
+        let stack = crate::queue::Entry {
+            pid,
+            ticket: 1,
+            key: "dev-env:stack".into(),
+            known: true,
+            long_lived: true,
+            need_mem_kb: 14 << 20,
+            queued_at: now() - 400.0,
+            ..Default::default()
+        };
+        q.write(&q.wait_path(&stack), &stack).unwrap();
+        app.load().unwrap();
+        app.view = View::Queue;
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("dev-env:stack has waited 6m40s with nothing of taskguard's running"), "{s}");
+        std::fs::remove_file(q.wait_path(&stack)).unwrap();
+        let started = crate::queue::Entry { started_at: Some(now() - 30.0), over_ram: true, live_mem_kb: 12 << 20, ..stack };
+        q.write(&q.run_path(pid), &started).unwrap();
+        app.load().unwrap();
+        let s = screen(&mut app, 150, 30);
+        assert!(s.contains("OVER") && s.contains("started with memory over RAM"), "{s}");
+        assert!(!s.contains("has waited"), "{s}");
+    }
+
+    #[test]
     fn queue_lists_running_jobs_first_and_marks_overage() {
         let (_t, mut app) = fixture();
         with_queue(&mut app, true);
@@ -2032,6 +2112,24 @@ mod tests {
         let (y, x, _, _) = *app.hits.iter().rev().find(|h| h.3 == Click::Key(KeyCode::Char(' '))).unwrap();
         app.mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y);
         assert!(app.paused && !app.keys_open, "a click on 'space' in the list pauses and closes it");
+    }
+
+    #[test]
+    fn the_footer_shows_the_version_at_the_right_when_the_keys_leave_room() {
+        let (_t, mut app) = fixture();
+        let v = env!("CARGO_PKG_VERSION");
+        let s = screen(&mut app, 200, 20);
+        let foot = s.lines().last().unwrap().trim_end();
+        assert!(foot.starts_with("? keys") && foot.ends_with(&format!("taskguard {v}")), "{foot:?}");
+        // Narrow, the keys keep their room: the number alone, or nothing.
+        for w in [40, 60, 80, 100, 120] {
+            let s = screen(&mut app, w, 20);
+            let foot = s.lines().last().unwrap();
+            assert!(foot.starts_with("? keys") && foot.chars().count() <= w as usize, "{w}: {foot:?}");
+            let keys = foot.trim_end().trim_end_matches(&format!("taskguard {v}")).trim_end_matches(&format!("v{v}")).trim_end();
+            let wide = screen(&mut app, 200, 20);
+            assert!(wide.lines().last().unwrap().starts_with(keys), "{w}: the version hid a key: {foot:?}");
+        }
     }
 
     #[test]

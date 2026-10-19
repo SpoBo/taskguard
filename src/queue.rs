@@ -106,11 +106,99 @@ pub struct Entry {
     /// A long-lived job (a dev stack) left its start-up phase then: from
     /// that moment its needs follow what it uses. Older versions leave it out.
     pub steady_since: Option<f64>,
+    /// A long-lived job, from its start: it runs until someone stops it.
+    /// Older versions leave it out; their long-lived jobs show as such only
+    /// once they are steady.
+    pub long_lived: bool,
+    /// For a long-lived job: the work its caller said will run on it
+    /// (`--expect`), with the memory booked for each until that work starts.
+    /// Older versions leave it out, and do not see the booking.
+    pub expects: Vec<Expect>,
+    /// The long-lived job this job is work for: one in the same checkout
+    /// that expects it. Older versions leave it out.
+    pub work_for: Option<WorkFor>,
+    /// For a long-lived job that expects work: until then it waits, before
+    /// it starts, for that work to queue (`expect_wait`), so it starts with
+    /// room for both. Older versions leave it out.
+    pub expect_until: Option<f64>,
+    /// It started with memory over RAM: by `overcommit`, by --st, or by
+    /// hand. On Linux the kernel's OOM killer picks it first. Older versions
+    /// leave it out.
+    pub over_ram: bool,
+    /// It started by the over-commit rule itself (`Room::overcommit`), as
+    /// the only job in the queue or stuck first in line, not by --st or by
+    /// hand. Work that takes over what it declared for it inherits that.
+    /// Older versions leave it out.
+    pub overcommitted: bool,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
     #[serde(skip)]
     pub stalled: bool,
+}
+
+/// Work a long-lived job expects: a pool name, a job key, or a command
+/// pattern as in `[[job]] match`. Until a job that matches it starts, the
+/// long-lived job books `mem_kb` for it, so the room the work needs is
+/// there when it comes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Expect {
+    pub work: String,
+    pub mem_kb: u64,
+    /// Where `mem_kb` comes from, in words.
+    pub from: String,
+    /// A job for it has started: the booking is gone.
+    pub started: bool,
+    /// Not declared: the history says such work followed this job before
+    /// (`infer_work`). While no job links to it, it is a guess (`is_guess`):
+    /// its booking ends `expire_after_s` after the job started, and no job
+    /// waits for it under the progress rule.
+    pub implied: bool,
+    pub expire_after_s: Option<f64>,
+    /// The guess did not come true in time: the booking is gone.
+    pub expired: bool,
+}
+
+impl Expect {
+    /// Still booked: its work has not started, and the guess has not expired.
+    pub fn open(&self) -> bool {
+        !self.started && !self.expired
+    }
+
+    /// A guess whose time is up, for a job that started at `started`.
+    pub fn due(&self, started: f64, now: f64) -> bool {
+        self.open() && self.expire_after_s.is_some_and(|a| now - started > a)
+    }
+}
+
+/// Is item `i` of long-lived job `e` still a guess of the history: implied,
+/// and no job among `running` and `waiting` links to it? Work that queued
+/// for a guess and linked to it made it come true: from then on it is
+/// declared work in every rule.
+pub fn is_guess(e: &Entry, i: usize, running: &[Entry], waiting: &[Entry]) -> bool {
+    e.expects.get(i).is_some_and(|x| x.implied)
+        && !running.iter().chain(waiting).any(|j| j.work_for.as_ref().is_some_and(|w| w.pid == e.pid && w.item == Some(i as u32)))
+}
+
+/// A guess of the history that did not come true in time: its booking ends.
+pub fn expire_guesses(e: &mut Entry, running: &[Entry], waiting: &[Entry], now: f64) -> bool {
+    let started = e.started_at.unwrap_or(now);
+    let due: Vec<usize> = (0..e.expects.len()).filter(|&i| e.expects[i].due(started, now) && is_guess(e, i, running, waiting)).collect();
+    for &i in &due {
+        e.expects[i].expired = true;
+    }
+    !due.is_empty()
+}
+
+/// The long-lived job a job is work for, and which of its `expects` it
+/// takes over (none when every one of them has started already).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WorkFor {
+    pub pid: i32,
+    pub key: String,
+    pub item: Option<u32>,
 }
 
 impl Entry {
@@ -124,6 +212,11 @@ impl Entry {
     /// outside taskguard: no job waits for it to end.
     pub fn steady(&self) -> bool {
         self.steady_since.is_some()
+    }
+
+    /// A job that does not end by itself: long-lived, or steady.
+    pub fn lasting(&self) -> bool {
+        self.long_lived || self.steady()
     }
 
     /// Seconds a running job has left by its learned duration, at least one.
@@ -199,8 +292,8 @@ impl Entry {
 pub struct LongLived {
     /// Seconds after its start that it holds its start-up peak.
     pub startup: f64,
-    /// The highest memory its past runs took after their start-up: what it
-    /// still grows to once it settles.
+    /// The highest memory its past runs took after their start-up. `follow`
+    /// does not book it: once steady, a job books what it holds now.
     pub steady_mem_kb: Option<u64>,
 }
 
@@ -219,11 +312,11 @@ impl Entry {
     /// A long-lived job follows its peak through its start-up only. After that its needs start again
     /// from what it uses: a dev stack that took every core while it started
     /// and seeded, and idles at a few percent, must not keep every core for
-    /// hours. Its memory need is what it holds plus a quarter, or what its
-    /// past runs grew to after their start-up when that is more, and follows
-    /// its peak from there: running out of memory kills processes. Its CPU
-    /// need is measured use plus a margin, up or down, because runnable wait
-    /// can reflect priority and contention rather than useful work.
+    /// hours. Its memory need is what it holds now plus a quarter, up or
+    /// down with each reading, so an idle stack releases its booking; what
+    /// its past runs grew to after their start-up is not booked. Its CPU need
+    /// is measured use plus a margin, up or down, because runnable wait can
+    /// reflect priority and contention rather than useful work.
     pub fn follow(&mut self, mem_kb: u64, used_recent: f64, ncpu: f64, now: f64, long: Option<LongLived>) {
         if let Some(l) = long
             && self.steady_since.is_none()
@@ -255,6 +348,9 @@ pub struct Nudge {
     pub pause: Option<bool>,
     pub need_cpu: Option<f64>,
     pub need_mem_kb: Option<u64>,
+    /// To a long-lived job: work it expects has started (`Expect::started`),
+    /// by index.
+    pub work_started: Vec<u32>,
 }
 
 pub struct Queue {
@@ -595,6 +691,16 @@ pub struct Limits {
     /// it has waited past `max_bypass`) starts on this share of its CPU need,
     /// when the machine is near its recent low. 0 turns it off.
     pub partial_fit: f64,
+    /// A job that only programs outside taskguard keep out may start over RAM
+    /// (`Room::overcommit`), while memory would stay under this share of RAM
+    /// and the part over RAM fits in half the free swap. At or under 100 it
+    /// is off.
+    pub overcommit_max_pct: f64,
+    /// Seconds the only job in the queue waits before it may start over RAM.
+    pub overcommit_after: f64,
+    /// Seconds the first job in line waits before it may start over RAM
+    /// while other jobs queue too.
+    pub overcommit_stuck_after: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -652,6 +758,20 @@ pub enum Blocker {
     Paused {
         key: String,
     },
+    /// Work for a long-lived job that does not run yet: it waits for it.
+    Stack {
+        key: String,
+    },
+    /// A long-lived job waits, for at most `wait_s` more, for the work it
+    /// expects to queue.
+    Expect {
+        work: Vec<String>,
+        wait_s: f64,
+    },
+    /// `limit_pct` is the ceiling the job really waits for: `mem_max`, or
+    /// all of RAM for the first in line with nothing of taskguard's
+    /// running. `overcommit_in` is set when `Room::overcommit` would let it
+    /// start over RAM in that many seconds.
     Memory {
         would_pct: f64,
         limit_pct: f64,
@@ -660,6 +780,8 @@ pub enum Blocker {
         reserve_kb: u64,
         need_kb: u64,
         total_kb: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        overcommit_in: Option<f64>,
     },
     Cpu {
         would: f64,
@@ -683,6 +805,8 @@ impl Blocker {
             Blocker::Memory { .. } => "memory",
             Blocker::Pressure { .. } => "pressure",
             Blocker::Paused { .. } => "paused",
+            Blocker::Stack { .. } => "stack",
+            Blocker::Expect { .. } => "expect",
             Blocker::Cpu { .. } => "cpu",
         }
     }
@@ -701,6 +825,12 @@ pub enum Decision {
         /// the cores it books instead of its whole need.
         #[serde(skip_serializing_if = "Option::is_none")]
         booked_cpu: Option<f64>,
+        /// Memory would go over RAM: it starts by `Room::overcommit`.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        over_ram: bool,
+        /// It starts by `Room::overcommit`.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        overcommitted: bool,
     },
     Wait {
         blockers: Vec<Blocker>,
@@ -714,11 +844,123 @@ pub enum Decision {
 /// A job paused by hand reserves no CPU: it uses none until someone resumes
 /// it, and the room it leaves is what the pause was for. Its memory stays
 /// reserved, since it keeps what it holds and grows again when it resumes.
+///
+/// A long-lived job also reserves what it books for the work it expects.
 pub fn reserve(running: &[Entry]) -> (f64, u64) {
     running.iter().fold((0.0, 0), |(c, m), e| {
         let cpu = if e.paused_by_hand { 0.0 } else { (e.need_cpu - e.live_cpu).max(0.0) };
-        (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb))
+        (c + cpu, m + e.need_mem_kb.saturating_sub(e.live_mem_kb) + booked(e, running))
     })
+}
+
+/// What `e` still books for the work it expects: each item whose work has
+/// not started, and that no running job has taken over yet. A waiting job
+/// books all of them, so it starts only with room for its work too.
+pub fn booked(e: &Entry, running: &[Entry]) -> u64 {
+    let taken = |i: usize| {
+        e.started_at.is_some() && running.iter().any(|r| r.work_for.as_ref().is_some_and(|w| w.pid == e.pid && w.item == Some(i as u32)))
+    };
+    e.expects.iter().enumerate().filter(|(i, x)| x.open() && !taken(*i)).map(|(_, x)| x.mem_kb).sum()
+}
+
+/// The part of `booked` that only the history guessed (`is_guess`).
+fn guessed(e: &Entry, running: &[Entry], waiting: &[Entry]) -> u64 {
+    let expects =
+        e.expects.iter().enumerate().map(|(i, x)| Expect { started: x.started || !is_guess(e, i, running, waiting), ..x.clone() });
+    booked(&Entry { expects: expects.collect(), ..e.clone() }, running)
+}
+
+/// The part of `job`'s own booking that it leaves out when it starts: all
+/// it guessed, when `job` is a waiting long-lived job with no declared work.
+/// Such a stack starts as it would without the history.
+pub fn own_guess(job: &Entry, running: &[Entry], waiting: &[Entry]) -> u64 {
+    let undeclared = job.long_lived && (0..job.expects.len()).all(|i| is_guess(job, i, running, waiting));
+    if undeclared && job.started_at.is_none() { guessed(job, running, waiting) } else { 0 }
+}
+
+/// The memory `job` adds when it starts: its need, plus what it books for
+/// the work it expects, less what its long-lived job booked for it, which it
+/// takes over.
+pub fn need_with_booking(job: &Entry, running: &[Entry]) -> u64 {
+    let own = if job.started_at.is_none() { booked(job, &[]) } else { 0 };
+    (job.need_mem_kb + own).saturating_sub(booking_taken_over(job, running))
+}
+
+/// What the long-lived job of `job` books for it now, which `job` takes over
+/// when it starts.
+fn booking_taken_over(job: &Entry, running: &[Entry]) -> u64 {
+    let Some(WorkFor { pid, item: Some(i), .. }) = &job.work_for else { return 0 };
+    if job.started_at.is_some() {
+        return 0;
+    }
+    let Some(stack) = running.iter().find(|e| e.pid == *pid) else { return 0 };
+    let taken = running.iter().any(|r| r.pid != job.pid && r.work_for.as_ref().is_some_and(|w| w.pid == *pid && w.item == Some(*i)));
+    stack.expects.get(*i as usize).filter(|x| x.open() && !taken).map_or(0, |x| x.mem_kb)
+}
+
+/// The part of `booking_taken_over` that only the history guessed: none
+/// when `job` is among `waiting`, as its link made the guess come true.
+fn guess_taken_over(job: &Entry, running: &[Entry], waiting: &[Entry]) -> u64 {
+    let Some(WorkFor { pid, item: Some(i), .. }) = &job.work_for else { return 0 };
+    let guess = running.iter().find(|e| e.pid == *pid).is_some_and(|e| is_guess(e, *i as usize, running, waiting));
+    if guess { booking_taken_over(job, running) } else { 0 }
+}
+
+/// Is `job` work for a long-lived job that does not run yet? It waits for
+/// it: the work needs it up.
+pub fn waits_for_stack(job: &Entry, running: &[Entry]) -> bool {
+    job.started_at.is_none() && job.work_for.as_ref().is_some_and(|w| !running.iter().any(|e| e.pid == w.pid))
+}
+
+/// The long-lived job in `me`'s checkout that expects it, among `running`
+/// and `waiting`, by `matches` (does `me` match this declared work?). A
+/// running one comes first, then the item whose work no other job has taken.
+/// Returns the link and the long-lived job's priority.
+pub fn link_work(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> Option<(WorkFor, i32)> {
+    if me.long_lived {
+        return None;
+    }
+    let claimed = |pid: i32, i: usize| {
+        running
+            .iter()
+            .chain(waiting)
+            .any(|r| r.pid != me.pid && r.work_for.as_ref().is_some_and(|w| w.pid == pid && w.item == Some(i as u32)))
+    };
+    let stacks = running.iter().chain(waiting).filter(|e| e.long_lived && e.pid != me.pid && e.checkout == me.checkout);
+    let mut best: Option<(u8, WorkFor, i32)> = None;
+    for e in stacks {
+        for (i, x) in e.expects.iter().enumerate().filter(|(_, x)| matches(&x.work) && still_expected(x)) {
+            let free = x.open() && !claimed(e.pid, i);
+            // A stack that waits takes only work that can take over a booking.
+            if e.started_at.is_none() && !free {
+                continue;
+            }
+            let rank = u8::from(e.started_at.is_none()) * 2 + u8::from(!free);
+            if best.as_ref().is_none_or(|(r, _, _)| rank < *r) {
+                let item = free.then_some(i as u32);
+                best = Some((rank, WorkFor { pid: e.pid, key: e.key.clone(), item }, e.priority));
+            }
+        }
+    }
+    best.map(|(_, w, p)| (w, p))
+}
+
+/// Is this work still expected: declared, or implied by the history and
+/// neither expired nor started? Only then does work link to it and go
+/// first. Once the run that made a guess come true has started, a second
+/// matching run is not the work the history foresaw: it keeps its own
+/// priority.
+fn still_expected(x: &Expect) -> bool {
+    !x.implied || x.open()
+}
+
+/// Has `me`'s link to its long-lived job lapsed: that job is gone, or what
+/// it expected of `me` was a guess that has expired or whose work started?
+/// The item `me` links to is no guess: `me` made it come true.
+pub fn link_lapsed(me: &Entry, running: &[Entry], waiting: &[Entry], matches: impl Fn(&str) -> bool) -> bool {
+    let Some(w) = &me.work_for else { return false };
+    let expected = |e: &Entry, i: usize| matches(&e.expects[i].work) && (w.item == Some(i as u32) || still_expected(&e.expects[i]));
+    running.iter().chain(waiting).find(|e| e.pid == w.pid).is_none_or(|e| !(0..e.expects.len()).any(|i| expected(e, i)))
 }
 
 /// Does `a` belong to an older task-runner run than `b`? Only jobs that are
@@ -756,6 +998,9 @@ pub fn decide(
     // A stalled job holds nobody back: it does not start whatever we wait.
     let mut older: Vec<&Entry> = waiting.iter().filter(|w| !w.stalled && w.ahead_of(me)).collect();
     older.sort_by(|a, b| a.line_order(b));
+    // First in line, for `overcommit`: work queued for `me` cannot start
+    // before it, whatever its place.
+    let first = older.iter().all(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid));
 
     // The kernel's own alarm comes first and holds back every job, even when
     // taskguard runs nothing: then the pressure comes from other programs, and
@@ -782,10 +1027,18 @@ pub fn decide(
         if !paced || growing.is_some() {
             return Decision::Wait { blockers: vec![pressure] };
         }
-        let room = Room::new(m, lim, running);
-        if let Some(mem) = room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
-        {
-            return Decision::Wait { blockers: vec![mem, pressure] };
+        // With only long-lived jobs past their start-up running, the progress
+        // rule below decides, up to all of RAM: they do not end by themselves,
+        // and the job that needs one of them would wait as long as the
+        // warning lasts, which can be all morning.
+        if !running.iter().all(Entry::steady) {
+            let room = Room::new(m, lim, running, waiting);
+            if let Some(mem) =
+                room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
+                && !matches!(room.overcommit(m, lim, waiting, me, first, now), Overcommit::Now(_))
+            {
+                return Decision::Wait { blockers: vec![mem, pressure] };
+            }
         }
     }
 
@@ -794,24 +1047,80 @@ pub fn decide(
         return Decision::Wait { blockers: vec![Blocker::Paused { key: p.key.clone() }] };
     }
 
-    // Always make progress: with nothing running, the oldest job starts,
-    // whatever the readings say. This is what keeps the queue from deadlocking
-    // on a machine that is busy with work outside taskguard. A long-lived job
-    // past its start-up counts as such work: it may run for hours, and a job
-    // it keeps out would otherwise hold up the whole queue until it is stopped.
+    // A long-lived job that expects work waits a few seconds for it to
+    // queue, unless it already has: its caller may start the work right
+    // after it, and then it starts with room for both, and the work goes
+    // first, instead of the stack starting alone.
+    if let Some(until) = me.expect_until.filter(|u| *u > now && me.started_at.is_none())
+        && !waiting.iter().any(|w| w.work_for.as_ref().is_some_and(|l| l.pid == me.pid))
+    {
+        let work = me.expects.iter().map(|x| x.work.clone()).collect();
+        return Decision::Wait { blockers: vec![Blocker::Expect { work, wait_s: until - now }] };
+    }
+
+    // Always make progress: with nothing running, the first job in line that
+    // fits starts, whatever the CPU reading says and up to all of RAM. This is
+    // what keeps the queue from deadlocking on a machine that is busy with
+    // work outside taskguard. A long-lived job past its start-up counts as
+    // such work: it may run for hours, and a job it keeps out would otherwise
+    // hold up the whole queue until it is stopped.
+    //
+    // A job that does not fit even so holds nobody back: it waits for memory,
+    // and the jobs behind it that fit start meanwhile. Next to long-lived
+    // jobs, a long-lived job must fit under `mem_max`: it does not end by
+    // itself, so starting it over the limit is no progress but load that
+    // stays, and a second dev stack started that way kept the first one's
+    // run out until it was given up. Only when programs outside taskguard
+    // alone keep it out may it go up to the ceiling of `outside_admit`, and
+    // with nothing of taskguard's running, up to all of RAM: nothing taskguard
+    // runs would free that.
+    let room = Room::new(m, lim, running, waiting);
     if running.iter().all(Entry::steady) {
-        return match older.first() {
-            None if running.is_empty() => Decision::Admit { reason: "nothing else is running".into(), early: None, booked_cpu: None },
-            None => Decision::Admit {
+        let fits = |w: &Entry| room.fits_on_progress(m, lim, running, w);
+        let head = older.iter().copied().chain(std::iter::once(me)).find(|w| fits(w));
+        return match head {
+            Some(h) if !h.ahead_of(me) && running.is_empty() => Decision::Admit {
+                reason: "nothing else is running".into(),
+                early: None,
+                booked_cpu: None,
+                over_ram: false,
+                overcommitted: false,
+            },
+            Some(h) if !h.ahead_of(me) => Decision::Admit {
                 reason: "nothing else is running but long-lived jobs past their start-up".into(),
                 early: None,
                 booked_cpu: None,
+                over_ram: false,
+                overcommitted: false,
             },
             Some(o) => Decision::Wait { blockers: vec![Blocker::Older { key: o.key.clone() }] },
+            None => {
+                let mut blockers: Vec<Blocker> = room
+                    .blockers(m, lim, running, me, now, unknown_starts)
+                    .into_iter()
+                    .filter(|b| matches!(b, Blocker::Slots { .. } | Blocker::Stack { .. }))
+                    .collect();
+                if blockers.is_empty() || room.mem_would_on(me, true) > room.progress_ceiling(m, lim, me) {
+                    blockers.push(room.progress_memory_blocker(m, lim, me));
+                }
+                if blockers.iter().all(|b| matches!(b, Blocker::Memory { .. })) {
+                    match room.overcommit(m, lim, waiting, me, first, now) {
+                        Overcommit::Now(why) => return over_committed(m, &room, me, why),
+                        Overcommit::In(s) => {
+                            if let Some(Blocker::Memory { overcommit_in, .. }) = blockers.first_mut() {
+                                *overcommit_in = Some(s);
+                            }
+                        }
+                        Overcommit::No => {}
+                    }
+                }
+                if let Some(p) = m.mem_pressure.filter(|p| *p >= lim.pressure_max) {
+                    blockers.push(Blocker::Pressure { level: p, limit: lim.pressure_max, paced: true, after: None, next_in: None });
+                }
+                Decision::Wait { blockers }
+            }
         };
     }
-
-    let room = Room::new(m, lim, running);
 
     let mut blockers = Vec::new();
     // With backfill on, a job ahead that goes first holds its turn only while
@@ -822,7 +1131,17 @@ pub fn decide(
     // keep it out: it starts once the running jobs have made room for it, or
     // when none runs, which they do not put off. A job that may start on part
     // of its need (`partial_fit`) waits only for that part.
+    //
+    // Work queued for a long-lived job is what that job exists for: the
+    // long-lived job it waits for, and that work once its long-lived job
+    // runs, hold their turn as a strict reservation does, also while they do
+    // not fit yet. Otherwise a stream of lints keeps taking the room a stack
+    // and its run need together, until the caller gives up on the run.
+    let queued_for = |w: &Entry| w.work_for.is_some() || waiting.iter().any(|x| x.work_for.as_ref().is_some_and(|l| l.pid == w.pid));
     let holds = |w: &Entry| {
+        if queued_for(w) {
+            return true;
+        }
         let (mut theirs, _) = room.left(m, lim, running, w, now, unknown_starts);
         if theirs.is_empty() {
             return true;
@@ -836,14 +1155,19 @@ pub fn decide(
         }
         now - w.queued_at > lim.max_backfill && !me.est_dur_s.zip(soonest_start(&theirs, running, now)).is_some_and(|(d, t)| d <= t)
     };
+    // A job ahead that would not fit even once every job that ends by itself
+    // has ended can only start when a long-lived job is stopped, or programs
+    // outside taskguard free memory. It holds nobody back: holding the jobs
+    // behind it that fit gains it nothing, and on Omarchy one such job kept
+    // two dozen others out for half an hour.
+    let may_hold = |w: &Entry| room.fits_once_drained(m, lim, running, w);
     // An older job that newer ones have passed for `max_bypass` goes first.
     // Only a job ahead in line holds `me` back, so a job of an older run is
     // never held back for one of a newer run, or for a job that queued after
     // that run began.
-    if let Some(r) = older
-        .iter()
-        .find(|w| w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass && (lim.max_backfill <= lim.max_bypass || holds(w)))
-    {
+    if let Some(r) = older.iter().find(|w| {
+        w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass && may_hold(w) && (lim.max_backfill <= lim.max_bypass || holds(w))
+    }) {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
     }
     // A waiting job with a higher priority goes first, unless its own pool is
@@ -853,7 +1177,9 @@ pub fn decide(
         (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
         _ => false,
     };
-    if let Some(h) = older.iter().find(|w| w.priority > me.priority && !pool_full(w) && (lim.max_backfill <= 0.0 || holds(w))) {
+    if let Some(h) =
+        older.iter().find(|w| w.priority > me.priority && !pool_full(w) && may_hold(w) && (lim.max_backfill <= 0.0 || holds(w)))
+    {
         blockers.push(Blocker::Priority { key: h.key.clone(), priority: h.priority });
     }
     // A job of an older task-runner run that could start now goes first, so
@@ -879,17 +1205,29 @@ pub fn decide(
             lim.mem_max_pct
         );
         let (early, booked_cpu) = early.unzip();
-        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten() }
+        Decision::Admit { reason, early, booked_cpu: booked_cpu.flatten(), over_ram: false, overcommitted: false }
+    } else if blockers.iter().all(|b| matches!(b, Blocker::Memory { .. }))
+        && let Overcommit::Now(why) = room.overcommit(m, lim, waiting, me, first, now)
+    {
+        over_committed(m, &room, me, why)
     } else {
         Decision::Wait { blockers }
     }
 }
 
+/// The admission of a job that `Room::overcommit` lets start.
+fn over_committed(m: &MachineSample, room: &Room, me: &Entry, why: String) -> Decision {
+    let over_ram = room.mem_would_on(me, true) > m.mem_total_kb as f64;
+    let reason = "only memory keeps it out, and over-commit lets it start (overcommit)";
+    Decision::Admit { reason: reason.into(), early: Some(why), booked_cpu: None, over_ram, overcommitted: true }
+}
+
 /// In how many seconds a job that `blockers` keep out could start at the
 /// soonest, by the learned durations of the running jobs: once they have
 /// freed what it lacks, or else once none of them runs but long-lived jobs
-/// past their start-up, as then the first in line starts whatever the readings
-/// say. None when that hangs on a job whose duration is unknown.
+/// past their start-up, as then the first in line that fits starts whatever
+/// the CPU reading says. None when that hangs on a job whose duration is
+/// unknown.
 fn soonest_start(blockers: &[Blocker], running: &[Entry], now: f64) -> Option<f64> {
     let drained = running.iter().filter(|e| !e.steady()).try_fold(0.0, |t: f64, e| Some(t.max(e.remaining(now)?)));
     blockers.iter().try_fold(0.0, |t: f64, b| Some(t.max(crate::report::start_eta(b, running, now).or(drained)?)))
@@ -1076,7 +1414,32 @@ pub fn signal_tree(root: i32, sig: i32) {
     }
 }
 
+/// The most memory a job may take the machine to over RAM: `overcommit_max`
+/// of RAM, and no more than RAM plus half the free swap. Half, so the swap
+/// keeps room for the pages the rest of the machine moves out as it fills.
+/// With no swap (or none read) nothing goes over RAM.
+pub fn overcommit_ceiling(m: &MachineSample, lim: &Limits) -> f64 {
+    let total = m.mem_total_kb as f64;
+    (total * lim.overcommit_max_pct / 100.0).min(total + m.swap_free_kb.unwrap_or(0) as f64 / 2.0)
+}
+
+/// Would `me` take memory over RAM if it started now? A job started so,
+/// by any rule or by hand, is made the OOM killer's first pick on Linux.
+pub fn over_ram(m: &MachineSample, lim: &Limits, running: &[Entry], waiting: &[Entry], me: &Entry) -> bool {
+    Room::new(m, lim, running, waiting).mem_would_on(me, true) > m.mem_total_kb as f64
+}
+
+/// What `Room::overcommit` says of a job that only memory keeps out.
+enum Overcommit {
+    /// It may start over RAM now, for this reason.
+    Now(String),
+    /// It may, once it has waited this many seconds more.
+    In(f64),
+    No,
+}
+
 /// The room the running jobs leave, read once per decision.
+#[derive(Clone)]
 struct Room {
     res_cpu: f64,
     res_mem: u64,
@@ -1087,12 +1450,28 @@ struct Room {
     promised_cpu: f64,
     /// What the running jobs hold now.
     ours_mem: u64,
+    /// What the running jobs that end by themselves hold, and still
+    /// reserve: the memory that frees up once they have ended.
+    passing_live: u64,
+    passing_res: u64,
+    /// The running jobs: what a job takes over from its long-lived job
+    /// depends on them.
+    running: Vec<Entry>,
+    /// The waiting jobs linked to a long-lived job: what is still a guess
+    /// depends on them.
+    linked: Vec<Entry>,
+    /// The part of `res_mem` that only the history guessed: what long-lived
+    /// jobs book for work nobody declared and no job has queued for yet
+    /// (`is_guess`).
+    res_guessed: u64,
 }
 
 impl Room {
-    fn new(m: &MachineSample, lim: &Limits, running: &[Entry]) -> Room {
+    fn new(m: &MachineSample, lim: &Limits, running: &[Entry], waiting: &[Entry]) -> Room {
         let (res_cpu, res_mem) = reserve(running);
+        let linked: Vec<Entry> = waiting.iter().filter(|w| w.work_for.is_some()).cloned().collect();
         let ours_mem = running.iter().map(|e| e.live_mem_kb).sum();
+        let passing: Vec<Entry> = running.iter().filter(|e| !e.lasting()).cloned().collect();
         Room {
             res_cpu,
             res_mem,
@@ -1101,11 +1480,168 @@ impl Room {
             mem_limit: m.mem_total_kb as f64 * lim.mem_max_pct / 100.0,
             mem_used: m.mem_for_admission(ours_mem),
             ours_mem,
+            passing_live: passing.iter().map(|e| e.live_mem_kb).sum(),
+            passing_res: reserve(&passing).1,
+            running: running.to_vec(),
+            res_guessed: running.iter().map(|e| guessed(e, running, &linked)).sum(),
+            linked,
         }
     }
 
     fn mem_would(&self, job: &Entry) -> f64 {
-        (self.mem_used + self.res_mem + job.need_mem_kb) as f64
+        self.mem_would_on(job, false)
+    }
+
+    /// As `mem_would`, by the progress rule (`progress`) or not. A guess of
+    /// the history never keeps a job that ends by itself out by the progress
+    /// rule, so it cannot stop the queue; the part of it that job takes over
+    /// counts once. A long-lived job respects the guesses of others while
+    /// they are open, but one started with no declared work leaves its own
+    /// guess out: such a stack starts as it would without the history, and
+    /// books its guess from then on.
+    fn mem_would_on(&self, job: &Entry, progress: bool) -> f64 {
+        let guess = if progress && !job.long_lived {
+            self.res_guessed.saturating_sub(guess_taken_over(job, &self.running, &self.linked))
+        } else {
+            0
+        };
+        let own = own_guess(job, &self.running, &self.linked);
+        (self.mem_used + self.res_mem - guess.min(self.res_mem) + need_with_booking(job, &self.running) - own) as f64
+    }
+
+    /// The most memory a job may take the machine to by the progress rule:
+    /// all of RAM, as nothing else of taskguard's would come after it. A
+    /// long-lived job, which stays, next to long-lived jobs of taskguard's,
+    /// only `mem_max` (with `noise_mem`), or when only programs outside
+    /// taskguard keep it out, the ceiling of `outside_admit`. With nothing of
+    /// taskguard's running, it too goes up to all of RAM: nothing taskguard
+    /// runs would free the rest.
+    fn progress_ceiling(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> f64 {
+        let total = m.mem_total_kb as f64;
+        if !job.long_lived || self.running.is_empty() {
+            return total;
+        }
+        let ceiling = self.mem_limit + total * lim.noise_mem_pct / 100.0;
+        let ours = self.mem_would_on(job, true) - self.mem_used.saturating_sub(self.ours_mem) as f64;
+        if lim.outside_admit && ours <= self.mem_limit { ceiling.max(total * lim.outside_mem_max_pct / 100.0).min(total) } else { ceiling }
+    }
+
+    /// May `job` start by the progress rule now: its pool has a free slot
+    /// and it fits under `progress_ceiling`.
+    fn fits_on_progress(&self, m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry) -> bool {
+        let pool_free = match (&job.pool_key, job.pool_slots) {
+            (Some(pk), Some(max)) => (running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32) < max,
+            _ => true,
+        };
+        pool_free && !waits_for_stack(job, running) && self.mem_would_on(job, true) <= self.progress_ceiling(m, lim, job)
+    }
+
+    /// Would `job` fit by the progress rule once every running job that ends
+    /// by itself has ended? If not, it starts only when a long-lived job is
+    /// stopped or programs outside taskguard free memory.
+    fn fits_once_drained(&self, m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry) -> bool {
+        let lasting: Vec<Entry> = running.iter().filter(|e| e.lasting()).cloned().collect();
+        let drained = Room {
+            mem_used: self.mem_used.saturating_sub(self.passing_live),
+            ours_mem: self.ours_mem.saturating_sub(self.passing_live),
+            res_mem: self.res_mem.saturating_sub(self.passing_res),
+            running: lasting.clone(),
+            ..self.clone()
+        };
+        drained.fits_on_progress(m, lim, &lasting, job)
+    }
+
+    /// The memory blocker for `job`, whether or not it fits under the limit.
+    fn memory_blocker(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> Blocker {
+        self.memory_blocker_at(m, job, self.mem_would(job), self.mem_limit, lim.mem_max_pct)
+    }
+
+    /// The memory blocker for `job` by the progress rule: measured against
+    /// the ceiling that rule really holds it to, all of RAM when nothing of
+    /// taskguard's runs, not `mem_max`.
+    fn progress_memory_blocker(&self, m: &MachineSample, lim: &Limits, job: &Entry) -> Blocker {
+        let ceiling = self.progress_ceiling(m, lim, job);
+        self.memory_blocker_at(m, job, self.mem_would_on(job, true), ceiling, pct(ceiling, m.mem_total_kb as f64))
+    }
+
+    fn memory_blocker_at(&self, m: &MachineSample, job: &Entry, mem_would: f64, ceiling: f64, limit_pct: f64) -> Blocker {
+        Blocker::Memory {
+            would_pct: pct(mem_would, m.mem_total_kb as f64),
+            limit_pct,
+            short_kb: (mem_would - ceiling).max(0.0) as u64,
+            used_kb: self.mem_used,
+            reserve_kb: self.res_mem,
+            need_kb: need_with_booking(job, &self.running),
+            total_kb: m.mem_total_kb,
+            overcommit_in: None,
+        }
+    }
+
+    /// May `job`, which only memory keeps out, start over RAM? macOS
+    /// compresses and swaps cold memory, so a job over RAM costs speed, not
+    /// processes; Linux has only its swap, and the OOM killer when that is
+    /// gone. So it may, never at critical pressure (on Linux, never at
+    /// `pressure_max`), while memory would stay under `overcommit_max` of
+    /// RAM and the part over RAM fits in half the free swap
+    /// (`overcommit_ceiling`), when either:
+    /// - nothing of taskguard's runs but the long-lived job it is work for,
+    ///   and it is first in line (`head`): it has waited `overcommit_after`
+    ///   as the only job in the queue, or `overcommit_stuck_after` with
+    ///   other jobs queued behind it. Then only programs outside taskguard
+    ///   keep it out, and nothing taskguard runs would ever free the room;
+    /// - it takes over what its running long-lived job declared and booked
+    ///   for it, adds no more than `noise_mem` to that, and that long-lived
+    ///   job itself started by this rule (`overcommitted`): it started over
+    ///   RAM with that room booked, so its work starts at once. A booking
+    ///   the history guessed was never part of that start.
+    fn overcommit(&self, m: &MachineSample, lim: &Limits, waiting: &[Entry], job: &Entry, head: bool, now: f64) -> Overcommit {
+        let critical = m.mem_pressure.is_some_and(|p| p >= 100.0 || (!lim.warn_admit && p >= lim.pressure_max));
+        if lim.overcommit_max_pct <= 100.0 || critical {
+            return Overcommit::No;
+        }
+        let total = m.mem_total_kb as f64;
+        let would = self.mem_would_on(job, true);
+        let ceiling = overcommit_ceiling(m, lim);
+        if would > ceiling {
+            return Overcommit::No;
+        }
+        let gb = |kb: f64| kb / (1024.0 * 1024.0);
+        let fit = format!(
+            "memory would reach {:.0}% of RAM, under overcommit_max {:.0}%, {:.1} GB into swap with {:.1} GB free",
+            pct(would, total),
+            lim.overcommit_max_pct,
+            gb((would - total).max(0.0)),
+            gb(m.swap_free_kb.unwrap_or(0) as f64)
+        );
+        let stack = job.work_for.as_ref().and_then(|w| self.running.iter().find(|e| e.pid == w.pid));
+        let item = job.work_for.as_ref().and_then(|w| w.item).zip(stack).and_then(|(i, s)| s.expects.get(i as usize));
+        let declared = item.is_some_and(|x| !x.implied);
+        let taken = booking_taken_over(job, &self.running);
+        if taken > 0
+            && declared
+            && stack.is_some_and(|s| s.overcommitted)
+            && need_with_booking(job, &self.running) as f64 <= total * lim.noise_mem_pct / 100.0
+        {
+            let key = job.work_for.as_ref().map(|w| w.key.as_str()).unwrap_or_default();
+            return Overcommit::Now(format!(
+                "it takes over the {:.1} GB {key} declared for it, and {key} started over RAM with that room by over-commit ({fit})",
+                gb(taken as f64)
+            ));
+        }
+        if self.running.iter().any(|e| stack.is_none_or(|s| s.pid != e.pid)) || !head {
+            return Overcommit::No;
+        }
+        let alone = !waiting.iter().any(|w| w.pid != job.pid && !w.stalled && w.work_for.as_ref().is_none_or(|l| l.pid != job.pid));
+        let after = if alone { lim.overcommit_after } else { lim.overcommit_stuck_after };
+        let waited = now - job.queued_at;
+        if waited < after {
+            return Overcommit::In(after - waited);
+        }
+        Overcommit::Now(format!(
+            "only programs outside taskguard keep it out, and it waited {} {} ({fit})",
+            crate::report::dur(waited),
+            if alone { "as the only job in the queue (overcommit_after)" } else { "first in line (overcommit_stuck_after)" }
+        ))
     }
 
     /// What keeps `job` from starting, after the leeway: a job that falls
@@ -1161,7 +1697,7 @@ impl Room {
                         return None;
                     }
                     let outside = self.mem_used.saturating_sub(self.ours_mem);
-                    let ours = (self.ours_mem + self.res_mem + job.need_mem_kb) as f64;
+                    let ours = (self.ours_mem + self.res_mem + need_with_booking(job, &self.running)) as f64;
                     if short_kb as f64 <= total * lim.noise_mem_pct / 100.0 {
                         why.push(format!(
                             "memory short by {:.1} GB, within noise_mem {:.0}% of RAM",
@@ -1213,6 +1749,10 @@ impl Room {
     /// of it in line.
     fn blockers(&self, m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry, now: f64, unknown_starts: &[f64]) -> Vec<Blocker> {
         let mut blockers = Vec::new();
+        // Work for a long-lived job that does not run yet needs it up first.
+        if waits_for_stack(job, running) {
+            blockers.push(Blocker::Stack { key: job.work_for.as_ref().map(|w| w.key.clone()).unwrap_or_default() });
+        }
         if let (Some(pk), Some(max)) = (&job.pool_key, job.pool_slots) {
             let holders: Vec<String> = running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).map(|e| e.key.clone()).collect();
             if holders.len() as u32 >= max {
@@ -1250,17 +1790,8 @@ impl Room {
                 blockers.push(Blocker::LearnStagger { wait_s: (lim.learn_stagger - (now - newest)).max(0.0) });
             }
         }
-        let mem_would = self.mem_would(job);
-        if mem_would > self.mem_limit {
-            blockers.push(Blocker::Memory {
-                would_pct: pct(mem_would, m.mem_total_kb as f64),
-                limit_pct: lim.mem_max_pct,
-                short_kb: (mem_would - self.mem_limit) as u64,
-                used_kb: self.mem_used,
-                reserve_kb: self.res_mem,
-                need_kb: job.need_mem_kb,
-                total_kb: m.mem_total_kb,
-            });
+        if self.mem_would(job) > self.mem_limit {
+            blockers.push(self.memory_blocker(m, lim, job));
         }
         // A short job is over before the CPU reading shows it, so the reading
         // does not hold it back. What taskguard has promised its own jobs
@@ -1374,6 +1905,9 @@ mod tests {
         outside_admit: false,
         outside_mem_max_pct: 95.0,
         partial_fit: 0.0,
+        overcommit_max_pct: 0.0,
+        overcommit_after: 120.0,
+        overcommit_stuck_after: 1800.0,
     };
 
     /// A running entry exactly as v0.1.2 writes it.
@@ -1414,6 +1948,27 @@ mod tests {
         assert_eq!(serde_json::from_str::<Entry>(&newer).unwrap().ticket, 7);
         let older: Entry = serde_json::from_str(r#"{"ticket":3,"pid":10,"run_id":1,"key":"k"}"#).unwrap();
         assert_eq!((older.ticket, older.need_cpu), (3, 0.0));
+        assert!(!older.long_lived && older.expects.is_empty() && older.work_for.is_none());
+        // What this version adds reads back, and leaves the rest alone.
+        let stack = Entry {
+            long_lived: true,
+            expects: vec![Expect {
+                work: "browser".into(),
+                mem_kb: 4,
+                from: "x".into(),
+                started: true,
+                implied: true,
+                expire_after_s: Some(600.0),
+                expired: true,
+            }],
+            expect_until: Some(5.0),
+            work_for: Some(WorkFor { pid: 9, key: "s".into(), item: Some(0) }),
+            ..older
+        };
+        let back: Entry = serde_json::from_str(&serde_json::to_string(&stack).unwrap()).unwrap();
+        assert_eq!(back, stack);
+        let nudge: Nudge = serde_json::from_str(r#"{"start":false,"work_started":[0]}"#).unwrap();
+        assert_eq!(nudge.work_started, vec![0]);
     }
 
     #[test]
@@ -1479,11 +2034,18 @@ mod tests {
     }
 
     #[test]
-    fn nothing_running_always_admits_the_oldest() {
-        let big = job(1, "big", 64.0, 500);
-        assert!(blockers(decide(&machine(12.0, 31), &LIM, &[], std::slice::from_ref(&big), &big, 1000.0, &[])).is_empty());
+    fn nothing_running_admits_the_first_in_line_that_fits_in_ram() {
+        // Whatever the CPU reading says, and past mem_max: 20 GB held and 10
+        // GB more is 94% of 32 GB, over the 85% limit, under all of RAM.
+        let old = job(1, "old", 64.0, 10);
+        assert!(blockers(decide(&machine(12.0, 20), &LIM, &[], std::slice::from_ref(&old), &old, 1000.0, &[])).is_empty());
         let young = job(2, "young", 1.0, 1);
-        assert_eq!(blockers(decide(&machine(0.0, 1), &LIM, &[], &[big.clone(), young.clone()], &young, 1000.0, &[])), vec!["order"]);
+        assert_eq!(blockers(decide(&machine(0.0, 1), &LIM, &[], &[old.clone(), young.clone()], &young, 1000.0, &[])), vec!["order"]);
+        // A job that would not fit in all of RAM waits for memory, and holds
+        // nobody back: the young job that fits starts.
+        let big = job(1, "big", 64.0, 500);
+        assert_eq!(blockers(decide(&machine(12.0, 31), &LIM, &[], std::slice::from_ref(&big), &big, 1000.0, &[])), vec!["memory"]);
+        assert!(blockers(decide(&machine(0.0, 1), &LIM, &[], &[big.clone(), young.clone()], &young, 1000.0, &[])).is_empty());
     }
 
     #[test]
@@ -1613,7 +2175,7 @@ mod tests {
         // A job that fits books its need; a partial fit books what it got.
         let fits = decide(&machine(1.0, 4), &LIM, &[], std::slice::from_ref(&small), &small, 1010.0, &[]);
         assert_eq!(cpu_to_book(&fits, 1.0), 1.0);
-        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0) };
+        let partial = Decision::Admit { reason: String::new(), early: None, booked_cpu: Some(6.0), over_ram: false, overcommitted: false };
         assert_eq!(cpu_to_book(&partial, 14.0), 6.0);
     }
 
@@ -1703,7 +2265,7 @@ mod tests {
         let r = std::slice::from_ref(&running);
         // The urgent job is newer and waits for memory; the small old one fits.
         let old = job(2, "old", 1.0, 1);
-        let mut urgent = job(3, "urgent", 1.0, 30);
+        let mut urgent = job(3, "urgent", 1.0, 20);
         urgent.priority = 1;
         let waiting = [old.clone(), urgent.clone()];
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &waiting, &old, 1000.0, &[])), vec!["priority"]);
@@ -1819,14 +2381,23 @@ mod tests {
     #[test]
     fn a_job_passed_for_too_long_is_reserved() {
         let running = job(1, "r", 1.0, 1);
-        let mut big = job(2, "big", 2.0, 30);
+        let mut big = job(2, "big", 2.0, 20);
         big.bypassed_since = Some(1010.0);
         let small = job(3, "small", 1.0, 1);
         let waiting = [big.clone(), small.clone()];
         // Not yet past max_bypass.
         assert!(blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &small, 1100.0, &[])).is_empty());
         // Past it: nobody newer may start.
-        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[running], &waiting, &small, 1200.0, &[])), vec!["reserved"]);
+        assert_eq!(
+            blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &small, 1200.0, &[])),
+            vec!["reserved"]
+        );
+        // A job that would not fit in RAM even once r has ended (8 GB held by
+        // other programs and 30 GB more) waits for them, not for r: it holds
+        // nobody back.
+        let huge = Entry { need_mem_kb: 30 * GB, ..big };
+        let waiting = [huge, small.clone()];
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, &[running], &waiting, &small, 1200.0, &[])).is_empty());
     }
 
     /// A 20 GB compile has run since 1000 and holds its memory. At 1000 a
@@ -2030,7 +2601,8 @@ mod tests {
         s.follow(2 * GB, 0.3, 12.0, 1460.0, Some(STACK));
         assert_eq!(s.need_mem_kb, 2 * GB + (2 * GB) / 4);
 
-        // What its past runs grew to after their start-up stays reserved.
+        // What its past runs grew to after their start-up is not booked:
+        // only what it holds now, plus a quarter.
         let mut again = Entry { started_at: Some(1000.0), ..stack() };
         again.follow(3 * GB, 0.2, 12.0, 1300.0, Some(LongLived { steady_mem_kb: Some(5 * GB), ..STACK }));
         assert_eq!(again.need_mem_kb, 3 * GB + (3 * GB) / 4);
@@ -2062,24 +2634,25 @@ mod tests {
 
     /// A reserved job that a stack keeps out: the stack never ends by itself,
     /// so nothing counts on it to make room. It counts as load from outside
-    /// taskguard: once only stacks run, the first in line starts whatever the
-    /// readings say, and past `max_backfill` a newer job passes only when it
-    /// ends before that.
+    /// taskguard: once only stacks run, the first in line that fits in RAM
+    /// starts, and past `max_backfill` a newer job passes only when it ends
+    /// before that.
     #[test]
     fn backfill_never_waits_for_a_long_lived_job_to_end() {
         let backfill = Limits { max_backfill: 1800.0, ..LIM };
-        // Two stacks past their start-up hold 10 GB each, other programs 6.
+        // Two stacks past their start-up hold 7 GB each, other programs 5.
         let steady = |pid: i32| Entry {
             pid,
             started_at: Some(0.0),
             steady_since: Some(300.0),
+            long_lived: true,
             live_cpu: 0.3,
-            live_mem_kb: 10 * GB,
-            ..job(1, "dalp:stack", 0.3, 10)
+            live_mem_kb: 7 * GB,
+            ..job(1, "dalp:stack", 0.3, 7)
         };
         let stacks = [steady(11), steady(12)];
-        let m = machine(2.0, 26);
-        // A 12 GB head would reach 38 GB of 27.2.
+        let m = machine(2.0, 19);
+        // A 12 GB head would reach 31 GB, over the 27.2 GB limit, in RAM.
         let (_, head) = blocked_head();
         let quick = Entry { est_dur_s: Some(60.0), ..job(3, "install", 0.2, 1) };
         let waiting = [head.clone(), quick.clone()];
@@ -2104,6 +2677,680 @@ mod tests {
         let running = [starting, stacks[1].clone()];
         assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &head, 2900.0, &[])), vec!["memory"]);
         assert_eq!(blockers(decide(&m, &backfill, &running, &waiting, &quick, 2900.0, &[])), vec!["reserved"]);
+    }
+
+    /// A steady dev stack of `live_gb`, as the MacBook's at 10:09.
+    fn steady_stack(pid: i32, live_gb: u64) -> Entry {
+        Entry {
+            pid,
+            started_at: Some(0.0),
+            steady_since: Some(120.0),
+            long_lived: true,
+            priority: 10,
+            live_cpu: 0.1,
+            live_mem_kb: live_gb * GB,
+            ..job(pid as u64, "dev-env:stack", 0.1, live_gb + live_gb / 4)
+        }
+    }
+
+    #[test]
+    fn the_progress_rule_never_starts_a_stack_that_does_not_fit() {
+        // The MacBook at 10:09:56: one steady stack, 24 GB held of 32, mem_max
+        // 95. A second stack of 9.4 GB queued at priority 10, ahead of the run
+        // of the first one (4.3 GB).
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let a = steady_stack(11, 7);
+        let stack_b = Entry { long_lived: true, priority: 10, need_mem_kb: 94 * GB / 10, ..job(2, "dev-env:stack", 3.0, 0) };
+        let run_a = Entry { need_mem_kb: 43 * GB / 10, ..job(3, "pr.ts --pr 17398", 3.0, 0) };
+        let waiting = [stack_b.clone(), run_a.clone()];
+        let m = machine(1.0, 24);
+        let r = std::slice::from_ref(&a);
+        // 24 + 1.75 still reserved by the stack + 9.4 = 35 GB, over 30.4: the
+        // stack waits, and holds nobody back.
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &stack_b, 1000.0, &[])), vec!["memory"]);
+        // The run fits under all of RAM (30 GB of 32), and starts.
+        let d = decide(&m, &lim, r, &waiting, &run_a, 1000.0, &[]);
+        assert!(matches!(&d, Decision::Admit { reason, .. } if reason.contains("long-lived")), "{d:?}");
+        // With nothing running at all, a stack starts up to all of RAM: 22 +
+        // 9.4 GB fits in 32, 23 + 9.4 does not.
+        assert!(blockers(decide(&machine(1.0, 22), &lim, &[], &waiting, &stack_b, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&machine(1.0, 23), &lim, &[], &waiting, &stack_b, 1000.0, &[])), vec!["memory"]);
+        // At macOS warning the same holds: the run starts next to its stack.
+        let mut warn = m.clone();
+        warn.mem_pressure = Some(50.0);
+        let warned = Limits { warn_admit: true, ..lim };
+        assert!(blockers(decide(&warn, &warned, r, &waiting, &run_a, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&warn, &warned, r, &waiting, &stack_b, 1000.0, &[])), vec!["memory", "pressure"]);
+        // Critical still stops every new job.
+        warn.mem_pressure = Some(100.0);
+        assert_eq!(blockers(decide(&warn, &warned, r, &waiting, &run_a, 1000.0, &[])), vec!["pressure"]);
+    }
+
+    #[test]
+    fn a_job_that_only_fits_once_a_stack_stops_holds_nobody_back() {
+        // Omarchy at 11:33: two stacks run, one past its start-up, and 18.9 GB
+        // is held of 31.3. An oxlint of 5.5 GB has waited 55 minutes, past
+        // max_backfill, and would reach 110%: it fits only once a stack is
+        // stopped. A test of 189 MB queued behind it.
+        let lim = Limits { mem_max_pct: 95.0, max_backfill: 1800.0, ..LIM };
+        let m = MachineSample::fixed(5.7, 24, 189 * GB / 10, 313 * GB / 10);
+        let steady = Entry { live_mem_kb: 82 * GB / 10, need_mem_kb: 102 * GB / 10, ..steady_stack(11, 8) };
+        let starting = Entry {
+            steady_since: None,
+            started_at: Some(3000.0),
+            live_mem_kb: 11 * GB / 10,
+            need_mem_kb: 91 * GB / 10,
+            ..steady_stack(12, 1)
+        };
+        let running = [steady.clone(), starting];
+        let mut lint = job(1, "domains/token-features/app:oxlint", 3.6, 0);
+        (lint.need_mem_kb, lint.queued_at, lint.bypassed_since, lint.est_dur_s) = (55 * GB / 10, 0.0, Some(60.0), Some(40.0));
+        let test = Entry { need_mem_kb: 189 * 1024, est_dur_s: Some(30.0), ..job(2, "custody-ops/flows:bun_test", 1.3, 0) };
+        let waiting = [lint.clone(), test.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &lint, 3300.0, &[])), vec!["memory"]);
+        assert!(blockers(decide(&m, &lim, &running, &waiting, &test, 3300.0, &[])).is_empty(), "the test fits and starts");
+        // So in the progress rule: with only the steady stack running, the
+        // lint does not fit in RAM; the test behind it does.
+        let m = MachineSample::fixed(1.0, 24, 28 * GB, 313 * GB / 10);
+        let r = std::slice::from_ref(&steady);
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &lint, 3300.0, &[])), vec!["memory"]);
+        assert!(blockers(decide(&m, &lim, r, &waiting, &test, 3300.0, &[])).is_empty());
+        // A lint that fits once a job that ends by itself has ended still
+        // holds back a job that would not end before then, as before.
+        let compile = Entry { started_at: Some(3200.0), live_mem_kb: 6 * GB, est_dur_s: Some(600.0), ..job(3, "compile", 1.0, 6) };
+        let m = MachineSample::fixed(5.0, 24, 24 * GB, 313 * GB / 10);
+        let running = [steady, compile];
+        let slow = Entry { est_dur_s: Some(1000.0), ..test };
+        let waiting = [lint.clone(), slow.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &lint, 3300.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&m, &lim, &running, &waiting, &slow, 3300.0, &[])), vec!["reserved"]);
+    }
+
+    /// A stack that expects a browser run of 4.3 GB, in checkout /w/a.
+    fn expecting(mut stack: Entry) -> Entry {
+        stack.checkout = "/w/a".into();
+        stack.expects = vec![Expect { work: "browser".into(), mem_kb: 43 * GB / 10, ..Default::default() }];
+        stack
+    }
+
+    /// The browser run of checkout /w/a, linked to the stack of pid 11.
+    fn run_for(item: Option<u32>) -> Entry {
+        Entry {
+            pool: Some("browser".into()),
+            checkout: "/w/a".into(),
+            need_mem_kb: 43 * GB / 10,
+            priority: 11,
+            work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item }),
+            ..job(3, "pr.ts --pr 17398", 3.0, 0)
+        }
+    }
+
+    #[test]
+    fn a_stack_starts_only_with_room_for_the_work_it_expects() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        // 18 GB held of 32 (limit 30.4): the stack alone (9.4 GB) fits, with
+        // its 4.3 GB run it does not.
+        let alone = Entry { long_lived: true, priority: 10, need_mem_kb: 94 * GB / 10, ..job(2, "dev-env:stack", 3.0, 0) };
+        let stack = Entry { pid: 11, ..expecting(alone.clone()) };
+        let m = machine(1.0, 18);
+        let busy = [Entry { started_at: Some(990.0), ..job(5, "lint", 1.0, 1) }];
+        assert!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&alone), &alone, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])), vec!["memory"]);
+        assert_eq!(need_with_booking(&stack, &busy), 94 * GB / 10 + 43 * GB / 10);
+        assert!(blockers(decide(&machine(1.0, 15), &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_running_stack_keeps_the_room_for_its_run_until_the_run_starts() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let stack = expecting(steady_stack(11, 7));
+        let r = std::slice::from_ref(&stack);
+        // What the stack may still grow to (1 GB), and 4.3 GB booked for its run.
+        let grows = stack.need_mem_kb - stack.live_mem_kb;
+        assert_eq!(reserve(r).1, grows + 43 * GB / 10);
+        let lint = Entry { need_mem_kb: 46 * GB / 10, ..job(4, "lint", 3.5, 0) };
+        let run = run_for(Some(0));
+        let waiting = [lint.clone(), run.clone()];
+        let m = machine(1.0, 24);
+        let other = [stack.clone(), Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 0) }];
+        // 24 GB held + 5.3 reserved: a lint that needs that room waits; the
+        // run takes over the booking, and goes first.
+        assert_eq!(blockers(decide(&m, &lim, &other, &waiting, &lint, 1000.0, &[])), vec!["priority", "memory"]);
+        assert!(blockers(decide(&m, &lim, &other, &waiting, &run, 1000.0, &[])).is_empty());
+        let alone = [lint.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &other, &alone, &lint, 1000.0, &[])), vec!["memory"]);
+        // Once the run runs, the stack books nothing for it: the run's own
+        // need counts instead.
+        let running = [stack.clone(), Entry { started_at: Some(1000.0), ..run.clone() }];
+        assert_eq!(reserve(&running).1, grows + 43 * GB / 10);
+        assert_eq!(super::booked(&stack, &running), 0);
+        // And once its owner has marked it started, it stays dropped.
+        let mut done = stack.clone();
+        done.expects[0].started = true;
+        assert_eq!(reserve(std::slice::from_ref(&done)).1, grows);
+    }
+
+    /// The MacBook (32 GB, mem_max 95, warn_admit) with over-commit on at
+    /// its defaults: 120% of RAM, after 120 s alone or 1800 s first in line.
+    fn overcommit_limits() -> Limits {
+        Limits {
+            mem_max_pct: 95.0,
+            warn_admit: true,
+            noise_mem_pct: 2.0,
+            outside_admit: true,
+            outside_mem_max_pct: 97.5,
+            overcommit_max_pct: 120.0,
+            ..LIM
+        }
+    }
+
+    /// `outside_gb` held by programs outside taskguard, at `pressure`, with
+    /// 16 GB of swap free.
+    fn macbook(outside_gb: f64, pressure: f64) -> MachineSample {
+        MachineSample {
+            mem_pressure: Some(pressure),
+            swap_free_kb: Some(16 * GB),
+            ..MachineSample::fixed(1.0, 10, (outside_gb * GB as f64) as u64, 32 * GB)
+        }
+    }
+
+    /// A lone dev stack of 9.5 GB, queued at 1000, that declared its 4.3 GB
+    /// browser run: it books 13.8 GB.
+    fn lone_stack() -> Entry {
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, need_mem_kb: 95 * GB / 10, ..job(1, "dev-env:stack", 3.0, 0) };
+        expecting(stack)
+    }
+
+    fn memory_of(d: &Decision) -> &Blocker {
+        match d {
+            Decision::Wait { blockers } => blockers.iter().find(|b| b.name() == "memory").expect("a memory blocker"),
+            Decision::Admit { .. } => panic!("admitted: {d:?}"),
+        }
+    }
+
+    #[test]
+    fn a_lone_stack_that_only_programs_outside_keep_out_starts_over_ram_after_a_while() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        // 20 GB outside + 13.8 GB = 106% of RAM. For its first two minutes
+        // it waits, and says how far it is from the real ceiling: all of
+        // RAM, not mem_max.
+        let d = decide(&macbook(20.0, 0.0), &lim, &[], w, &me, 1060.0, &[]);
+        let b = memory_of(&d);
+        assert!(
+            matches!(b, Blocker::Memory { limit_pct, overcommit_in: Some(s), .. } if *limit_pct == 100.0 && (*s - 60.0).abs() < 1e-6),
+            "{b:?}"
+        );
+        let text = crate::report::blocker_text(b);
+        assert!(text.contains("(limit 100%), 1.8 GB short") && text.contains("over RAM in 1m00s"), "{text}");
+        // After that it starts, at normal pressure and at macOS warning.
+        for p in [0.0, 50.0] {
+            let d = decide(&macbook(20.0, p), &lim, &[], w, &me, 1130.0, &[]);
+            assert!(
+                matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("only job in the queue")),
+                "{p}: {d:?}"
+            );
+        }
+        // Up to the cap: 24 GB outside is 118%, 25 GB 121%.
+        assert!(matches!(decide(&macbook(24.0, 50.0), &lim, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        let d = decide(&macbook(25.0, 0.0), &lim, &[], w, &me, 1130.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: None, .. }), "{d:?}");
+        // Never at critical.
+        assert_eq!(blockers(decide(&macbook(18.5, 100.0), &lim, &[], w, &me, 5000.0, &[])), vec!["pressure"]);
+        // Its run, queued for it, does not count as another job in line.
+        let run = Entry { queued_at: 1100.0, ..run_for(None) };
+        let both = [me.clone(), run];
+        assert!(matches!(decide(&macbook(20.0, 0.0), &lim, &[], &both, &me, 1130.0, &[]), Decision::Admit { over_ram: true, .. }));
+    }
+
+    #[test]
+    fn over_ram_goes_only_into_half_the_free_swap() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        let with_swap = |gb: u64| MachineSample { swap_free_kb: Some(gb * GB), ..macbook(20.0, 0.0) };
+        // 1.8 GB over RAM: 4 GB of swap holds it, 3 GB does not, none at all
+        // keeps it out for good.
+        assert!(matches!(decide(&with_swap(4), &lim, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        assert_eq!(blockers(decide(&with_swap(3), &lim, &[], w, &me, 1130.0, &[])), vec!["memory"]);
+        let none = MachineSample { swap_free_kb: None, ..macbook(20.0, 0.0) };
+        assert_eq!(blockers(decide(&none, &lim, &[], w, &me, 5000.0, &[])), vec!["memory"]);
+        // Linux: no warning level, so any pressure at pressure_max (PSI)
+        // keeps it out, whatever the swap.
+        let linux = Limits { warn_admit: false, ..lim };
+        assert!(matches!(decide(&with_swap(4), &linux, &[], w, &me, 1130.0, &[]), Decision::Admit { .. }));
+        let psi = MachineSample { mem_pressure: Some(25.0), ..with_swap(16) };
+        assert_eq!(blockers(decide(&psi, &linux, &[], w, &me, 5000.0, &[])), vec!["pressure"]);
+    }
+
+    #[test]
+    fn with_other_jobs_queued_the_first_in_line_starts_over_ram_only_once_stuck() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        // A 20 GB compile queued behind it: it cannot start either.
+        let compile = Entry { queued_at: 1010.0, ..job(2, "compile", 2.0, 20) };
+        let waiting = [me.clone(), compile.clone()];
+        let m = macbook(20.0, 0.0);
+        let d = decide(&m, &lim, &[], &waiting, &me, 1130.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(s), .. } if (*s - 1670.0).abs() < 1e-6), "{d:?}");
+        let d = decide(&m, &lim, &[], &waiting, &me, 2800.0, &[]);
+        assert!(matches!(&d, Decision::Admit { early: Some(why), .. } if why.contains("first in line")), "{d:?}");
+        // The job behind it never starts over RAM by the first-in-line rule.
+        assert_eq!(blockers(decide(&m, &lim, &[], &waiting, &compile, 5000.0, &[])), vec!["memory"]);
+        // A stalled job behind it does not count.
+        let stalled = [me.clone(), Entry { stalled: true, ..compile }];
+        assert!(matches!(decide(&m, &lim, &[], &stalled, &me, 1130.0, &[]), Decision::Admit { .. }));
+    }
+
+    #[test]
+    fn the_run_of_a_stack_started_over_ram_inherits_the_over_commit_at_once() {
+        let lim = overcommit_limits();
+        // The stack started by over-commit and runs, steady at 7 GB (8 GB
+        // need), with 4.3 GB declared for its run; 20 GB outside:
+        // 27 + 1 + 4.3 GB = 101% of RAM.
+        let stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let off = Limits { overcommit_max_pct: 0.0, ..lim };
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &off, r, w, &run, 1000.0, &[])), vec!["memory"], "0.11.0-rc.2 waits");
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        let inherits = |why: &str| why.contains("takes over the 4.3 GB");
+        assert!(matches!(&d, Decision::Admit { over_ram: true, overcommitted: true, early: Some(why), .. } if inherits(why)), "{d:?}");
+        assert!(matches!(decide(&macbook(27.0, 50.0), &lim, r, w, &run, 1000.0, &[]), Decision::Admit { .. }));
+        // Never at critical; never above the cap.
+        assert_eq!(blockers(decide(&macbook(27.0, 100.0), &lim, r, w, &run, 1000.0, &[])), vec!["pressure"]);
+        assert_eq!(blockers(decide(&macbook(34.0, 0.0), &lim, r, w, &run, 1000.0, &[])), vec!["memory"]);
+        // A run that needs more than was booked for it does not inherit.
+        let big = Entry { need_mem_kb: 8 * GB, ..run.clone() };
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, std::slice::from_ref(&big), &big, 1000.0, &[])), vec!["memory"]);
+        // Also while the stack is still in its start-up.
+        let starting = Entry { steady_since: None, started_at: Some(990.0), ..stack.clone() };
+        let d = decide(&macbook(27.0, 0.0), &lim, std::slice::from_ref(&starting), w, &run, 1000.0, &[]);
+        assert!(matches!(d, Decision::Admit { .. }), "{d:?}");
+    }
+
+    #[test]
+    fn the_run_of_a_stack_that_started_normally_over_commits_only_by_the_queue_rule() {
+        let lim = overcommit_limits();
+        let stack = expecting(steady_stack(11, 7));
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(s), .. } if (*s - 120.0).abs() < 1e-6), "{d:?}");
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1130.0, &[]);
+        assert!(matches!(&d, Decision::Admit { over_ram: true, early: Some(why), .. } if why.contains("only job in the queue")), "{d:?}");
+        // With another job of taskguard's running, never.
+        let other = Entry { pid: 21, started_at: Some(900.0), ..job(21, "lint", 0.5, 0) };
+        let both = [stack.clone(), other];
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, &both, w, &run, 9000.0, &[])), vec!["memory"]);
+        // With another job queued, only once stuck.
+        let compile = Entry { pid: 2, queued_at: 1010.0, ..job(2, "compile", 2.0, 20) };
+        let queued = [run.clone(), compile];
+        assert_eq!(blockers(decide(&macbook(27.0, 0.0), &lim, r, &queued, &run, 1130.0, &[])), vec!["memory"]);
+        assert!(matches!(decide(&macbook(27.0, 0.0), &lim, r, &queued, &run, 2810.0, &[]), Decision::Admit { .. }));
+    }
+
+    #[test]
+    fn the_run_of_a_guessed_booking_does_not_inherit_the_over_commit() {
+        let lim = overcommit_limits();
+        let mut stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        let r = std::slice::from_ref(&stack);
+        let run = Entry { queued_at: 1000.0, ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let d = decide(&macbook(27.0, 0.0), &lim, r, w, &run, 1000.0, &[]);
+        assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: Some(_), .. }), "{d:?}");
+    }
+
+    #[test]
+    fn at_macos_warning_the_takeover_still_waits_for_its_slot_and_a_paused_job() {
+        let lim = overcommit_limits();
+        let stack = Entry { overcommitted: true, ..expecting(steady_stack(11, 7)) };
+        let compile = Entry { pid: 21, started_at: Some(900.0), ..job(21, "compile", 0.5, 0) };
+        let run = Entry { queued_at: 1000.0, pool_key: Some("browser".into()), pool_slots: Some(1), ..run_for(Some(0)) };
+        let w = std::slice::from_ref(&run);
+        let m = macbook(27.0, 50.0);
+        assert!(matches!(decide(&m, &lim, &[stack.clone(), compile.clone()], w, &run, 1000.0, &[]), Decision::Admit { .. }));
+        let other_run = Entry { pid: 22, started_at: Some(900.0), pool_key: Some("browser".into()), ..job(22, "other run", 0.5, 0) };
+        let d = decide(&m, &lim, &[stack.clone(), compile.clone(), other_run], w, &run, 1000.0, &[]);
+        assert!(!matches!(d, Decision::Admit { .. }), "{d:?}");
+        let paused = Entry { paused_since: Some(950.0), ..compile };
+        assert_eq!(blockers(decide(&m, &lim, &[stack, paused], w, &run, 1000.0, &[])), vec!["paused"]);
+    }
+
+    #[test]
+    fn a_second_stack_next_to_a_running_one_still_waits() {
+        let lim = overcommit_limits();
+        let a = expecting(steady_stack(11, 7));
+        let b = Entry { pid: 12, ..lone_stack() };
+        let w = std::slice::from_ref(&b);
+        for now in [1130.0, 2900.0, 9000.0] {
+            // 9 GB outside + the first stack's 7 GB, 5.3 GB it reserves, and 13.8 GB.
+            assert_eq!(blockers(decide(&macbook(16.0, 0.0), &lim, std::slice::from_ref(&a), w, &b, now, &[])), vec!["memory"]);
+        }
+    }
+
+    #[test]
+    fn with_over_commit_off_a_lone_job_waits_as_in_0_11_0_rc_2() {
+        let lim = Limits { overcommit_max_pct: 0.0, ..overcommit_limits() };
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        for now in [1130.0, 2900.0, 90000.0] {
+            let d = decide(&macbook(20.0, 0.0), &lim, &[], w, &me, now, &[]);
+            assert!(matches!(memory_of(&d), Blocker::Memory { overcommit_in: None, .. }), "{d:?}");
+        }
+        // Under the limit it still starts at once, as before.
+        assert!(matches!(decide(&macbook(18.0, 0.0), &lim, &[], w, &me, 1000.0, &[]), Decision::Admit { over_ram: false, .. }));
+    }
+
+    #[test]
+    fn a_forced_start_over_ram_is_seen_as_such() {
+        let lim = overcommit_limits();
+        let me = lone_stack();
+        let w = std::slice::from_ref(&me);
+        assert!(over_ram(&macbook(20.0, 0.0), &lim, &[], w, &me));
+        assert!(!over_ram(&macbook(18.0, 0.0), &lim, &[], w, &me));
+        // A history guess another stack books is not memory in use: a job
+        // forced next to it is over RAM only by the progress measure.
+        let mut guessing = Entry { pid: 12, ..expecting(steady_stack(12, 7)) };
+        guessing.expects[0].implied = true;
+        let lint = job(3, "lint", 0.5, 18);
+        let r = std::slice::from_ref(&guessing);
+        assert!(!over_ram(&macbook(10.0, 0.0), &lim, r, std::slice::from_ref(&lint), &lint));
+    }
+
+    #[test]
+    fn work_links_to_the_stack_of_its_checkout_that_expects_it() {
+        let stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(3, "pr.ts", 3.0, 4) };
+        let is = |w: &str| w == "browser";
+        let (link, priority) = link_work(&me, std::slice::from_ref(&stack), &[], is).unwrap();
+        assert_eq!((link.pid, link.item, priority), (11, Some(0), 10));
+        // Not from another checkout, and not work it does not expect.
+        let elsewhere = Entry { checkout: "/w/b".into(), ..me.clone() };
+        assert!(link_work(&elsewhere, std::slice::from_ref(&stack), &[], is).is_none());
+        assert!(link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "lint").is_none());
+        // A second run while the first one has the booking still goes first,
+        // without a booking to take over.
+        let first = Entry { pid: 30, started_at: Some(990.0), ..run_for(Some(0)) };
+        let (link, _) = link_work(&me, &[stack.clone(), first], &[], is).unwrap();
+        assert_eq!(link.item, None);
+        // A stack that still waits takes only work that can take over its booking.
+        let waiting = Entry { started_at: None, ..stack.clone() };
+        let claimed = Entry { pid: 30, ..run_for(Some(0)) };
+        assert!(link_work(&me, &[], &[waiting.clone(), claimed], is).is_none());
+        assert_eq!(link_work(&me, &[], std::slice::from_ref(&waiting), is).unwrap().0.item, Some(0));
+        // A long-lived job is nobody's work.
+        assert!(link_work(&Entry { long_lived: true, ..me }, std::slice::from_ref(&stack), &[], is).is_none());
+    }
+
+    #[test]
+    fn work_waits_for_its_stack_and_holds_nobody_back_meanwhile() {
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 9)) };
+        let run = run_for(Some(0));
+        let lint = job(4, "lint", 1.0, 1);
+        let waiting = [stack.clone(), run.clone(), lint.clone()];
+        let busy = [Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 2) }];
+        let m = machine(1.0, 4);
+        assert_eq!(blockers(decide(&m, &LIM, &busy, &waiting, &run, 1000.0, &[])), vec!["stack"]);
+        // Its priority is above the stack's, but it cannot start: the lint
+        // that fits is held back only by the stack itself.
+        assert_eq!(blockers(decide(&m, &LIM, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        let d = decide(&m, &LIM, &busy, &waiting, &lint, 1000.0, &[]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Priority { key, priority: 10 } if key == "dev-env:stack"))
+        );
+        // With nothing running, the progress rule skips it too: the stack
+        // behind it in line starts.
+        assert_eq!(blockers(decide(&m, &LIM, &[], &waiting, &run, 1000.0, &[])), vec!["stack"]);
+        assert!(blockers(decide(&m, &LIM, &[], &waiting, &stack, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_stack_that_expects_work_waits_a_few_seconds_for_it_to_queue() {
+        let stack = Entry {
+            pid: 11,
+            long_lived: true,
+            priority: 10,
+            queued_at: 1000.0,
+            expect_until: Some(1005.0),
+            ..expecting(job(2, "dev-env:stack", 3.0, 9))
+        };
+        let m = machine(1.0, 4);
+        let alone = std::slice::from_ref(&stack);
+        let d = decide(&m, &LIM, &[], alone, &stack, 1002.0, &[]);
+        assert!(
+            matches!(&d, Decision::Wait { blockers } if matches!(&blockers[0], Blocker::Expect { wait_s, .. } if *wait_s == 3.0)),
+            "{d:?}"
+        );
+        // The run queued: the stack starts now, with room for both, and the
+        // run waits for it.
+        let run = run_for(Some(0));
+        let both = [stack.clone(), run.clone()];
+        assert!(blockers(decide(&m, &LIM, &[], &both, &stack, 1002.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&m, &LIM, &[], &both, &run, 1002.0, &[])), vec!["stack"]);
+        // Nothing queued: after the wait it starts alone.
+        assert!(blockers(decide(&m, &LIM, &[], alone, &stack, 1005.0, &[])).is_empty());
+        // A stack that expects nothing never waits.
+        let plain = Entry { expects: Vec::new(), expect_until: None, ..stack.clone() };
+        assert!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_stack_with_work_queued_for_it_holds_its_turn_also_before_it_fits() {
+        // DALP's max_backfill: a job ahead holds its turn only while it could
+        // start, for half an hour.
+        let lim = Limits { max_backfill: 1800.0, ..LIM };
+        let stack = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 9)) };
+        let lint = job(4, "lint", 1.0, 1);
+        let busy = [Entry { started_at: Some(990.0), est_dur_s: Some(20.0), ..job(5, "build", 0.5, 12) }];
+        // 4 GB held + 12 reserved + 13.3 for the stack and its run: it waits.
+        let m = machine(1.0, 4);
+        // Alone, it lets the lint that fits start meanwhile, as before.
+        let waiting = [stack.clone(), lint.clone()];
+        assert!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])).is_empty());
+        // With its run queued for it, the lint waits: the room is theirs.
+        let waiting = [stack.clone(), run_for(Some(0)), lint.clone()];
+        assert_eq!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        // Still when 14 GB is held by other programs: once the build has
+        // ended nothing of taskguard's runs, and a lone job may then take
+        // the machine up to all of RAM (14 + 13.3 of 32 GB), so the stack
+        // and its run will start, and the room is theirs.
+        let m = machine(1.0, 14);
+        assert_eq!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+        // Not when it could not start even then: 14 GB held and 22.3 GB more
+        // for a bigger stack and its run is over all of RAM.
+        let big = Entry { pid: 11, long_lived: true, priority: 10, ..expecting(job(2, "dev-env:stack", 3.0, 18)) };
+        let waiting = [big, run_for(Some(0)), lint.clone()];
+        assert!(blockers(decide(&m, &lim, &busy, &waiting, &lint, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_guess_of_the_history_books_room_but_never_stops_the_queue() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let grows = stack.need_mem_kb - stack.live_mem_kb;
+        let r = std::slice::from_ref(&stack);
+        // It books the run's usual 4.3 GB, and the run takes that over.
+        assert_eq!(reserve(r).1, grows + 43 * GB / 10);
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(3, "pr.ts", 3.0, 4) };
+        assert_eq!(link_work(&me, r, &[], |w| w == "browser").unwrap().0.item, Some(0));
+        // 24 GB held of 32 and only the stack runs: a 5 GB lint does not fit
+        // with the guess booked (35 GB), but the progress rule ignores a
+        // guess, up to all of RAM (30 GB): it starts.
+        let m = machine(1.0, 24);
+        let lint = job(4, "lint", 3.5, 5);
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&lint), &lint, 1000.0, &[])).is_empty());
+        // While a job that ends by itself runs, the guess holds like a booking.
+        let busy = [stack.clone(), Entry { started_at: Some(990.0), ..job(5, "build", 0.5, 0) }];
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&lint), &lint, 1000.0, &[])), vec!["memory"]);
+        // A second stack respects the open guess, declared work or not (24 +
+        // 5.3 + 4 GB is over 30.4); one with no declared work leaves only its
+        // own guess out.
+        let plain = Entry { long_lived: true, priority: 10, ..job(6, "dev-env:stack", 1.0, 4) };
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])), vec!["memory"]);
+        let mut guessing = Entry { checkout: "/w/b".into(), ..plain.clone() };
+        guessing.expects = vec![Expect { work: "browser".into(), mem_kb: GB, implied: true, ..Default::default() }];
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])), vec!["memory"]);
+        let mut declared = guessing.clone();
+        declared.expects[0].implied = false;
+        assert_eq!(blockers(decide(&m, &lim, r, std::slice::from_ref(&declared), &declared, 1000.0, &[])), vec!["memory"]);
+        // A run that linked to the open guess keeps its link, and so does one
+        // that linked while another run held the booking.
+        let linked = Entry { work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item: Some(0) }), ..me.clone() };
+        assert!(!link_lapsed(&linked, r, &[], |w| w == "browser"));
+        let linked = Entry { work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item: None }), ..me.clone() };
+        assert!(!link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Expired, it books nothing: the stack with no declared work starts
+        // (24 + 1 + 4 GB), and no run links to the guess or keeps a link
+        // that did not take its booking.
+        stack.expects[0].expired = true;
+        let r = std::slice::from_ref(&stack);
+        assert_eq!(reserve(r).1, grows);
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&plain), &plain, 1000.0, &[])).is_empty());
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&guessing), &guessing, 1000.0, &[])).is_empty());
+        assert!(link_work(&me, r, &[], |w| w == "browser").is_none());
+        assert!(link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Nor once it came true.
+        stack.expects[0] = Expect { expired: false, started: true, ..stack.expects[0].clone() };
+        let r = std::slice::from_ref(&stack);
+        assert!(link_work(&me, r, &[], |w| w == "browser").is_none());
+        assert!(link_lapsed(&linked, r, &[], |w| w == "browser"));
+        // Declared work that has started still links: the stack exists for it.
+        stack.expects[0].implied = false;
+        let r = std::slice::from_ref(&stack);
+        assert_eq!(link_work(&me, r, &[], |w| w == "browser").unwrap().0.item, None);
+        assert!(!link_lapsed(&linked, r, &[], |w| w == "browser"));
+    }
+
+    #[test]
+    fn a_run_takes_over_a_guessed_booking_once_by_the_progress_rule() {
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        let r = std::slice::from_ref(&stack);
+        let run = run_for(Some(0));
+        // 29 GB held, 1 still to grow and the 4.3 GB the run takes over:
+        // 34.3 GB of 32. The guess it takes over counts once, not as nothing.
+        assert_eq!(blockers(decide(&machine(1.0, 29), &lim, r, std::slice::from_ref(&run), &run, 1000.0, &[])), vec!["memory"]);
+        // 26 GB held: 31.3 GB, under all of RAM, and it starts.
+        assert!(blockers(decide(&machine(1.0, 26), &lim, r, std::slice::from_ref(&run), &run, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_lone_stack_is_never_kept_out_by_other_programs_alone() {
+        // 32 GB, mem_max 85 (27.2 GB). Nothing of taskguard runs; other
+        // programs hold 22 GB and a 9 GB stack would take the machine to 31
+        // GB: only they keep it out, and nothing taskguard runs would free
+        // that. It starts up to all of RAM, whatever outside_admit and its
+        // ceiling say.
+        let stack = Entry { long_lived: true, priority: 10, ..job(1, "dev-env:stack", 3.0, 9) };
+        let me = std::slice::from_ref(&stack);
+        for lim in [
+            LIM,
+            Limits { outside_admit: true, ..LIM },
+            Limits { outside_admit: true, outside_mem_max_pct: 92.0, ..LIM },
+            Limits { outside_admit: false, outside_mem_max_pct: 50.0, ..LIM },
+        ] {
+            assert!(blockers(decide(&machine(1.0, 22), &lim, &[], me, &stack, 1000.0, &[])).is_empty(), "{lim:?}");
+            // Never past all of RAM: 24 + 9 GB is over 32.
+            assert_eq!(blockers(decide(&machine(1.0, 24), &lim, &[], me, &stack, 1000.0, &[])), vec!["memory"], "{lim:?}");
+        }
+        // Next to a steady stack, only programs outside taskguard keep it out
+        // (4 + 1 + 9 GB of taskguard's is under 27.2): it starts up to the
+        // outside_admit ceiling (30.4 GB), and without that leeway waits.
+        let small = steady_stack(12, 4);
+        let r = std::slice::from_ref(&small);
+        let lim = Limits { outside_admit: true, ..LIM };
+        assert!(blockers(decide(&machine(1.0, 20), &lim, r, me, &stack, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&machine(1.0, 21), &lim, r, me, &stack, 1000.0, &[])), vec!["memory"]);
+        assert_eq!(blockers(decide(&machine(1.0, 20), &LIM, r, me, &stack, 1000.0, &[])), vec!["memory"]);
+        // When a steady stack of taskguard's fills the room, outside programs
+        // are no excuse: 16 + 4 + 9 GB of its own is over 27.2.
+        let a = steady_stack(12, 16);
+        assert_eq!(blockers(decide(&machine(1.0, 17), &lim, std::slice::from_ref(&a), me, &stack, 1000.0, &[])), vec!["memory"]);
+    }
+
+    #[test]
+    fn a_guess_whose_work_queued_stays_while_that_work_waits() {
+        // The history says the run follows about 6 minutes after the stack
+        // starts: the guess expires 10 minutes in. The run queues at minute 6
+        // and links; memory pressure keeps it out past minute 10.
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let me = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), queued_at: 360.0, ..job(3, "pr.ts", 3.0, 4) };
+        let (link, priority) = link_work(&me, std::slice::from_ref(&stack), &[], |w| w == "browser").unwrap();
+        assert_eq!((link.item, priority + 1), (Some(0), 11));
+        let run = Entry { work_for: Some(link), priority: priority + 1, ..me };
+        let waiting = std::slice::from_ref(&run);
+        // Minute 11: the guess came true, so it does not expire.
+        assert!(!expire_guesses(&mut stack, &[], waiting, 660.0));
+        let r = std::slice::from_ref(&stack);
+        assert!(!link_lapsed(&run, r, waiting, |w| w == "browser"));
+        assert_eq!(reserve(r).1, GB + 43 * GB / 10, "it keeps the room booked for the run");
+        let mut m = machine(1.0, 20);
+        m.mem_pressure = Some(50.0);
+        assert_eq!(blockers(decide(&m, &LIM, r, waiting, &run, 660.0, &[])), vec!["pressure"]);
+        // Once the run has left the queue, the guess that is past its time ends.
+        assert!(expire_guesses(&mut stack, &[], &[], 660.0));
+        assert_eq!(reserve(std::slice::from_ref(&stack)).1, GB);
+    }
+
+    #[test]
+    fn a_second_run_does_not_ride_on_a_guess_the_first_run_made_come_true() {
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let is = |w: &str| w == "browser";
+        // The first run linked to the guess, took over its booking and runs.
+        stack.expects[0].started = true;
+        let first = Entry { pid: 30, started_at: Some(990.0), ..run_for(Some(0)) };
+        let running = [stack.clone(), first.clone()];
+        assert!(!link_lapsed(&first, &running, &[], is), "the first run keeps its link");
+        // A second matching run in the checkout is not the work the history
+        // foresaw: it does not link, so it gets no lift and does not wait
+        // for the stack.
+        let second = Entry { pool: Some("browser".into()), checkout: "/w/a".into(), ..job(31, "pr.ts --pr 17399", 3.0, 4) };
+        assert!(link_work(&second, &running, &[], is).is_none());
+        // One that linked before the first run started lets go of its link.
+        let linked = Entry { work_for: Some(WorkFor { pid: 11, key: "dev-env:stack".into(), item: None }), ..second.clone() };
+        assert!(link_lapsed(&linked, &running, &[], is));
+        // Declared work still links a second run: the caller said it comes.
+        stack.expects[0].implied = false;
+        let running = [stack, first];
+        assert_eq!(link_work(&second, &running, &[], is).unwrap().0.item, None);
+    }
+
+    #[test]
+    fn a_guess_whose_work_queued_is_declared_work_also_by_the_progress_rule() {
+        // 32 GB, 28 GB held; only a steady stack runs, still to grow 1 GB,
+        // and the history guessed a 4.3 GB run for it.
+        let lim = Limits { mem_max_pct: 95.0, ..LIM };
+        let mut stack = Entry { pid: 11, ..expecting(steady_stack(11, 7)) };
+        stack.expects[0].implied = true;
+        stack.expects[0].expire_after_s = Some(600.0);
+        let r = std::slice::from_ref(&stack);
+        let m = machine(1.0, 28);
+        let lint = job(4, "lint", 0.5, 2);
+        // While nothing queued for it, the guess is no reason to wait: the
+        // lint starts (28 + 1 + 2 GB).
+        assert!(blockers(decide(&m, &lim, r, std::slice::from_ref(&lint), &lint, 1000.0, &[])).is_empty());
+        // The run queued and linked: the guess came true, and its room is
+        // the run's. The lint does not start into it (28 + 1 + 4.3 + 2 GB).
+        let run = run_for(Some(0));
+        let waiting = [run.clone(), lint.clone()];
+        assert_eq!(blockers(decide(&m, &lim, r, &waiting, &lint, 1000.0, &[])), vec!["memory"]);
+        assert!(!expire_guesses(&mut stack, &[], &waiting, 2000.0));
+        // A guess no job queued for still expires, and then books nothing.
+        let waiting = std::slice::from_ref(&lint);
+        assert!(expire_guesses(&mut stack, &[], waiting, 2000.0));
+        assert!(blockers(decide(&m, &lim, std::slice::from_ref(&stack), waiting, &lint, 2000.0, &[])).is_empty());
     }
 
     #[test]
@@ -2356,10 +3603,19 @@ mod tests {
         );
         assert!(blockers(decide(&m, &lim, &both, std::slice::from_ref(&lint), &lint, 1015.0, &[])).is_empty(), "it has settled");
 
-        // At warning, memory has no leeway, also when only long-lived jobs run.
+        // At warning, memory has no leeway while a job that ends by itself
+        // runs.
         let big = job(5, "big", 1.0, 12);
-        let d = decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&big), &big, 1000.0, &[]);
+        let busy = [stack.clone(), Entry { started_at: Some(999.0), ..lint.clone() }];
+        let d = decide(&m, &lim, &busy, std::slice::from_ref(&big), &big, 1000.0, &[]);
         assert_eq!(blockers(d), vec!["memory", "pressure"]);
+        // With only long-lived jobs running, the progress rule decides, up to
+        // all of RAM: 16 + 12 GB is 88% of 32, over the 85% limit.
+        let d = decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&big), &big, 1000.0, &[]);
+        assert!(blockers(d).is_empty(), "the progress rule also works at warning");
+        let bigger = job(5, "bigger", 1.0, 17);
+        let d = decide(&m, &lim, std::slice::from_ref(&stack), std::slice::from_ref(&bigger), &bigger, 1000.0, &[]);
+        assert_eq!(blockers(d), vec!["memory", "pressure"], "over all of RAM it waits");
 
         // Critical stops every new job, and warn_admit off keeps the old rule.
         m.mem_pressure = Some(100.0);
