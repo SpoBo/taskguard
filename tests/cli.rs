@@ -522,15 +522,15 @@ fn wait_until(what: &str, mut ok: impl FnMut() -> bool) {
 #[test]
 fn a_job_is_paused_and_resumed_by_hand() {
     let e = Env::new("sample_every = 0.2\n");
-    let job = e.spawn(&["--", "sh", "-c", "touch started; sleep 1; echo done >> log"]);
+    let job = e.spawn(&["--", "sh", "-c", "touch started; sleep 4; echo done >> log"]);
     wait_for(&e.file("started"));
-    let out = e.run(&["pause", "sleep_1"]);
+    let out = e.run(&["pause", "sleep_4"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("paused"), "{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
     let status = String::from_utf8_lossy(&e.run(&["status"]).stdout).into_owned();
     assert!(status.contains("PAUSED") && status.contains("by hand"), "{status}");
     std::thread::sleep(Duration::from_millis(1500));
     assert!(!e.file("log").exists(), "a paused job does not go on");
-    let out = e.run(&["resume", "sleep_1"]);
+    let out = e.run(&["resume", "sleep_4"]);
     assert!(String::from_utf8_lossy(&out.stdout).contains("resumed"), "{}", stderr(&out));
     let out = job.wait_with_output().unwrap();
     assert!(e.file("log").exists());
