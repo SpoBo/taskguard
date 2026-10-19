@@ -19,10 +19,11 @@ and the versions follow [semver](https://semver.org).
   `overcommit_stuck_after` (1800) seconds while other jobs queue too. Work
   for a running stack counts as alone next to it. Work that takes over the
   room a stack declared for it starts so at once only when that stack itself
-  started by over-commit; otherwise it waits as any other job. Never at critical pressure (on Linux, never at `pressure_max`), up
-  to `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM,
-  and with the part over RAM in at most half the free swap; on macOS the
-  swap counts the free space of the volume its swap files grow on.
+  started by over-commit; otherwise it waits as any other job. Never at
+  critical pressure (on Linux, never at `pressure_max`), up to
+  `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM, and
+  with the part over RAM in at most half the free swap; on macOS the swap
+  counts the free space of the volume its swap files grow on.
   `overcommit = false` turns it off.
 - On Linux a job that starts with memory over RAM (by over-commit, by `--st`,
   or by hand) is the OOM killer's first pick: its processes get

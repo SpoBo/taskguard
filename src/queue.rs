@@ -1035,10 +1035,9 @@ pub fn decide(
             let room = Room::new(m, lim, running, waiting);
             if let Some(mem) =
                 room.blockers(m, lim, running, me, now, unknown_starts).into_iter().find(|b| matches!(b, Blocker::Memory { .. }))
+                && !matches!(room.overcommit(m, lim, waiting, me, first, now), Overcommit::Now(_))
             {
-                if !matches!(room.overcommit(m, lim, waiting, me, first, now), Overcommit::Now(_)) {
-                    return Decision::Wait { blockers: vec![mem, pressure] };
-                }
+                return Decision::Wait { blockers: vec![mem, pressure] };
             }
         }
     }

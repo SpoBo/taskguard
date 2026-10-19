@@ -144,30 +144,30 @@ below).
   that stays. Memory pressure is the one exception:
   then the load comes from other programs, and jobs wait until it eases
   (at macOS warning, see above).
-- **A job that only programs outside taskguard keep out starts over RAM
-  once it has waited (`overcommit`).** With nothing of taskguard's running,
-  a job short of all of RAM waits for programs outside taskguard to free
-  memory, and nothing taskguard runs would make that room: on a 32 GB Mac a
-  dev stack that books its browser run waited for good once other programs
-  held 18 GB. So the only job in the queue may start with memory over RAM
-  after `overcommit_after` (120) seconds, and the first in line after
+- **A job that only programs outside taskguard keep out starts over RAM once
+  it has waited (`overcommit`).** With nothing of taskguard's running, a job
+  short of all of RAM waits for programs outside taskguard to free memory,
+  and nothing taskguard runs would make that room: on a 32 GB Mac a dev
+  stack that books its browser run waited for good once other programs held
+  18 GB. So the only job in the queue may start with memory over RAM after
+  `overcommit_after` (120) seconds, and the first in line after
   `overcommit_stuck_after` (1800) seconds while other jobs queue behind it.
   Work for a running stack counts as alone next to it. Work that takes over
   the room its running stack declared for it (not a guess of the history),
   and needs no more than `noise_mem` beyond it, starts so at once only when
   that stack itself started by over-commit: it started over RAM with that
-  room booked. Otherwise the work waits as any other job does. Memory may reach `overcommit_max_macos` or
-  `overcommit_max_linux` (120) percent of RAM, and the part over RAM must
-  fit in half the free swap. macOS compresses cold memory and swaps to files
-  that grow while their volume has space, so there the swap counts that
-  free space too; over RAM costs speed, not processes. Linux has only its
-  swap: with none, nothing starts over RAM. Never at critical pressure, and
-  on Linux never at `pressure_max`. A second stack next to a running one
-  still waits. On Linux a job that starts over RAM, by this rule, by `--st`
-  or by hand, gets `oom_score_adj` 800: when memory runs out, the OOM killer
-  takes it, not the browser or the agents that ran first. `taskguard top`
-  marks it `OVER`, `taskguard status` `OVER-RAM`. `overcommit = false` turns
-  it off.
+  room booked. Otherwise the work waits as any other job does. Memory may
+  reach `overcommit_max_macos` or `overcommit_max_linux` (120) percent of
+  RAM, and the part over RAM must fit in half the free swap. macOS
+  compresses cold memory and swaps to files that grow while their volume has
+  space, so there the swap counts that free space too; over RAM costs speed,
+  not processes. Linux has only its swap: with none, nothing starts over
+  RAM. Never at critical pressure, and on Linux never at `pressure_max`. A
+  second stack next to a running one still waits. On Linux a job that starts
+  over RAM, by this rule, by `--st` or by hand, gets `oom_score_adj` 800:
+  when memory runs out, the OOM killer takes it, not the browser or the
+  agents that ran first. `taskguard top` marks it `OVER`, `taskguard status`
+  `OVER-RAM`. `overcommit = false` turns it off.
 - **A long wait for memory says who holds it.** A job that has waited five
   minutes for memory with nothing of taskguard's running gets a line in
   `taskguard top` and `taskguard status` that names the programs outside

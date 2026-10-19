@@ -182,10 +182,11 @@ pub struct Config {
     pub partial_fit: f64,
     /// A job that only memory keeps out may start over RAM: the only job in
     /// the queue after `overcommit_after` seconds, the first in line after
-    /// `overcommit_stuck_after`, with nothing of taskguard's running; and
-    /// work for a running long-lived job at once. Never at critical pressure,
-    /// up to `overcommit_max_*` of RAM on this OS, and over RAM only into
-    /// half the free swap (see `queue::overcommit_ceiling`).
+    /// `overcommit_stuck_after`, with nothing of taskguard's running but the
+    /// long-lived job it is work for (see `Room::overcommit` for work that
+    /// inherits its stack's over-commit). Never at critical pressure, up to
+    /// `overcommit_max_*` of RAM on this OS, and over RAM only into half the
+    /// free swap (see `queue::overcommit_ceiling`).
     pub overcommit: bool,
     pub overcommit_after: f64,
     pub overcommit_stuck_after: f64,
