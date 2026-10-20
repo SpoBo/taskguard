@@ -10,51 +10,7 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
-## [0.11.0-rc.3] - 2026-10-19
-
-### Added
-
-- Over-commit for a lone job (`overcommit`, on by default). A job that only
-  programs outside taskguard keep out, with nothing of taskguard's running,
-  may start with memory over RAM: as the only job in the queue after
-  `overcommit_after` (120) seconds, or as the first in line after
-  `overcommit_stuck_after` (1800) seconds while other jobs queue too. Work
-  for a running stack counts as alone next to it. Work that takes over the
-  room a stack declared for it starts so at once only when that stack itself
-  started by over-commit; otherwise it waits as any other job. Never at
-  critical pressure (on Linux, never at `pressure_max`), up to
-  `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM, and
-  with the part over RAM in at most half the free swap; on macOS the swap
-  counts the free space of the volume its swap files grow on.
-  `overcommit = false` turns it off.
-- On Linux a job that starts with memory over RAM (by over-commit, by `--st`,
-  or by hand) is the OOM killer's first pick: its processes get
-  `oom_score_adj` 800.
-- `taskguard top` and `taskguard status` mark a job that started over RAM
-  (`OVER`, `OVER-RAM`), and a job that has waited five minutes for memory
-  with nothing of taskguard's running gets a line that names the programs
-  outside taskguard that hold it, how far it is short, and when or how it
-  starts. The memory rule of the Why panel shows a waiting stack's own need
-  and what it books for its work apart, and how much of what running jobs
-  hold back is booked for work their stacks expect.
-
-### Fixed
-
-- A lone job, such as a dev stack that books its browser run, no longer
-  waits for ever when only programs outside taskguard keep it out.
-- The wait text measures the gap of the first job in line against the
-  ceiling it really waits for, all of RAM with nothing of taskguard's
-  running, not `mem_max`: a lone stack at 18.5 GB held outside taskguard on
-  a 32 GB Mac is 307 MB short, where it said 1.9 GB.
-
-## [0.11.0-rc.2] - 2026-10-17
-
-### Added
-
-- `taskguard top` shows its version at the right of the key bar, in the
-  room the keys leave: `taskguard VERSION`, or `vVERSION` when narrow.
-
-## [0.11.0-rc.1] - 2026-10-16
+## [0.11.0] - 2026-10-20
 
 ### Added
 
@@ -97,6 +53,31 @@ and the versions follow [semver](https://semver.org).
   expects work, declared or from its history, waits that long before it
   starts for the work to queue, so a stack and a run started together start
   with room for both. A stack that expects nothing starts at once.
+- `taskguard top` shows its version at the right of the key bar, in the
+  room the keys leave: `taskguard VERSION`, or `vVERSION` when narrow.
+- Over-commit for a lone job (`overcommit`, on by default). A job that only
+  programs outside taskguard keep out, with nothing of taskguard's running,
+  may start with memory over RAM: as the only job in the queue after
+  `overcommit_after` (120) seconds, or as the first in line after
+  `overcommit_stuck_after` (1800) seconds while other jobs queue too. Work
+  for a running stack counts as alone next to it. Work that takes over the
+  room a stack declared for it starts so at once only when that stack itself
+  started by over-commit; otherwise it waits as any other job. Never at
+  critical pressure (on Linux, never at `pressure_max`), up to
+  `overcommit_max_macos` / `overcommit_max_linux` (120) percent of RAM, and
+  with the part over RAM in at most half the free swap; on macOS the swap
+  counts the free space of the volume its swap files grow on.
+  `overcommit = false` turns it off.
+- On Linux a job that starts with memory over RAM (by over-commit, by `--st`,
+  or by hand) is the OOM killer's first pick: its processes get
+  `oom_score_adj` 800.
+- `taskguard top` and `taskguard status` mark a job that started over RAM
+  (`OVER`, `OVER-RAM`), and a job that has waited five minutes for memory
+  with nothing of taskguard's running gets a line that names the programs
+  outside taskguard that hold it, how far it is short, and when or how it
+  starts. The memory rule of the Why panel shows a waiting stack's own need
+  and what it books for its work apart, and how much of what running jobs
+  hold back is booked for work their stacks expect.
 
 ### Changed
 
@@ -129,6 +110,12 @@ and the versions follow [semver](https://semver.org).
   (92% by default), as with `mem_max = 95`. It capped memory at `pause_at`,
   under the limit, so it could never let a job start; the cap is now
   halfway from `mem_max` to all of RAM in that case.
+- A lone job, such as a dev stack that books its browser run, no longer
+  waits for ever when only programs outside taskguard keep it out.
+- The wait text measures the gap of the first job in line against the
+  ceiling it really waits for, all of RAM with nothing of taskguard's
+  running, not `mem_max`: a lone stack at 18.5 GB held outside taskguard on
+  a 32 GB Mac is 307 MB short, where it said 1.9 GB.
 
 ## [0.10.0] - 2026-10-16
 
@@ -444,10 +431,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.11.0-rc.3...HEAD
-[0.11.0-rc.3]: https://github.com/SpoBo/taskguard/compare/v0.11.0-rc.2...v0.11.0-rc.3
-[0.11.0-rc.2]: https://github.com/SpoBo/taskguard/compare/v0.11.0-rc.1...v0.11.0-rc.2
-[0.11.0-rc.1]: https://github.com/SpoBo/taskguard/compare/v0.10.0...v0.11.0-rc.1
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/SpoBo/taskguard/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/SpoBo/taskguard/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/SpoBo/taskguard/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/SpoBo/taskguard/compare/v0.7.1...v0.8.0
