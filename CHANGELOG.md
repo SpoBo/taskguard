@@ -16,6 +16,15 @@ and the versions follow [semver](https://semver.org).
   pool or command that was starved of memory does not add 25% to its next
   need. A `[[job]]` rule wins over its pool. `boost_runs = 0` still turns the
   boost off for every job.
+- A running job past its peak keeps promised only what its past runs still
+  reached from its age on, plus 15%, not its whole peak until it ends
+  (`reserve = "remaining"`, the default; `reserve = "peak"` keeps the old
+  rule). Each run records that curve in a new column, `runs.reach`; a job
+  counts it once three runs have one. A run that goes above it, or runs
+  longer than any of them, books its whole need again for the rest of the
+  run. `taskguard status` marks such a job PAST-PEAK or ABOVE-CURVE, and the
+  dashboard says why. On 48 hours of real samples the memory reserved fell by
+  17%, and 0.9% of runs went above their curve.
 
 ### Fixed
 
@@ -32,7 +41,6 @@ and the versions follow [semver](https://semver.org).
   job, so it no longer boosts the next stack's need by 25%. On one machine
   124 of 300 stack runs were marked starved by pressure that came from the
   other jobs.
-
 - A run's memory peak is what its processes hold themselves: physical
   footprint on macOS, PSS on Linux. The kernel's peak resident size, which
   also counts mapped files and binaries, no longer raises it; it only

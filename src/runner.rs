@@ -9,6 +9,7 @@ use crate::machine;
 use crate::matcher;
 use crate::need;
 use crate::queue::{self, Decision, Entry, Queue};
+use crate::reach;
 use crate::report::{self, Lines, say};
 use crate::sys;
 use anyhow::{Context, Result, bail};
@@ -147,6 +148,7 @@ fn apply_nudge(me: &mut Entry, n: &queue::Nudge, database: Option<&Db>) {
         Some(format!("set by hand to {cpu:.1} cores, {} (was {:.1} cores, {})", report::gb(mem), me.need_cpu, report::gb(me.need_mem_kb)));
     me.need_cpu = cpu;
     me.need_mem_kb = mem;
+    me.reach_flat_kb = None;
     // The job's needs are now known: no estimate, no learn stagger.
     me.known = true;
     if let Some(d) = database {
@@ -845,6 +847,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let mut last_mem_kb = 0u64;
     let mut seen_peak_kb = 0u64;
     let long = startup.map(|startup| queue::LongLived { startup, steady_mem_kb: learned.steady_mem_kb });
+    // What its past runs still reached from each age on, when they say so.
+    let envelope = learned.envelope.as_ref().filter(|_| cfg.reserve == config::Reserve::Remaining);
+    // This run's readings, for its own curve: of its start-up, for a
+    // long-lived job.
+    let mut readings: Vec<(f64, u64)> = Vec::new();
     // Seconds paused before a long-lived job left its start-up.
     let mut paused_before_steady = 0.0;
     let mut int_seen: Option<f64> = None;
@@ -944,8 +951,24 @@ pub fn run(mut o: Opts) -> Result<i32> {
                     me.mem_grew_at = Some(now);
                 }
                 seen_peak_kb = seen_peak_kb.max(r.mem_kb);
+                let age = now - started - me.paused_s;
+                if !me.steady() {
+                    readings.push((age, r.mem_kb));
+                }
+                // The needs follow the peak from the whole need, then the
+                // curve of the past runs may lower it.
+                me.need_mem_kb = me.reach_flat_kb.unwrap_or(me.need_mem_kb);
                 let (peak_cpu, peak_mem) = (me.need_cpu, me.need_mem_kb);
                 me.follow(r.mem_kb, r.used_recent, sys::ncpu() as f64, now, long);
+                if me.reach(me.need_mem_kb, envelope.and_then(|e| e.need_at(age))) && !o.quiet {
+                    say(&format!(
+                        "above its curve {} - it holds {}, more than its past runs still reached at {}; it books its whole need, {}, until it ends",
+                        me.key,
+                        report::gb(r.mem_kb),
+                        report::dur(age),
+                        report::gb(me.need_mem_kb)
+                    ));
+                }
                 if me.steady_since == Some(now) {
                     tracker.steady_from(now, r.mem_kb);
                     paused_before_steady = me.paused_s;
@@ -1067,6 +1090,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 steady: tracker.steady(ended, me.paused_s - paused_before_steady),
                 nested_jobs,
                 startup_mem_kb: startup.map(|_| tracker.startup_peak()),
+                // A long-lived job's curve covers its start-up only.
+                reach: reach::Curve::from_samples(&readings, if me.steady() { startup.unwrap_or(wall).min(wall) } else { wall }),
             },
         );
     }

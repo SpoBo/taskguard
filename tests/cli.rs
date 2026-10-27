@@ -619,10 +619,21 @@ fn a_long_lived_job_holds_its_peak_only_through_its_start_up() {
 
 /// Not a test of its own: other tests run this binary with `TG_TEST_HOLD`
 /// set to `MB:SECONDS,MB:SECONDS...`, and then it holds that much memory of
-/// its own for that long, step by step.
+/// its own for that long, step by step. Each step runs in a process of its
+/// own: macOS's allocator keeps a freed block, so a step that holds less
+/// would not show it.
 #[test]
 fn helper_holds_memory() {
     let Ok(steps) = std::env::var("TG_TEST_HOLD") else { return };
+    if steps.contains(',') {
+        for step in steps.split(',') {
+            let me = std::env::current_exe().unwrap();
+            let st =
+                Command::new(me).args(["helper_holds_memory", "--exact", "--test-threads=1"]).env("TG_TEST_HOLD", step).status().unwrap();
+            assert!(st.success());
+        }
+        return;
+    }
     for step in steps.split(',') {
         let (mb, secs) = step.split_once(':').unwrap();
         let mut held = vec![0u8; mb.parse::<usize>().unwrap() << 20];
@@ -654,6 +665,60 @@ fn a_stack_that_grows_after_its_start_up_is_admitted_against_its_start_up_peak()
     let dump: serde_json::Value = serde_json::from_slice(&e.run(&["dump", "stack"]).stdout).unwrap();
     let next = dump["jobs"][0]["next_need"]["mem_kb"].as_i64().unwrap();
     assert_eq!(next, startup, "the next run is admitted against the start-up peak, not the {peak} kB it grew to");
+}
+
+/// #7: a job past the peak of its past runs books what they still reached
+/// from its age on; with `reserve = "peak"` it keeps its whole peak booked.
+#[test]
+fn a_running_job_past_its_peak_books_only_what_its_past_runs_still_reached() {
+    let remaining = Env::new("sample_every = 0.2\n");
+    let peak = Env::new("sample_every = 0.2\nreserve = \"peak\"\n");
+    for e in [&remaining, &peak] {
+        // Three runs: 160 MB for 2 s, then 20 MB.
+        for _ in 0..3 {
+            let out = holding(e, &["--key", "ci"], "160:2,20:1");
+            assert!(out.status.success(), "{}", stderr(&out));
+        }
+        let curves: Vec<String> =
+            e.db().prepare("SELECT reach FROM runs").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+        for c in &curves {
+            let c: serde_json::Value = serde_json::from_str(c).unwrap();
+            let p = c["p"].as_array().unwrap();
+            let (top, rest) = (p[0][1].as_u64().unwrap(), p.last().unwrap()[1].as_u64().unwrap());
+            assert!(top > 150 << 10 && rest < 80 << 10, "each run records the most it still reached from each moment on: {c}");
+        }
+        // The curve is widened by at least 10 s; as if the runs went on idle
+        // for minutes, so a run 13 s in is still within them.
+        e.db().execute("UPDATE runs SET reach = json_set(reach, '$.d', 600.0)", []).unwrap();
+    }
+    let hold = |e: &Env| {
+        let me = std::env::current_exe().unwrap();
+        e.cmd(&["--key", "ci", "--", me.to_str().unwrap(), "helper_holds_memory", "--exact", "--test-threads=1"])
+            .env("TG_TEST_HOLD", "20:15")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let (a, b) = (hold(&remaining), hold(&peak));
+    let t = Instant::now();
+    let lowered = loop {
+        let r = running_job(&remaining);
+        if let Some(r) = r.filter(|r| !r["reach_flat_kb"].is_null()) {
+            break r;
+        }
+        assert!(t.elapsed() < Duration::from_secs(16), "the need never fell: {:?}", running_job(&remaining));
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let (need, flat) = (lowered["need_mem_kb"].as_u64().unwrap(), lowered["reach_flat_kb"].as_u64().unwrap());
+    assert!(flat > 150 << 10 && need < 80 << 10, "it books {need} kB, not its peak of {flat} kB");
+    let status = String::from_utf8_lossy(&remaining.run(&["status"]).stdout).into_owned();
+    assert!(status.contains("PAST-PEAK"), "{status}");
+    let kept = running_job(&peak).unwrap();
+    assert!(kept["reach_flat_kb"].is_null() && kept["need_mem_kb"].as_u64().unwrap() > 150 << 10, "{kept}");
+    for c in [a, b] {
+        assert!(c.wait_with_output().unwrap().status.success());
+    }
 }
 
 #[test]

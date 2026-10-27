@@ -928,6 +928,15 @@ fn queue(f: &mut Frame, app: &mut App, area: Rect) {
         if e.now {
             lines.push(Line::raw("it skipped the queue (--now); it is measured like any other job"));
         }
+        if let Some(flat) = e.reach_flat_kb {
+            lines.push(Line::raw(format!(
+                "past its peak: its past runs reached at most {} from here on, so it books that, not {}",
+                gb(e.need_mem_kb),
+                gb(flat)
+            )));
+        } else if e.reach_missed {
+            lines.push(Line::raw("it went above what its past runs reached at its age, so it books its whole need until it ends"));
+        }
         if e.over_ram {
             lines.push(Line::styled(
                 format!(

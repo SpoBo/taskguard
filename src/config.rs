@@ -58,6 +58,7 @@ pub struct Layer {
     pub overcommit_stuck_after: Option<f64>,
     pub overcommit_max_macos: Option<f64>,
     pub overcommit_max_linux: Option<f64>,
+    pub reserve: Option<Reserve>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -117,6 +118,16 @@ pub struct Pool {
     pub long_lived: bool,
     pub startup: Option<u64>,
     pub boost: Option<bool>,
+}
+
+/// What a running job reserves to grow into (`reserve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reserve {
+    /// Its whole need, the peak of its history, until it ends.
+    Peak,
+    /// The most its past runs still reached from its age on: see `reach`.
+    Remaining,
 }
 
 /// Seconds a long-lived job holds its start-up peak when no `startup` is set.
@@ -196,6 +207,9 @@ pub struct Config {
     pub overcommit_stuck_after: f64,
     pub overcommit_max_macos: f64,
     pub overcommit_max_linux: f64,
+    /// What a running job reserves: its whole need, or what its past runs
+    /// say it can still reach (see `reach`).
+    pub reserve: Reserve,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -254,6 +268,7 @@ impl Default for Config {
             overcommit_stuck_after: 1800.0,
             overcommit_max_macos: 120.0,
             overcommit_max_linux: 120.0,
+            reserve: Reserve::Remaining,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -704,6 +719,7 @@ impl Config {
         set!(overcommit_stuck_after);
         set!(overcommit_max_macos);
         set!(overcommit_max_linux);
+        set!(reserve);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);

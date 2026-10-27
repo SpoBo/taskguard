@@ -130,6 +130,13 @@ pub struct Entry {
     /// hand. Work that takes over what it declared for it inherits that.
     /// Older versions leave it out.
     pub overcommitted: bool,
+    /// While its past runs say it can no longer reach its whole need: that
+    /// whole need, which `need_mem_kb` is lowered from (`Entry::reach`).
+    /// Older versions leave it out, and read the lowered need.
+    pub reach_flat_kb: Option<u64>,
+    /// It went above what its past runs reached at its age: it books its
+    /// whole need for the rest of its run. Older versions leave it out.
+    pub reach_missed: bool,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -333,6 +340,34 @@ impl Entry {
             self.need_mem_kb = mem_kb + mem_kb / 4;
         } else if used_recent > self.need_cpu {
             self.need_cpu = used_recent.min(ncpu);
+        }
+    }
+}
+
+impl Entry {
+    /// Lower a running job's memory need to `can_reach`, the most its past
+    /// runs still reached from its age on (`reach::Envelope::need_at`),
+    /// never above `flat`, the need it would book by its peak. Once it holds
+    /// more than that, it books `flat` for the rest of its run. A steady
+    /// long-lived job and needs set by hand are left alone. Returns true when
+    /// the job has just gone above it.
+    pub fn reach(&mut self, flat: u64, can_reach: Option<u64>) -> bool {
+        self.need_mem_kb = flat;
+        self.reach_flat_kb = None;
+        if self.reach_missed || self.steady() || self.by_hand.is_some() {
+            return false;
+        }
+        match can_reach {
+            Some(r) if self.live_mem_kb > r => {
+                self.reach_missed = true;
+                true
+            }
+            Some(r) if r < flat => {
+                self.need_mem_kb = r;
+                self.reach_flat_kb = Some(flat);
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -2046,6 +2081,65 @@ mod tests {
         let big = job(1, "big", 64.0, 500);
         assert_eq!(blockers(decide(&machine(12.0, 31), &LIM, &[], std::slice::from_ref(&big), &big, 1000.0, &[])), vec!["memory"]);
         assert!(blockers(decide(&machine(0.0, 1), &LIM, &[], &[big.clone(), young.clone()], &young, 1000.0, &[])).is_empty());
+    }
+
+    /// Three past runs of a `ci` job on a 32 GB machine: 2 GB, an 18 GB peak
+    /// from 40 s to 70 s, then 2 GB again until it ends at 300 s.
+    fn ci_envelope() -> crate::reach::Envelope {
+        let run = |shift: f64| -> Vec<(f64, u64)> {
+            (0..=150)
+                .map(|i| i as f64 * 2.0)
+                .map(|t| (t, if (40.0 + shift..=70.0 + shift).contains(&t) { 18 * GB } else { 2 * GB }))
+                .collect()
+        };
+        let curves = [0.0, 6.0, -6.0].iter().map(|s| crate::reach::Curve::from_samples(&run(*s), 300.0).unwrap()).collect();
+        crate::reach::Envelope::of(curves, 3).unwrap()
+    }
+
+    /// #7: a job past its peak books what its past runs still reached from
+    /// its age on, not its whole peak, so a waiting job starts. Before its
+    /// peak, and after it went above the curve, it books its whole need.
+    #[test]
+    fn a_job_past_its_peak_reserves_only_what_it_can_still_reach() {
+        let env = ci_envelope();
+        let mut ci = Entry { started_at: Some(1000.0), ..job(1, "ci", 2.0, 18) };
+        let test = job(2, "test", 1.0, 8);
+        let at = |ci: &mut Entry, age: f64, live_gb: u64| {
+            ci.live_mem_kb = live_gb * GB;
+            let flat = ci.reach_flat_kb.unwrap_or(ci.need_mem_kb);
+            ci.reach(flat, env.need_at(age))
+        };
+        let waits = |ci: &Entry| {
+            blockers(decide(&machine(1.0, 6), &LIM, std::slice::from_ref(ci), std::slice::from_ref(&test), &test, 1000.0, &[]))
+        };
+        // At 20 s its peak is still to come: 6 + 16 reserved + 8 > 27.2 GB.
+        assert!(!at(&mut ci, 20.0, 2));
+        assert_eq!(ci.need_mem_kb, 18 * GB);
+        assert_eq!(waits(&ci), vec!["memory"]);
+        // At 120 s its past runs reached 2 GB at most: it books 2.3 GB.
+        assert!(!at(&mut ci, 120.0, 2));
+        assert_eq!((ci.need_mem_kb, ci.reach_flat_kb), ((2.0 * GB as f64 * crate::reach::MARGIN) as u64, Some(18 * GB)));
+        assert_eq!(waits(&ci), Vec::<&str>::new(), "the test starts");
+        // It goes above that curve: its whole need again, for the rest of the run.
+        assert!(at(&mut ci, 140.0, 5), "it just went above the curve");
+        assert_eq!((ci.need_mem_kb, ci.reach_flat_kb, ci.reach_missed), (18 * GB, None, true));
+        assert!(!at(&mut ci, 200.0, 2));
+        assert_eq!(ci.need_mem_kb, 18 * GB);
+        // Past the end of its past runs, too.
+        let mut late = Entry { started_at: Some(1000.0), ..job(1, "ci", 2.0, 18) };
+        at(&mut late, 400.0, 2);
+        assert_eq!(late.need_mem_kb, 18 * GB);
+    }
+
+    #[test]
+    fn a_steady_stack_and_needs_set_by_hand_ignore_the_curve() {
+        let env = ci_envelope();
+        let mut by_hand = Entry { started_at: Some(1000.0), by_hand: Some("set by hand".into()), ..job(1, "ci", 2.0, 18) };
+        by_hand.reach(18 * GB, env.need_at(120.0));
+        assert_eq!(by_hand.need_mem_kb, 18 * GB);
+        let mut steady = Entry { started_at: Some(1000.0), steady_since: Some(1300.0), ..job(1, "stack", 2.0, 5) };
+        steady.reach(5 * GB, env.need_at(120.0));
+        assert_eq!(steady.need_mem_kb, 5 * GB, "a steady stack books what it holds plus a quarter, as before");
     }
 
     #[test]

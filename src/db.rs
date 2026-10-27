@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS runs (
   steady_mem_kb INTEGER,
   nested_jobs INTEGER,
   need_why TEXT,
-  startup_mem_kb INTEGER
+  startup_mem_kb INTEGER,
+  reach TEXT
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -182,6 +183,7 @@ CREATE TABLE IF NOT EXISTS pruned_runs (
   nested_jobs INTEGER,
   need_why TEXT,
   startup_mem_kb INTEGER,
+  reach TEXT,
   pruned_at REAL NOT NULL,
   prune_reason TEXT NOT NULL
 );
@@ -193,7 +195,7 @@ CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
 const RUN_COLUMNS: &str = "id, ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, started_at, ended_at, exit,
   waited_s, main_blocker, now, min_cpu, min_mem_kb, need_cpu, need_mem_kb, peak_mem_kb, cores_used, cores_wanted, cpu_seconds,
   runnable_seconds, pageins, starved, starved_detail, machine_full_frac, imported, paused_s, package, steady_cores_wanted,
-  steady_mem_kb, nested_jobs, need_why, startup_mem_kb";
+  steady_mem_kb, nested_jobs, need_why, startup_mem_kb, reach";
 
 /// A run whose first sample came this soon after its start has its samples
 /// from the start: the samples older than the retention window are gone.
@@ -255,6 +257,9 @@ pub struct Learned {
     /// The most taskguard jobs one of the recent runs started inside itself,
     /// when any did: the command wraps other taskguard jobs. None otherwise.
     pub nested_jobs: Option<u64>,
+    /// The curves of the recent runs: what a running job can still reach
+    /// (`reserve = "remaining"`). None with too few recorded.
+    pub envelope: Option<crate::reach::Envelope>,
 }
 
 /// A run starved of memory raises the need when its peak reached this share
@@ -553,6 +558,9 @@ pub struct RunResult {
     /// A long-lived job: its memory peak during its start-up, which its
     /// next run is admitted against. None for other jobs.
     pub startup_mem_kb: Option<u64>,
+    /// The highest memory it reached from each moment of its run on; for a
+    /// long-lived job, of its start-up only.
+    pub reach: Option<crate::reach::Curve>,
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -620,8 +628,9 @@ impl Db {
         // Databases made before wrapper jobs were learned: how many taskguard
         // jobs a run started inside itself. Both tables, so a prune keeps it.
         // And how the need a run started with was made, as JSON (`need::Need`).
-        // And, for a long-lived job, its memory peak during its start-up.
-        for (col, kind) in [("nested_jobs", "INTEGER"), ("need_why", "TEXT"), ("startup_mem_kb", "INTEGER")] {
+        // And, for a long-lived job, its memory peak during its start-up. And
+        // the highest memory it reached from each moment on (`reach::Curve`).
+        for (col, kind) in [("nested_jobs", "INTEGER"), ("need_why", "TEXT"), ("startup_mem_kb", "INTEGER"), ("reach", "TEXT")] {
             for table in ["runs", "pruned_runs"] {
                 let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"))?.exists([])?;
                 if !has {
@@ -640,18 +649,18 @@ impl Db {
         let (keep, boost_runs) = (rules.keep, rules.boost_runs);
         let mut stmt = self.conn.prepare_cached(
             "SELECT coalesce(startup_mem_kb, peak_mem_kb), coalesce(cores_used, cores_wanted), ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb,
-                    steady_cores_wanted, id, ended_at, exit, need_mem_kb, nested_jobs
+                    steady_cores_wanted, id, ended_at, exit, need_mem_kb, nested_jobs, reach
              FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC, id DESC LIMIT ?2",
         )?;
         // peak memory, cores used, duration, starved, after the start-up: memory peak and cores wanted,
-        // then the memory need it started with and the jobs nested inside it
-        type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>, Option<i64>, Option<i64>);
+        // then the memory need it started with, the jobs nested inside it, and its curve
+        type Row = (i64, Option<f64>, Option<f64>, Option<String>, Option<i64>, Option<f64>, Option<i64>, Option<i64>, Option<String>);
         let rows: Vec<(Row, Outlier)> = stmt
             .query_map(params![key, keep.max(boost_runs) as i64], |r| {
                 let peak: i64 = r.get(0)?;
                 let run = Outlier { run_id: r.get(6)?, peak_kb: peak as u64, ended_at: r.get(7)?, exit: r.get(8)? };
-                Ok(((peak, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(9)?, r.get(10)?), run))
+                Ok(((peak, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(9)?, r.get(10)?, r.get(11)?), run))
             })?
             .collect::<std::result::Result<_, _>>()?;
         let (rows, runs): (Vec<Row>, Vec<Outlier>) = rows.into_iter().unzip();
@@ -694,6 +703,17 @@ impl Db {
         let steady_mem_kb = recent.iter().filter_map(|r| r.4).max().map(|m| m as u64);
         let steady_cpu = median_of(recent.iter().filter_map(|r| r.5).collect());
         let nested_jobs = recent.iter().filter_map(|r| r.7).filter(|n| *n > 0).max().map(|n| n as u64);
+        // A run with no curve, from before curves or an older version,
+        // counts at its peak for its whole length.
+        let curves: Vec<(crate::reach::Curve, bool)> = recent
+            .iter()
+            .map(|r| match r.8.as_deref().and_then(|j| serde_json::from_str(j).ok()) {
+                Some(c) => (c, true),
+                None => (crate::reach::Curve::flat(r.0 as u64, r.2.unwrap_or(f64::MAX)), false),
+            })
+            .collect();
+        let recorded = curves.iter().filter(|c| c.1).count();
+        let envelope = crate::reach::Envelope::of(curves.into_iter().map(|c| c.0).collect(), recorded);
         Ok(Learned {
             runs: recent.len(),
             mem_kb: mem,
@@ -705,6 +725,7 @@ impl Db {
             steady_mem_kb,
             steady_cpu,
             nested_jobs,
+            envelope,
         })
     }
 
@@ -960,7 +981,7 @@ impl Db {
             "UPDATE runs SET ended_at = ?2, exit = ?3, peak_mem_kb = ?4, cores_used = ?5, cores_wanted = ?6,
                 cpu_seconds = ?7, runnable_seconds = ?8, pageins = ?9, starved = ?10, starved_detail = ?11,
                 machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15, nested_jobs = ?16,
-                startup_mem_kb = ?17
+                startup_mem_kb = ?17, reach = ?18
              WHERE id = ?1",
             params![
                 id,
@@ -979,7 +1000,8 @@ impl Db {
                 r.steady.filter(|_| r.measured).map(|s| s.0),
                 r.steady.filter(|_| r.measured).map(|s| s.1 as i64),
                 r.nested_jobs as i64,
-                r.startup_mem_kb.filter(|_| r.measured).map(|m| m as i64)
+                r.startup_mem_kb.filter(|_| r.measured).map(|m| m as i64),
+                r.reach.as_ref().filter(|_| r.measured).and_then(|c| serde_json::to_string(c).ok())
             ],
         )?;
         Ok(())

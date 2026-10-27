@@ -16,6 +16,7 @@ mod machine;
 mod matcher;
 mod need;
 mod queue;
+mod reach;
 mod recorder;
 mod report;
 mod runner;

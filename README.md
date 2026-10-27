@@ -121,7 +121,20 @@ below).
   fills every core. Memory is checked for every job.
 - **"Promised" is the growth still to come.** A compile that sits at 2 GB
   but peaked at 20 GB last time still has 18 GB to take. Without this, a second
-  job is started into space the first one is about to use.
+  job is started into space the first one is about to use. Once a job is past
+  the point where its past runs peaked, it is promised only what they still
+  reached from its age on (`reserve = "remaining"`, the default): each run
+  records the most memory it reached from each moment on, and a running job
+  books the highest of its recent runs from a little before its age on
+  (a fifth of its age earlier, at least 10 s), plus 15%. A compile that peaked
+  at 20 GB in its first minute and sits at 2 GB for the next four stops
+  holding 18 GB for the rest. It counts once three runs have such a record.
+  A run that goes above it, or runs longer than any of them, books its whole
+  need again at once, for the rest of the run. On 48 hours of real samples
+  this lowered the memory reserved by 17%, and 0.9% of runs went above it, by
+  0.1 GB at the median and 2.2 GB at most. `reserve = "peak"` keeps the whole
+  peak promised until a job ends. A dev stack past its start-up follows what
+  it holds, as before; a need set by hand stays.
 - **The machine readings count everything.** Your browser and your editor
   count too, not only jobs that taskguard started.
 - **A little short is close enough.** A job short of memory by at most
@@ -675,6 +688,7 @@ max_backfill = 600     # small jobs pass a stuck job this long, then the machine
 expect_wait = 5        # a dev stack waits this long for the work it expects to queue
 infer_work = true      # a dev stack books the work its history says follows it
 overcommit = true      # a lone job that only other programs keep out starts over RAM after a while
+reserve = "remaining"  # a running job past its peak books what its past runs still reached; "peak" = its whole peak
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -829,7 +843,11 @@ Versions up to 0.11.0 do not keep a long-lived job's start-up peak apart
 (`runs.startup_mem_kb`): they admit a stack against the whole-run peaks
 of its history, so they book more for it, and a stack run they ran counts
 with its whole-run peak in every version. They ignore `boost = false` and
-still let memory pressure boost a stack.
+still let memory pressure boost a stack. Nor do they know `reserve`: their
+jobs keep their whole peak promised, they do not record a run's curve
+(`runs.reach`), and a run they ran counts at its peak for its whole length.
+Their waiting jobs do read the lower need a newer version books for a job
+past its peak.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not
