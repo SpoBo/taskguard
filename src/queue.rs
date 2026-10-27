@@ -2899,6 +2899,40 @@ mod tests {
         assert!(blockers(decide(&machine(1.0, 15), &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
     }
 
+    /// #27, with its numbers: 10 cores, 32 GB, mem_max 90 (28.8 GB). Programs
+    /// outside taskguard held 17.4 GB; the stack needs 9.2 GB, its proof job
+    /// 4.0 GB. The stack alone fit and started, and then held 7.3 GB idle for
+    /// 39 minutes while its proof job waited, 1.8 GB short. Once the stack
+    /// expects the proof job, declared or from its history, it does not start
+    /// for a job that cannot; when it does start, its proof job does too.
+    #[test]
+    fn a_stack_is_not_started_for_a_proof_job_that_cannot_start() {
+        let lim = Limits { mem_max_pct: 90.0, outside_mem_max_pct: crate::commands::outside_ceiling(90.0, 92.0), ..LIM };
+        let alone = Entry { long_lived: true, priority: 10, need_mem_kb: 92 * GB / 10, ..job(2, "dev-env:stack", 3.0, 0) };
+        let mut stack = Entry { pid: 11, ..expecting(alone.clone()) };
+        stack.expects[0].mem_kb = 4 * GB;
+        let m = MachineSample::fixed(1.0, 10, 174 * GB / 10, 32 * GB);
+        // A small job of taskguard's runs, holding what it needs.
+        let busy = [Entry { started_at: Some(990.0), live_mem_kb: GB / 2, ..job(5, "lint", 1.0, 0) }];
+        // Before: the stack alone fits (26.6 of 28.8 GB) and starts.
+        assert!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&alone), &alone, 1000.0, &[])).is_empty());
+        // Expecting its proof job it waits: 30.6 GB, over 28.8 and over the
+        // 29.4 GB that outside_admit allows when only other programs keep it out.
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])), vec!["memory"]);
+        // With 2 GB more free, the stack and its booked run fit together.
+        let freer = MachineSample::fixed(1.0, 10, 154 * GB / 10, 32 * GB);
+        assert!(blockers(decide(&freer, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+        // With nothing of taskguard's running, the pair may start up to all of
+        // RAM; then, with the stack steady at 7.3 GB (24.7 GB held, as in the
+        // issue), its proof job is the first in line and starts too.
+        assert!(blockers(decide(&m, &lim, &[], std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+        let up = Entry { need_mem_kb: 92 * GB / 10, ..expecting(steady_stack(11, 0)) };
+        let up = Entry { live_mem_kb: 73 * GB / 10, expects: vec![Expect { mem_kb: 4 * GB, ..up.expects[0].clone() }], ..up };
+        let run = Entry { need_mem_kb: 4 * GB, ..run_for(Some(0)) };
+        let held = MachineSample::fixed(1.0, 10, 247 * GB / 10, 32 * GB);
+        assert!(blockers(decide(&held, &lim, std::slice::from_ref(&up), std::slice::from_ref(&run), &run, 3400.0, &[])).is_empty());
+    }
+
     #[test]
     fn a_running_stack_keeps_the_room_for_its_run_until_the_run_starts() {
         let lim = Limits { mem_max_pct: 95.0, ..LIM };
