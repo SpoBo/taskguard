@@ -1004,7 +1004,13 @@ pub fn run(mut o: Opts) -> Result<i32> {
         let _ = d.job_sample(run_id, ended, tail, cpu_left / tail, cpu_left / tail, mem, 0.0);
     }
     tracker.cpu_ns = tracker.cpu_ns.max(ru_cpu_ns);
-    tracker.peak_mem_kb = tracker.peak_mem_kb.max(ru_maxrss_kb);
+    // The kernel's peak is the resident size of the biggest process, which
+    // also counts the pages of the files and binaries it maps: a compiled Bun
+    // host held 3.4 GB resident and 585 MB of its own. So it only stands in
+    // for a job that no sample measured.
+    if tracker.samples == 0 {
+        tracker.peak_mem_kb = ru_maxrss_kb;
+    }
     // Time paused for memory is not part of the run.
     let wall = (wall - me.paused_s).max(0.0);
     let (used, wanted) = tracker.sustained(wall);

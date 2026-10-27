@@ -319,6 +319,42 @@ fn a_job_shorter_than_one_sample_still_shows_its_load() {
     assert!((covered - cpu).abs() < cpu * 0.3, "the samples cover the run's CPU: {covered} of {cpu}");
 }
 
+/// Not a test of its own: `a_mapped_file_is_not_learned_as_memory` runs
+/// this binary with `TG_TEST_MAP` set, and then it maps that file, reads
+/// every page and holds it for a few seconds.
+#[test]
+fn helper_reads_a_mapped_file() {
+    let Some(path) = std::env::var_os("TG_TEST_MAP") else { return };
+    let f = std::fs::File::open(path).unwrap();
+    let len = f.metadata().unwrap().len() as usize;
+    use std::os::fd::AsRawFd;
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0) };
+    assert_ne!(p, libc::MAP_FAILED);
+    let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, len) };
+    let sum: u64 = bytes.iter().step_by(4096).map(|b| *b as u64).sum();
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(sum > 0);
+}
+
+/// macOS charges a process the memory it holds itself (physical footprint),
+/// not the pages of files and binaries it maps, which its resident size
+/// counts: a compiled Bun host held 3.4 GB resident against 585 MB of its
+/// own. On Linux PSS counts mapped pages too, so the test is for macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mapped_file_is_not_learned_as_memory() {
+    let e = Env::new("sample_every = 0.2\n");
+    let file = e.file("mapped");
+    std::fs::write(&file, vec![1u8; 192 << 20]).unwrap();
+    let me = std::env::current_exe().unwrap();
+    let me = me.to_str().unwrap();
+    let mut c = e.cmd(&["--key", "mapped", "--", me, "helper_reads_a_mapped_file", "--exact", "--test-threads=1"]);
+    let out = c.env("TG_TEST_MAP", &file).output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let peak: i64 = e.db().query_row("SELECT peak_mem_kb FROM runs WHERE key = 'mapped'", [], |r| r.get(0)).unwrap();
+    assert!(peak < 64 << 10, "it held {peak} kB of its own, not the 192 MB file it mapped");
+}
+
 #[test]
 fn a_nested_call_runs_inside_the_outer_slot() {
     // Every version sets and honours TASKGUARD_HELD=1, so a nested call from

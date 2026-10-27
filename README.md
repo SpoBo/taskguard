@@ -345,7 +345,10 @@ takes the higher of the two.
 
 Physical footprint is used on macOS because resident size hides compressed
 pages. One measured `tsc` reported 3.8 GB resident while it really held 22 GB.
-All readings are syscalls. They cost microseconds, not the 120 ms per process
+Resident size also counts the pages of files and binaries a process maps:
+a compiled Bun host held 3.4 GB resident and 585 MB of its own. So the
+kernel's peak resident size at the end of a run only stands in for a job
+that ended before its first sample. All readings are syscalls. They cost microseconds, not the 120 ms per process
 of `/usr/bin/footprint`.
 
 The whole process tree is measured, because the memory often lives in a
@@ -704,6 +707,12 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   they may use its CPU. Its memory stays reserved. taskguard also sees a job
   that someone stopped with `kill -STOP` and treats it as paused by hand. It
   cannot see a Ctrl-Z in the terminal: that stops taskguard itself too.
+- On macOS, memory that processes share without a file behind it, such as
+  PostgreSQL's shared buffers, counts once for each process that touched
+  it: the kernel charges it to every footprint, and only root may ask which
+  pages two processes share. On a DALP dev stack with 16 to 28 PostgreSQL
+  processes that is about 0.2 to 0.8 GB of the 3 to 4 GB it reads. Linux splits
+  such pages between the processes (PSS).
 - A job with no history reserves an estimate. A first run far bigger than
   similar jobs can still take more than its estimate before it is learned.
 - An outlier that is real growth is learned late: the next run still

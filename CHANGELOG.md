@@ -10,6 +10,14 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A run's memory peak is what its processes hold themselves: physical
+  footprint on macOS, PSS on Linux. The kernel's peak resident size, which
+  also counts mapped files and binaries, no longer raises it; it only
+  stands in for a job that ended before its first sample. On macOS a
+  compiled Bun host held 3.4 GB resident and 585 MB of its own.
+
 ## [0.11.0] - 2026-10-20
 
 ### Added
