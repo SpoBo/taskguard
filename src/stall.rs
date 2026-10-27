@@ -971,4 +971,67 @@ mod tests {
         // A fifth still waits: admission refuses what does not fit.
         assert_eq!(stacks_started_together(after, 5).0, 4);
     }
+
+    /// Stacks that start one after another, each settled at `held_kb` (and
+    /// booking that plus a quarter) before the next queues, on the same Mac:
+    /// how many run at once.
+    fn stacks_settled_in_turn(need_kb: u64, held_kb: u64, n: usize) -> usize {
+        let lim = Limits {
+            mem_max_pct: 90.0,
+            cpu_max_pct: 150.0,
+            outside_mem_max_pct: crate::commands::outside_ceiling(90.0, 92.0),
+            ..macbook_limits()
+        };
+        let mut running: Vec<Entry> = Vec::new();
+        for i in 0..n {
+            let me = Entry {
+                ticket: i as u64 + 1,
+                pid: 1000 + i as i32,
+                key: "dev-env:stack".into(),
+                pool: Some("stack".into()),
+                checkout: format!("/w/dalp/{i}"),
+                queued_at: 1000.0 * i as f64,
+                need_cpu: 3.0,
+                need_mem_kb: need_kb,
+                known: true,
+                priority: 10,
+                long_lived: true,
+                ..Default::default()
+            };
+            let used = 16 * GB + running.iter().map(|e| e.live_mem_kb).sum::<u64>();
+            let m = MachineSample {
+                cpu_busy: 2.0,
+                ncpu: 16,
+                mem_used_kb: used,
+                mem_total_kb: 64 * GB,
+                mem_pressure: Some(0.0),
+                ..Default::default()
+            };
+            let now = me.queued_at + 1.0;
+            if !matches!(decide(&m, &lim, &running, std::slice::from_ref(&me), &me, now, &[]), Decision::Admit { .. }) {
+                break;
+            }
+            let start = now;
+            running.push(Entry {
+                started_at: Some(start),
+                steady_since: Some(start + 120.0),
+                live_mem_kb: held_kb,
+                need_mem_kb: held_kb * 5 / 4,
+                ..me
+            });
+        }
+        running.len()
+    }
+
+    /// How many settled stacks the 64 GB Mac runs at once: one more than
+    /// 0.11.0 by the start-up peak. Fifteen do not fit by any booking: 15
+    /// stacks holding 4.3 GB each are 64 GB, all of RAM.
+    #[test]
+    fn settled_stacks_on_the_64_gb_mac() {
+        let (before, after) = (stack_need(false), stack_need(true));
+        let held = 43 * GB / 10;
+        let (n_before, n_after) = (stacks_settled_in_turn(before, held, 15), stacks_settled_in_turn(after, held, 15));
+        eprintln!("settled at 4.3 GB: {n_before} stacks by the whole-run peak, {n_after} by the start-up peak");
+        assert_eq!(n_after, n_before + 1);
+    }
 }
