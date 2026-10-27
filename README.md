@@ -202,7 +202,9 @@ below).
   (below) not while it cannot use the room.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
-  has started, except by backfill (below).
+  has started, except by backfill (below). A job whose own pool is full, such
+  as a second stack waiting for the one stack slot, holds nobody back: it
+  could not start in the room it holds.
 - **Part of its CPU need is enough for a job that cannot fit.** A job whose
   CPU need is above the whole limit never fits, and a job that waited past
   `max_bypass` is the one others are held for. Such a job starts on part of
@@ -474,7 +476,9 @@ from the first run, with nothing to learn first.
 Long-running commands are never queued: watch modes, dev servers, `--version`
 and `--help` run straight through (the list is in `src/builtin.rs`). Add your
 own with `passthrough = ["storybook", "my-dev-server"]` in a config file; it
-adds to the built-in list. See `taskguard doctor --explain "COMMAND"`.
+adds to the built-in list. See `taskguard doctor --explain "COMMAND"`. An
+explicit `--id` or `-j` asks for a slot and beats the list:
+`taskguard --id stack -- devenv up` queues.
 
 ### What a waiting job prints
 

@@ -1196,22 +1196,27 @@ pub fn decide(
     // behind it that fit gains it nothing, and on Omarchy one such job kept
     // two dozen others out for half an hour.
     let may_hold = |w: &Entry| room.fits_once_drained(m, lim, running, w);
+    // A job whose own pool is full cannot start, whatever room it holds:
+    // holding others back for it gains nothing.
+    let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
+        (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
+        _ => false,
+    };
     // An older job that newer ones have passed for `max_bypass` goes first.
     // Only a job ahead in line holds `me` back, so a job of an older run is
     // never held back for one of a newer run, or for a job that queued after
     // that run began.
     if let Some(r) = older.iter().find(|w| {
-        w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass && may_hold(w) && (lim.max_backfill <= lim.max_bypass || holds(w))
+        w.bypassed_since.is_some()
+            && now - w.queued_at > lim.max_bypass
+            && !pool_full(w)
+            && may_hold(w)
+            && (lim.max_backfill <= lim.max_bypass || holds(w))
     }) {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
     }
     // A waiting job with a higher priority goes first, unless its own pool is
-    // full: then it cannot start anyway, and holding others back gains nothing.
-    // With backfill on, it holds them back as a reservation does.
-    let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
-        (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
-        _ => false,
-    };
+    // full. With backfill on, it holds them back as a reservation does.
     if let Some(h) =
         older.iter().find(|w| w.priority > me.priority && !pool_full(w) && may_hold(w) && (lim.max_backfill <= 0.0 || holds(w)))
     {
@@ -3810,6 +3815,22 @@ mod tests {
         // A job outside any run is still held back by the reservation.
         let other = job(4, "other", 1.0, 1);
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &[passed, other.clone()], &other, 1000.0, &[])), vec!["reserved"]);
+    }
+
+    /// #4: an e2e run passed for long holds nobody back while its own pool's
+    /// one slot is taken: it could not start in the room it holds.
+    #[test]
+    fn a_reservation_whose_pool_is_full_holds_nobody_back() {
+        let pooled = |e: Entry| Entry { pool_key: Some("e2e@/w".into()), pool_slots: Some(1), ..e };
+        let running = pooled(Entry { started_at: Some(500.0), ..job(1, "e2e:a", 1.0, 2) });
+        let mut passed = pooled(job(2, "e2e:b", 1.0, 2));
+        (passed.queued_at, passed.bypassed_since) = (600.0, Some(610.0));
+        let lint = job(3, "lint", 1.0, 1);
+        let waiting = [passed.clone(), lint.clone()];
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &lint, 1000.0, &[])).is_empty());
+        // Once its slot is free, it holds them back again.
+        let other = job(4, "other", 1.0, 1);
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[other], &waiting, &lint, 1000.0, &[])), vec!["reserved"]);
     }
 
     /// The circle seen with several DALP gates at once, all three jobs fitting:

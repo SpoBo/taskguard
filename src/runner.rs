@@ -326,7 +326,9 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let cfg = Config::load(&cwd, &checkout)?;
     let jkey = o.key.clone().unwrap_or_else(|| key::run_key(&cwd, &o.cmd));
     let cls = cfg.classify(&o.cmd, &jkey)?;
-    if !cfg.enabled || cls.passthrough {
+    // An explicit `--id` or `-j` asks for a slot: it beats the passthrough
+    // list, so `taskguard --id stack -- devenv up` queues.
+    if !cfg.enabled || (cls.passthrough && o.id.is_none() && o.jobs.is_none()) {
         exec(&o.cmd);
     }
     if o.wraps {

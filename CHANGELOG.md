@@ -46,6 +46,13 @@ and the versions follow [semver](https://semver.org).
   also counts mapped files and binaries, no longer raises it; it only
   stands in for a job that ended before its first sample. On macOS a
   compiled Bun host held 3.4 GB resident and 585 MB of its own.
+- A job passed for `max_bypass` no longer holds every newer job back while
+  its own pool is full: a second dev stack waiting for the one stack slot
+  froze all other work until the first stack stopped. A higher priority
+  already skipped such a job.
+- An explicit `--id` or `-j` beats the passthrough list, so
+  `taskguard --id stack -- devenv up` queues instead of running straight
+  through.
 
 ## [0.11.0] - 2026-10-20
 

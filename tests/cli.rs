@@ -224,6 +224,21 @@ fn passthrough_commands_run_straight_through() {
     );
 }
 
+/// #4: `--id` or `-j` asks for a slot, so the command queues even when it is
+/// on the passthrough list (`devenv up` is, for a dev stack).
+#[test]
+fn an_explicit_id_or_slot_count_beats_the_passthrough_list() {
+    let e = Env::new("");
+    for args in [&["--id", "stack"][..], &["-j", "2"][..]] {
+        let mut argv = args.to_vec();
+        argv.extend(["--", "sh", "-c", "exit 0", "sh", "--watch"]);
+        let out = e.run(&argv);
+        assert!(out.status.success(), "{}", stderr(&out));
+    }
+    let runs: i64 = e.db().query_row("SELECT count(*) FROM runs", [], |r| r.get(0)).unwrap();
+    assert_eq!(runs, 2, "both calls queued and ran as jobs");
+}
+
 #[test]
 fn a_run_is_learned_and_explained() {
     let e = Env::new("");
