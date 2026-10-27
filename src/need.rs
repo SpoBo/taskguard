@@ -62,6 +62,8 @@ pub struct Inputs<'a> {
     pub new_job_mem_kb: u64,
     pub keep: usize,
     pub boost_runs: usize,
+    /// The job's `boost` setting: false, and a memory-starved run adds nothing.
+    pub boost: bool,
 }
 
 /// The need a run starts with, and each step that made it.
@@ -73,7 +75,7 @@ pub fn derive(i: &Inputs) -> Need {
         cpu = l.cpu.unwrap_or(0.0);
         mem = l.mem_kb.unwrap_or(0);
         steps.push(Step { step: "history", cpu, mem_kb: mem, why: history_why(l, i.keep, i.history_key) });
-        if l.mem_boosted {
+        if l.mem_boosted && i.boost {
             mem = (mem as f64 * 1.25) as u64;
             steps.push(Step {
                 step: "boost",
@@ -209,7 +211,7 @@ pub fn expected(db: Option<&Db>, cfg: &Config, cwd: &Path, work: &str) -> crate:
     };
     let pool = cls.pool.as_ref().map(|p| p.0.as_str());
     let guess = (learned.runs == 0).then(|| self::guess(db, cfg, None, &argv, cls.label.as_deref(), pool));
-    let need = derive(&inputs(cfg, &learned, Some(&history_key), guess.as_ref(), cls.min_cpu, cls.min_mem_kb));
+    let need = derive(&inputs(cfg, &learned, Some(&history_key), guess.as_ref(), cls.min_cpu, cls.min_mem_kb, cfg.boost(&cls, pool)));
     let from = match need.steps.last() {
         Some(s) => format!("{}: {}", s.step, s.why),
         None => "nothing known".into(),
@@ -230,6 +232,7 @@ pub fn inputs<'a>(
     guess: Option<&'a Guess>,
     min_cpu: Option<f64>,
     min_mem_kb: Option<u64>,
+    boost: bool,
 ) -> Inputs<'a> {
     Inputs {
         learned,
@@ -244,6 +247,7 @@ pub fn inputs<'a>(
         new_job_mem_kb: cfg.new_job_mem_kb,
         keep: cfg.hist_keep,
         boost_runs: cfg.boost_runs,
+        boost,
     }
 }
 
@@ -267,6 +271,7 @@ mod tests {
             new_job_mem_kb: 1536 * 1024,
             keep: 10,
             boost_runs: 5,
+            boost: true,
         }
     }
 
@@ -296,6 +301,15 @@ mod tests {
         assert_eq!(n.cpu, 11.0);
         // The minimum only lifts the capped need, not what was learned (12).
         assert!(!n.raised_by_min);
+    }
+
+    #[test]
+    fn boost_false_leaves_a_starved_run_out_of_the_need() {
+        let l = Learned { runs: 4, mem_kb: Some(8 * GB), cpu: Some(2.0), mem_boosted: true, ..Default::default() };
+        let mut i = base(&l);
+        i.boost = false;
+        let n = derive(&i);
+        assert_eq!((n.mem_kb, names(&n)), (8 * GB, vec!["history"]));
     }
 
     #[test]
@@ -339,6 +353,7 @@ mod tests {
             patterns: Vec::new(),
             long_lived: false,
             startup: None,
+            boost: None,
         };
         let empty = crate::config::Pool { name: "storybook".into(), ..pool.clone() };
         let cfg = Config { pools: vec![pool, empty], ..Config::default() };

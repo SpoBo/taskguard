@@ -255,8 +255,16 @@ below).
   down with each reading, so an idle stack releases its booking. A DALP dev
   stack wants almost every core while it
   starts and seeds, then idles at a few percent; without this it kept every
-  core for hours. Its history keeps both: the start-up peak, which the next
-  run is admitted against, and what it took after. Past its start-up it
+  core for hours. Its history keeps both: the peak of its start-up, which
+  the next run is admitted against, and what it took after. A stack grows
+  while it serves pages, so its whole-run peak would book every start for
+  the biggest it ever grew: on a 64 GB Mac 12 GB per start, where its
+  start-ups peaked at 9.6 GB at most. A run recorded before taskguard kept
+  the start-up peak apart counts with its whole-run peak, which is never
+  lower, until its samples (kept 48 hours) fill the start-up peak in.
+  Memory pressure on the machine while it runs does not count as starving
+  it: the pressure comes from the other jobs, and a bigger booking for the
+  next stack only makes the queue longer. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
   nothing else runs, the first in line that fits starts. A waiting long-lived
   job itself starts that way next to it only under `mem_max`, or, when only
@@ -499,7 +507,10 @@ waited for a core more than half as long as they ran, it paged memory in while t
 took 1.5 times its usual time while the machine was full. A run starved of
 memory that reached 90% of its need teaches a higher need for the next run
 (+25%); one starved far below its need was squeezed by others, and more room
-would not have helped it. A run starved of CPU does not
+would not have helped it. `boost = false` in a `[pool.NAME]` or `[[job]]`
+section turns that off for its jobs, and `boost_runs = 0` for every job. A
+long-lived job is never starved of memory (see "Long-lived jobs"). A run
+starved of CPU does not
 raise the CPU need (see "Needs are learned"). With hints on it prints advice
 that can be pasted:
 
@@ -814,6 +825,11 @@ Versions up to 0.11.0-rc.2 do not over-commit: a job of theirs waits where a
 newer version would start it over RAM. With nothing of taskguard's running a
 job that does not fit in RAM holds nobody back in any version, but while it
 is first in line, a newer job behind it does not over-commit either.
+Versions up to 0.11.0 do not keep a long-lived job's start-up peak apart
+(`runs.startup_mem_kb`): they admit a stack against the whole-run peaks
+of its history, so they book more for it, and a stack run they ran counts
+with its whole-run peak in every version. They ignore `boost = false` and
+still let memory pressure boost a stack.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not

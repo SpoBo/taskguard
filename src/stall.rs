@@ -857,4 +857,118 @@ mod tests {
         assert!(jobs_started(&s, &o) >= 24, "{o:?}");
         assert!(worst_small_wait(&s, &o) < 300.0, "{o:?}");
     }
+
+    /// The last ten `dev-env:stack` runs on the 64 GB Mac (taskguard 0.11.0,
+    /// `boost_runs = 0`), in GB: the peak of the first 120 s (`startup`) and
+    /// of the whole run.
+    const STACK_RUNS: [(f64, f64); 10] =
+        [(6.8, 12.0), (9.4, 9.4), (5.1, 5.9), (4.6, 6.0), (9.6, 9.6), (4.6, 4.9), (3.0, 3.6), (9.5, 9.5), (3.1, 3.7), (0.8, 0.8)];
+
+    /// What the next stack books from that history: with the start-up peaks
+    /// recorded, or as 0.11.0 had it, with only the whole-run peaks.
+    fn stack_need(startup_recorded: bool) -> u64 {
+        use crate::db::{Db, Learn, NewRun, RunResult, now};
+        let db = Db::open(std::path::Path::new(":memory:")).unwrap();
+        let gb = |x: f64| (x * GB as f64) as u64;
+        for (startup, peak) in STACK_RUNS {
+            let id = db.insert_run(&NewRun { ns: "dalp", key: "dev-env:stack", ..Default::default() }).unwrap();
+            db.mark_started(id, now() - 3600.0, 0.0, None).unwrap();
+            let r = RunResult {
+                ended_at: now(),
+                peak_mem_kb: gb(peak),
+                cores_used: 3.0,
+                measured: true,
+                steady: Some((0.3, gb(peak.min(4.5)))),
+                startup_mem_kb: startup_recorded.then(|| gb(startup)),
+                ..Default::default()
+            };
+            db.finish_run(id, &r).unwrap();
+        }
+        let learn = Learn { boost_runs: 0, ..Learn::default() };
+        let learned = db.learned("dev-env:stack", &learn).unwrap();
+        let i = crate::need::Inputs {
+            learned: &learned,
+            history_key: Some("dev-env:stack"),
+            guess: None,
+            min_cpu: None,
+            min_mem_kb: None,
+            ncpu: 16.0,
+            mem_total_kb: 64 * GB,
+            cpu_max: 150.0,
+            mem_max: 90.0,
+            new_job_mem_kb: 1536 * 1024,
+            keep: 10,
+            boost_runs: 0,
+            boost: true,
+        };
+        crate::need::derive(&i).mem_kb
+    }
+
+    /// Stacks with `need_kb` queued at the same moment on the 64 GB Mac with
+    /// 16 GB held by programs outside taskguard, decided in turn as their
+    /// runners do: how many start, and how much of RAM is free meanwhile.
+    fn stacks_started_together(need_kb: u64, n: usize) -> (usize, u64) {
+        let lim = Limits {
+            mem_max_pct: 90.0,
+            cpu_max_pct: 150.0,
+            outside_mem_max_pct: crate::commands::outside_ceiling(90.0, 92.0),
+            ..macbook_limits()
+        };
+        let stack = |i: usize| Entry {
+            ticket: i as u64 + 1,
+            pid: 1000 + i as i32,
+            key: "dev-env:stack".into(),
+            pool: Some("stack".into()),
+            checkout: format!("/w/dalp/{i}"),
+            queued_at: 0.0,
+            need_cpu: 3.0,
+            need_mem_kb: need_kb,
+            known: true,
+            priority: 10,
+            long_lived: true,
+            ..Default::default()
+        };
+        let mut waiting: Vec<Entry> = (0..n).map(stack).collect();
+        let mut running: Vec<Entry> = Vec::new();
+        let outside = 16 * GB;
+        for t in 0..5 {
+            for me in waiting.clone() {
+                let used = outside + running.iter().map(|e| e.live_mem_kb).sum::<u64>();
+                let m = MachineSample {
+                    ts: t as f64,
+                    cpu_busy: 2.0,
+                    ncpu: 16,
+                    mem_used_kb: used,
+                    mem_total_kb: 64 * GB,
+                    mem_pressure: Some(0.0),
+                    ..Default::default()
+                };
+                if matches!(decide(&m, &lim, &running, &waiting, &me, t as f64, &[]), Decision::Admit { .. }) {
+                    // Right after its start it holds half a gigabyte.
+                    running.push(Entry { started_at: Some(t as f64), live_mem_kb: GB / 2, ..me.clone() });
+                    waiting.retain(|w| w.pid != me.pid);
+                }
+            }
+        }
+        let used = outside + running.iter().map(|e| e.live_mem_kb).sum::<u64>();
+        (running.len(), 64 * GB - used)
+    }
+
+    /// #34: three stacks start together, and with 0.11.0 a fourth waits for
+    /// memory while most of RAM is free. Admitted against the start-up peak
+    /// of its history, the fourth starts too.
+    #[test]
+    fn three_stacks_start_together_and_a_fourth_fits() {
+        let (before, after) = (stack_need(false), stack_need(true));
+        let gb = |kb: u64| kb as f64 / GB as f64;
+        let (n_before, free_before) = stacks_started_together(before, 4);
+        let (n_after, free_after) = stacks_started_together(after, 4);
+        eprintln!("whole-run peak: books {:.1} GB, {n_before} of 4 start, {:.1} GB free", gb(before), gb(free_before));
+        eprintln!("start-up peak:  books {:.1} GB, {n_after} of 4 start, {:.1} GB free", gb(after), gb(free_after));
+        assert_eq!((before, after), (12 * GB, 96 * GB / 10));
+        assert_eq!(n_before, 3, "0.11.0: the fourth waits with {:.1} GB free", gb(free_before));
+        assert_eq!(n_after, 4);
+        // A fifth still waits: admission refuses what does not fit.
+        assert_eq!(stacks_started_together(after, 5).0, 4);
+    }
 }

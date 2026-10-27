@@ -602,12 +602,18 @@ fn explain(cmdline: &str, cwd: &Path, cfg: &Config, dir: &Path) -> Result<i32> {
         None => println!("pool:       none"),
     }
     if let Some(s) = cfg.long_lived(&cls, cls.pool.as_ref().map(|p| p.0.as_str())) {
-        println!("long-lived: yes - it holds its start-up peak for {}, then its needs follow what it uses", dur(s));
+        println!(
+            "long-lived: yes - it is admitted against the peak of its start-up, holds that for {}, then its needs follow what it uses",
+            dur(s)
+        );
     }
     for w in &cls.why {
         println!("  because {w}");
     }
     if let Ok(db) = Db::open_dir(dir) {
+        if let Some(s) = cfg.long_lived(&cls, cls.pool.as_ref().map(|p| p.0.as_str())) {
+            db.fill_startup_peaks(&key, s)?;
+        }
         let l = db.learned(&key, &cfg.learn())?;
         if l.runs == 0 {
             println!("learned:    nothing yet; the first run just runs");

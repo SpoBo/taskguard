@@ -617,6 +617,45 @@ fn a_long_lived_job_holds_its_peak_only_through_its_start_up() {
     assert!(!explain.contains("long-lived"), "only the stack pool is: {explain}");
 }
 
+/// Not a test of its own: other tests run this binary with `TG_TEST_HOLD`
+/// set to `MB:SECONDS,MB:SECONDS...`, and then it holds that much memory of
+/// its own for that long, step by step.
+#[test]
+fn helper_holds_memory() {
+    let Ok(steps) = std::env::var("TG_TEST_HOLD") else { return };
+    for step in steps.split(',') {
+        let (mb, secs) = step.split_once(':').unwrap();
+        let mut held = vec![0u8; mb.parse::<usize>().unwrap() << 20];
+        for b in held.iter_mut().step_by(4096) {
+            *b = 1;
+        }
+        std::thread::sleep(Duration::from_secs_f64(secs.parse().unwrap()));
+        assert!(std::hint::black_box(&held).iter().step_by(4096).all(|b| *b == 1));
+    }
+}
+
+/// `taskguard ARGS -- <this binary> helper_holds_memory` with `hold` steps.
+fn holding(e: &Env, args: &[&str], hold: &str) -> Output {
+    let me = std::env::current_exe().unwrap();
+    let mut argv: Vec<&str> = args.to_vec();
+    argv.extend(["--", me.to_str().unwrap(), "helper_holds_memory", "--exact", "--test-threads=1"]);
+    e.cmd(&argv).env("TG_TEST_HOLD", hold).output().unwrap()
+}
+
+#[test]
+fn a_stack_that_grows_after_its_start_up_is_admitted_against_its_start_up_peak() {
+    let e = Env::new("sample_every = 0.2\n[pool.stack]\nlong_lived = true\nstartup = 2\n");
+    // 40 MB while it starts, then it grows to 160 MB while it serves.
+    let out = holding(&e, &["--id", "stack", "--key", "stack"], "40:3,160:3");
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (peak, startup): (i64, i64) =
+        e.db().query_row("SELECT peak_mem_kb, startup_mem_kb FROM runs", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(peak > 150 << 10 && startup < 100 << 10, "whole run {peak} kB, start-up {startup} kB");
+    let dump: serde_json::Value = serde_json::from_slice(&e.run(&["dump", "stack"]).stdout).unwrap();
+    let next = dump["jobs"][0]["next_need"]["mem_kb"].as_i64().unwrap();
+    assert_eq!(next, startup, "the next run is admitted against the start-up peak, not the {peak} kB it grew to");
+}
+
 #[test]
 fn a_stack_books_the_work_it_expects_and_that_work_goes_first() {
     let e = Env::new(

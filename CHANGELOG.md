@@ -10,7 +10,28 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `boost = false` in a `[pool.NAME]` or `[[job]]` section: a run of that
+  pool or command that was starved of memory does not add 25% to its next
+  need. A `[[job]]` rule wins over its pool. `boost_runs = 0` still turns the
+  boost off for every job.
+
 ### Fixed
+
+- A long-lived job is admitted against the peak of its start-up, as the
+  README said, not the highest its whole run reached. The history keeps the
+  start-up peak in a new column, `runs.startup_mem_kb`. A dev stack grows
+  while it serves pages: on a 64 GB Mac its last ten runs booked every start
+  at 12 GB, where their start-ups peaked at 9.6 GB at most, and three stacks
+  starting together kept a fourth out with 46 GB of RAM free. A run from
+  before this release counts with its whole-run peak, which is never lower,
+  until its samples, kept for 48 hours, fill in its start-up peak; no
+  history is dropped.
+- Memory pressure on the machine no longer counts as starving a long-lived
+  job, so it no longer boosts the next stack's need by 25%. On one machine
+  124 of 300 stack runs were marked starved by pressure that came from the
+  other jobs.
 
 - A run's memory peak is what its processes hold themselves: physical
   footprint on macOS, PSS on Linux. The kernel's peak resident size, which

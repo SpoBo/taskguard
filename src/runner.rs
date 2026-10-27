@@ -368,6 +368,11 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let startup = cfg.long_lived(&cls, pool.as_deref());
 
     let database = Db::open_dir(&dir).ok();
+    // Runs of a long-lived job from before the start-up peak was recorded
+    // get it from their samples, while those are kept.
+    if let (Some(d), Some(s)) = (&database, startup) {
+        let _ = d.fill_startup_peaks(&jkey, s);
+    }
     // A compile with no history of its own falls back on what tsc-queue learned.
     let (learned, history_key) = match &database {
         Some(d) => need::history(d, &cfg, &cwd, &o.cmd, &jkey),
@@ -402,7 +407,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
     let cmdline = o.cmd.join(" ");
     let guess = (learned.runs == 0)
         .then(|| need::guess(database.as_ref(), &cfg, package.as_deref(), &o.cmd, cls.label.as_deref(), pool.as_deref()));
-    let need = need::derive(&need::inputs(&cfg, &learned, Some(&history_key), guess.as_ref(), min_cpu, min_mem));
+    let boost = cfg.boost(&cls, pool.as_deref());
+    let need = need::derive(&need::inputs(&cfg, &learned, Some(&history_key), guess.as_ref(), min_cpu, min_mem, boost));
     if let Some(from) = need.mem_capped_from {
         say(&format!(
             "warning {jkey} - its history says {} of memory, more than mem_max {:.0}% of RAM allows; it reserves {} (see taskguard outliers)",
@@ -1029,6 +1035,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
             pressure_frac: tracker.pressure_samples as f64 / n,
             full_frac: tracker.full_samples as f64 / n,
             median_dur: median,
+            long_lived: startup.is_some(),
         })
     } else {
         None
@@ -1059,6 +1066,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 paused_s: me.paused_s,
                 steady: tracker.steady(ended, me.paused_s - paused_before_steady),
                 nested_jobs,
+                startup_mem_kb: startup.map(|_| tracker.startup_peak()),
             },
         );
     }
@@ -1070,7 +1078,21 @@ pub fn run(mut o: Opts) -> Result<i32> {
     lines.done(&report::Done { key: &jkey, secs: wall, used, wanted, peak_kb: tracker.peak_mem_kb, code, queued: still });
 
     if let (Some(st), Some(d)) = (&starved, &database) {
-        after_starved(d, &cfg, &o, &me, &cwd, st, &learned, used, tracker.peak_mem_kb, script.as_deref(), package_json.as_deref(), &lines);
+        after_starved(
+            d,
+            &cfg,
+            &o,
+            &me,
+            &cwd,
+            st,
+            &learned,
+            used,
+            tracker.peak_mem_kb,
+            boost,
+            script.as_deref(),
+            package_json.as_deref(),
+            &lines,
+        );
     }
     Ok(code)
 }
@@ -1162,16 +1184,19 @@ fn after_starved(
     before: &db::Learned,
     used: f64,
     peak: u64,
+    boost: bool,
     script: Option<&str>,
     package_json: Option<&str>,
     lines: &Lines,
 ) {
     let after = d.learned(&me.key, &cfg.learn()).unwrap_or_default();
     let reason = st.evidence.join("; ");
+    // What the next run reserves: the boost only when it applies.
+    let boosted = |m: u64| if boost && after.mem_boosted { (m as f64 * 1.25) as u64 } else { m };
     match st.kind {
         "memory" => {
             let old = before.mem_kb.map(|m| m as f64);
-            let new = after.mem_kb.map(|m| m as f64 * 1.25);
+            let new = after.mem_kb.map(|m| boosted(m) as f64);
             let _ = d.adjustment(&me.key, me.run_id, "mem_boost", old, new, &reason);
         }
         _ => {
@@ -1183,7 +1208,7 @@ fn after_starved(
         let v = if st.kind == "memory" { peak as f64 * 1.25 } else { after.cpu.unwrap_or(used).ceil() };
         let _ = d.adjustment(&me.key, me.run_id, "suggest_min", None, Some(v), &format!("starved {streak} runs in a row"));
     }
-    let mem_after = after.mem_kb.map(|m| (m as f64 * 1.25) as u64);
+    let mem_after = after.mem_kb.map(boosted);
     let what = insight::next_need(st.kind, before.cpu, after.cpu, used, mem_after, peak);
     say(&format!("warning {} - possibly starved: {}; {what}", me.key, st.evidence.join("; ")));
     if !lines.hints {
@@ -1201,7 +1226,7 @@ fn after_starved(
         cpu_before: before.cpu,
         cpu_after: after.cpu,
         mem_before: before.mem_kb,
-        mem_after: after.mem_kb.map(|m| (m as f64 * 1.25) as u64),
+        mem_after,
         got_cores: used,
         peak_mem_kb: peak,
         others,

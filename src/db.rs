@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS runs (
   steady_cores_wanted REAL,
   steady_mem_kb INTEGER,
   nested_jobs INTEGER,
-  need_why TEXT
+  need_why TEXT,
+  startup_mem_kb INTEGER
 );
 CREATE INDEX IF NOT EXISTS runs_key ON runs(key, ended_at);
 CREATE INDEX IF NOT EXISTS runs_ended ON runs(ended_at);
@@ -180,6 +181,7 @@ CREATE TABLE IF NOT EXISTS pruned_runs (
   steady_mem_kb INTEGER,
   nested_jobs INTEGER,
   need_why TEXT,
+  startup_mem_kb INTEGER,
   pruned_at REAL NOT NULL,
   prune_reason TEXT NOT NULL
 );
@@ -191,7 +193,11 @@ CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
 const RUN_COLUMNS: &str = "id, ns, pool, key, label, cwd, cmd, pid, script, package_json, queued_at, started_at, ended_at, exit,
   waited_s, main_blocker, now, min_cpu, min_mem_kb, need_cpu, need_mem_kb, peak_mem_kb, cores_used, cores_wanted, cpu_seconds,
   runnable_seconds, pageins, starved, starved_detail, machine_full_frac, imported, paused_s, package, steady_cores_wanted,
-  steady_mem_kb, nested_jobs, need_why";
+  steady_mem_kb, nested_jobs, need_why, startup_mem_kb";
+
+/// A run whose first sample came this soon after its start has its samples
+/// from the start: the samples older than the retention window are gone.
+const FIRST_SAMPLE_WITHIN_S: f64 = 10.0;
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
@@ -223,8 +229,8 @@ pub struct Estimate {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Learned {
     pub runs: usize,
-    /// Max of the recent peaks, with outliers held back (see `Outliers`).
-    /// Runs that failed never raise it above the runs that passed; when every
+    /// Max of the recent peaks, with outliers held back (see `Outliers`):
+    /// for a long-lived job, the peaks of their start-up. Runs that failed never raise it above the runs that passed; when every
     /// recent run failed, see `failed_need`. None when no run was ever
     /// measured.
     pub mem_kb: Option<u64>,
@@ -544,6 +550,9 @@ pub struct RunResult {
     pub steady: Option<(f64, u64)>,
     /// How many taskguard calls ran nested inside this run.
     pub nested_jobs: u64,
+    /// A long-lived job: its memory peak during its start-up, which its
+    /// next run is admitted against. None for other jobs.
+    pub startup_mem_kb: Option<u64>,
 }
 
 fn median(v: &mut [f64]) -> Option<f64> {
@@ -611,7 +620,8 @@ impl Db {
         // Databases made before wrapper jobs were learned: how many taskguard
         // jobs a run started inside itself. Both tables, so a prune keeps it.
         // And how the need a run started with was made, as JSON (`need::Need`).
-        for (col, kind) in [("nested_jobs", "INTEGER"), ("need_why", "TEXT")] {
+        // And, for a long-lived job, its memory peak during its start-up.
+        for (col, kind) in [("nested_jobs", "INTEGER"), ("need_why", "TEXT"), ("startup_mem_kb", "INTEGER")] {
             for table in ["runs", "pruned_runs"] {
                 let has: bool = conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"))?.exists([])?;
                 if !has {
@@ -622,10 +632,14 @@ impl Db {
         Ok(Db { conn })
     }
 
+    /// A long-lived job's memory need is the peak of its start-up, so a run
+    /// counts with `startup_mem_kb` where it has one. A run recorded before
+    /// that column, or by an older version, counts with its whole-run peak,
+    /// which is never lower: its history stays and errs on the safe side.
     pub fn learned(&self, key: &str, rules: &Learn) -> Result<Learned> {
         let (keep, boost_runs) = (rules.keep, rules.boost_runs);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT peak_mem_kb, coalesce(cores_used, cores_wanted), ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb,
+            "SELECT coalesce(startup_mem_kb, peak_mem_kb), coalesce(cores_used, cores_wanted), ended_at - started_at - coalesce(paused_s, 0), starved, steady_mem_kb,
                     steady_cores_wanted, id, ended_at, exit, need_mem_kb, nested_jobs
              FROM runs WHERE key = ?1 AND ended_at IS NOT NULL AND peak_mem_kb > 0
              ORDER BY ended_at DESC, id DESC LIMIT ?2",
@@ -692,6 +706,22 @@ impl Db {
             steady_cpu,
             nested_jobs,
         })
+    }
+
+    /// Fill in `startup_mem_kb` for the runs of long-lived job `key` that
+    /// left their start-up before the column existed, from the samples of
+    /// their first `startup_s` seconds. Samples are kept for 48 hours, and
+    /// only runs whose samples still reach back to their start are filled
+    /// in; older ones keep counting with their whole-run peak.
+    pub fn fill_startup_peaks(&self, key: &str, startup_s: f64) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE runs SET startup_mem_kb = (
+                 SELECT max(mem_kb) FROM job_samples WHERE run_id = runs.id AND ts <= runs.started_at + ?2)
+             WHERE key = ?1 AND startup_mem_kb IS NULL AND steady_mem_kb IS NOT NULL AND ended_at IS NOT NULL
+               AND EXISTS (SELECT 1 FROM job_samples WHERE run_id = runs.id AND ts <= runs.started_at + ?3)",
+            params![key, startup_s, FIRST_SAMPLE_WITHIN_S],
+        )?;
+        Ok(n)
     }
 
     /// Rows as JSON objects, one field per column, for `taskguard dump`: every
@@ -929,7 +959,8 @@ impl Db {
         self.conn.execute(
             "UPDATE runs SET ended_at = ?2, exit = ?3, peak_mem_kb = ?4, cores_used = ?5, cores_wanted = ?6,
                 cpu_seconds = ?7, runnable_seconds = ?8, pageins = ?9, starved = ?10, starved_detail = ?11,
-                machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15, nested_jobs = ?16
+                machine_full_frac = ?12, paused_s = ?13, steady_cores_wanted = ?14, steady_mem_kb = ?15, nested_jobs = ?16,
+                startup_mem_kb = ?17
              WHERE id = ?1",
             params![
                 id,
@@ -947,7 +978,8 @@ impl Db {
                 (r.paused_s > 0.0).then_some(r.paused_s),
                 r.steady.filter(|_| r.measured).map(|s| s.0),
                 r.steady.filter(|_| r.measured).map(|s| s.1 as i64),
-                r.nested_jobs as i64
+                r.nested_jobs as i64,
+                r.startup_mem_kb.filter(|_| r.measured).map(|m| m as i64)
             ],
         )?;
         Ok(())
@@ -1602,6 +1634,10 @@ mod tests {
 
     const GB: u64 = 1024 * 1024;
 
+    fn gb(x: f64) -> u64 {
+        (x * GB as f64) as u64
+    }
+
     #[test]
     fn one_far_higher_peak_counts_more_each_time_it_comes_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1652,7 +1688,6 @@ mod tests {
     /// A run that peaked at `peak` GB, ended with `exit`, and started with a
     /// memory need of `need` GB.
     fn run_mem(db: &Db, key: &str, peak: f64, exit: i32, starved: Option<&str>, need: f64) -> i64 {
-        let gb = |x: f64| (x * GB as f64) as u64;
         let id = db.insert_run(&NewRun { ns: "n", key, need_mem_kb: gb(need), ..Default::default() }).unwrap();
         db.mark_started(id, now() - 10.0, 0.0, None).unwrap();
         let r = RunResult {
@@ -1981,6 +2016,66 @@ mod tests {
         assert_eq!((n, works[0].runs), (3, 2));
         let (n, works) = db.followers("dev-env:stack", Some("stack"), "/w/elsewhere", 5, 900.0).unwrap();
         assert_eq!((n, works.len()), (0, 0));
+    }
+
+    /// A long-lived run of the stack: its whole-run peak, the peak of its
+    /// start-up when it was recorded, and its steady peak. In GB.
+    fn stack_run(db: &Db, key: &str, peak: f64, startup: Option<f64>, steady: f64) -> i64 {
+        let id = db.insert_run(&NewRun { ns: "n", key, need_mem_kb: gb(12.0), ..Default::default() }).unwrap();
+        db.mark_started(id, now() - 3600.0, 0.0, None).unwrap();
+        let r = RunResult {
+            ended_at: now(),
+            peak_mem_kb: gb(peak),
+            cores_used: 3.0,
+            cores_wanted: 3.0,
+            measured: true,
+            steady: Some((0.3, gb(steady))),
+            startup_mem_kb: startup.map(gb),
+            ..Default::default()
+        };
+        db.finish_run(id, &r).unwrap();
+        id
+    }
+
+    /// The last ten `dev-env:stack` runs on a 64 GB Mac: the peak of the
+    /// first 120 s (`startup`) and of the whole run. The stack grows while
+    /// it serves pages, so a whole-run peak books every start at 12 GB.
+    const STACK_RUNS: [(f64, f64); 10] =
+        [(6.8, 12.0), (9.4, 9.4), (5.1, 5.9), (4.6, 6.0), (9.6, 9.6), (4.6, 4.9), (3.0, 3.6), (9.5, 9.5), (3.1, 3.7), (0.8, 0.8)];
+
+    #[test]
+    fn a_long_lived_job_is_admitted_against_its_start_up_peak_not_its_whole_run() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        for (startup, peak) in STACK_RUNS {
+            stack_run(&db, "dev-env:stack", peak, Some(startup), peak.min(4.5).max(startup.min(4.5)));
+        }
+        let l = db.learned("dev-env:stack", &Learn::default()).unwrap();
+        assert_eq!(l.mem_kb, Some(gb(9.6)), "the highest start-up peak, not the 12 GB the stack grew to later");
+    }
+
+    #[test]
+    fn older_runs_of_a_long_lived_job_count_whole_until_their_samples_fill_them_in() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        // Runs from before the start-up peak was recorded: only the whole-run
+        // peak. It is never lower, so the history errs on the safe side.
+        let ids: Vec<i64> = STACK_RUNS.iter().map(|&(_, peak)| stack_run(&db, "dev-env:stack", peak, None, peak.min(4.5))).collect();
+        assert_eq!(db.learned("dev-env:stack", &Learn::default()).unwrap().mem_kb, Some(gb(12.0)));
+        // Their samples, kept for 48 hours, fill in the start-up peak. Those
+        // of the third run are gone but for its late ones, so it keeps
+        // counting whole, at 5.9 GB.
+        for (i, (&id, &(startup, peak))) in ids.iter().zip(&STACK_RUNS).enumerate() {
+            let started: f64 = db.conn.query_row("SELECT started_at FROM runs WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+            if i != 2 {
+                db.job_sample(id, started + 2.0, 2.0, 3.0, 3.0, gb(startup / 2.0), 0.0).unwrap();
+                db.job_sample(id, started + 100.0, 2.0, 3.0, 3.0, gb(startup), 0.0).unwrap();
+            }
+            db.job_sample(id, started + 900.0, 2.0, 0.1, 0.1, gb(peak), 0.0).unwrap();
+        }
+        assert_eq!(db.fill_startup_peaks("dev-env:stack", 120.0).unwrap(), 9);
+        let kept: Option<i64> = db.conn.query_row("SELECT startup_mem_kb FROM runs WHERE id = ?1", [ids[2]], |r| r.get(0)).unwrap();
+        assert_eq!(kept, None, "no samples of its start-up are left");
+        assert_eq!(db.learned("dev-env:stack", &Learn::default()).unwrap().mem_kb, Some(gb(9.6)));
+        assert_eq!(db.fill_startup_peaks("dev-env:stack", 120.0).unwrap(), 0, "once is enough");
     }
 
     #[test]

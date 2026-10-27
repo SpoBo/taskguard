@@ -169,11 +169,19 @@ retention_rollup_days = 90  # keep one-minute averages this long
 # there is room for its start-up peak and holds that peak for `startup`
 # seconds (300 by default). After that its needs follow what it uses, so an
 # idle stack does not keep the cores it took while it started. A [[job]] rule
-# can set both too; its long_lived wins over its pool's.
+# can set both too; its long_lived wins over its pool's. Its history keeps the
+# peak of its start-up apart, and the next run is admitted against that.
 # [pool.stack]
 # max_slots = 4
 # long_lived = true
 # startup = 600
+#
+# A memory-starved run adds 25% to the next run's need (see boost_runs).
+# Setting boost to false turns that off for one pool, or in a [[job]] rule
+# for one command; the rule wins over its pool.
+# [pool.ci]
+# boost = false
+# match = ["bun run ci:local"]
 
 # ---------------------------------------------------------- job rules ----
 # Per-command settings. `match` is a pattern: the command word, then words that

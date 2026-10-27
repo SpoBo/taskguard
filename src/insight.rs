@@ -29,6 +29,8 @@ pub struct Tracker {
     /// When a long-lived job left its start-up, with the CPU totals then.
     steady: Option<(f64, u64, u64)>,
     pub steady_peak_mem_kb: u64,
+    /// A long-lived job's memory peak before it left its start-up.
+    startup_peak_mem_kb: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +132,14 @@ impl Tracker {
     /// A long-lived job left its start-up at `ts`, holding `mem_kb`.
     pub fn steady_from(&mut self, ts: f64, mem_kb: u64) {
         self.steady = Some((ts, self.cpu_ns, self.runnable_ns));
+        self.startup_peak_mem_kb = Some(self.peak_mem_kb);
         self.steady_peak_mem_kb = mem_kb;
+    }
+
+    /// A long-lived job's memory peak during its start-up: the whole run's
+    /// when it never left it.
+    pub fn startup_peak(&self) -> u64 {
+        self.startup_peak_mem_kb.unwrap_or(self.peak_mem_kb)
     }
 
     /// What a long-lived job took after its start-up, which ended `paused_s`
@@ -179,6 +188,9 @@ pub struct RunFacts {
     pub pressure_frac: f64,
     pub full_frac: f64,
     pub median_dur: Option<f64>,
+    /// A long-lived job, such as a dev stack: memory pressure on the host
+    /// while it runs comes from the other jobs, not from too small a need.
+    pub long_lived: bool,
 }
 
 pub const CPU_WAIT_RATIO: f64 = 0.5;
@@ -207,10 +219,17 @@ pub fn starvation(f: &RunFacts) -> Option<Starvation> {
     // page-in, and a cold `turbo run` reads thousands of files on a machine with
     // plenty of free memory. They only count while the kernel also reported
     // memory pressure during the run.
-    if f.pageins_per_s > PAGEINS_PER_S && f.pressure_frac > 0.0 {
-        found.push(("memory", format!("paged in {:.0} pages/s under memory pressure, so it ran short of memory", f.pageins_per_s)));
-    } else if f.pressure_frac > PRESSURE_FRAC {
-        found.push(("memory", format!("the machine was under memory pressure {:.0}% of the run", f.pressure_frac * 100.0)));
+    //
+    // A long-lived job runs for hours next to everything else, so the host
+    // is under pressure for part of nearly every run: 124 of 300 stack runs
+    // on one machine. That pressure comes from the other jobs, and booking
+    // the next stack bigger for it only makes the queue longer.
+    if !f.long_lived {
+        if f.pageins_per_s > PAGEINS_PER_S && f.pressure_frac > 0.0 {
+            found.push(("memory", format!("paged in {:.0} pages/s under memory pressure, so it ran short of memory", f.pageins_per_s)));
+        } else if f.pressure_frac > PRESSURE_FRAC {
+            found.push(("memory", format!("the machine was under memory pressure {:.0}% of the run", f.pressure_frac * 100.0)));
+        }
     }
     if let Some(m) = f.median_dur
         && f.wall > SLOWDOWN * m
@@ -435,6 +454,7 @@ mod tests {
             pressure_frac: 0.0,
             full_frac: 0.0,
             median_dur: Some(100.0),
+            long_lived: false,
         }
     }
 
@@ -448,6 +468,15 @@ mod tests {
         assert_eq!(starvation(&RunFacts { pageins_per_s: 500.0, ..facts() }), None, "file reads on a calm machine are not starvation");
         assert_eq!(starvation(&RunFacts { wall: 200.0, full_frac: 0.8, ..facts() }).unwrap().kind, "slowdown");
         assert_eq!(starvation(&RunFacts { wall: 200.0, full_frac: 0.1, ..facts() }), None, "slow but the machine had room");
+    }
+
+    #[test]
+    fn host_memory_pressure_does_not_starve_a_long_lived_job() {
+        let stack = || RunFacts { long_lived: true, ..facts() };
+        assert_eq!(starvation(&RunFacts { pageins_per_s: 500.0, pressure_frac: 0.2, ..stack() }), None);
+        assert_eq!(starvation(&RunFacts { pressure_frac: 0.9, ..stack() }), None);
+        let s = starvation(&RunFacts { runnable_s: 150.0, ..stack() }).unwrap();
+        assert_eq!(s.kind, "cpu", "CPU starvation still counts");
     }
 
     fn argv(s: &str) -> Vec<String> {
