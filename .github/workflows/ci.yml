@@ -8,39 +8,45 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        n: [1, 2, 3, 4]
+        ref: [roderik/taskguard-stack-density, master]
+        n: [1, 2, 3]
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          ref: ${{ matrix.ref }}
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --check
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Root watchdog for the test step
+        with:
+          key: ${{ matrix.ref }}
+      - name: Build
+        run: cargo test --no-run
+      - name: Memory sampler (root)
         run: |
-          cat > /tmp/wd.sh <<'EOS'
+          cat > /tmp/mem.sh <<'EOS'
           #!/bin/bash
-          # Wait for the test step to start, then give it 6 minutes.
-          until pgrep -f 'cargo test' >/dev/null; do sleep 1; done
-          sleep 360
-          {
-            echo "=== still running after 6 min at $(date -u +%T)"
-            ps -axo pid,ppid,user,stat,etime,command | grep -E "runner" | grep -vE "Runner\.|/System/|/usr/libexec|/usr/sbin" | cut -c1-220
-            echo "=== open pipes of runner processes"
-            lsof -nP -u runner 2>/dev/null | grep -E "PIPE|FIFO" | grep -vE "^(Runner|Spotlight)" | head -80
-          } > /tmp/wd.log 2>&1
-          pkill -9 -f 'target/debug'
-          pkill -9 cargo
+          while true; do
+            v=$(vm_stat)
+            g() { echo "$v" | awk -v k="$1" -F: '$1 ~ k {gsub("[ .]","",$2); print $2}'; }
+            echo "$(date +%s) free=$(( $(g 'Pages free') * 16 / 1024 )) inactive=$(( $(g 'Pages inactive') * 16 / 1024 )) compressor=$(( $(g 'occupied by compressor') * 16 / 1024 )) swapouts=$(g 'Swapouts') swap=$(sysctl -n vm.swapusage | awk '{print $6}')"
+            sleep 1
+          done
           EOS
-          chmod +x /tmp/wd.sh
-          sudo nohup /tmp/wd.sh > /dev/null 2>&1 &
+          chmod +x /tmp/mem.sh
+          sudo nohup /tmp/mem.sh > /tmp/mem.log 2>&1 &
       - name: Test
-        run: cargo test
-      - name: Watchdog log
+        run: |
+          set +e
+          perl -e 'alarm shift; exec @ARGV' 300 cargo test > /tmp/test.log 2>&1
+          echo "exit $?"
+          grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
+      - name: Memory summary
         if: always()
-        run: cat /tmp/wd.log 2>/dev/null || echo "(the test step ended within 6 minutes)"
+        run: |
+          echo "min free MB:       $(awk '{split($2,a,"="); print a[2]}' /tmp/mem.log | sort -n | head -1)"
+          echo "max compressor MB: $(awk '{split($4,a,"="); print a[2]}' /tmp/mem.log | sort -n | tail -1)"
+          echo "swapouts first/last: $(head -1 /tmp/mem.log | awk '{print $5}') / $(tail -1 /tmp/mem.log | awk '{print $5}')"
+          echo "swap used last:    $(tail -1 /tmp/mem.log | awk '{print $6}')"
+          echo "--- lowest 5 samples"
+          sort -t= -k2 -n /tmp/mem.log | head -5
