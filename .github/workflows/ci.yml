@@ -25,7 +25,7 @@ jobs:
             free=$(( $(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); print $3}') * 16 / 1024 ))
             el=$(( $(date +%s) - start ))
             [ $(( el % 20 )) -lt 2 ] && echo "t=${el}s procs=$n free=${free}MB"
-            if [ "$n" -gt 400 ] || [ "$free" -lt 400 ] || [ "$el" -gt 420 ]; then
+            if [ "$n" -gt 900 ] || [ "$free" -lt 250 ] || [ "$el" -gt 420 ]; then
               echo "WATCHDOG t=${el}s procs=$n free=${free}MB"
               ps -axo pid,ppid,rss,etime,command | sort -k3 -n -r | head -25 | cut -c1-220
               echo "--- by command"
