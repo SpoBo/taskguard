@@ -1023,15 +1023,25 @@ mod tests {
         running.len()
     }
 
-    /// How many settled stacks the 64 GB Mac runs at once: one more than
-    /// 0.11.0 by the start-up peak. Fifteen do not fit by any booking: 15
-    /// stacks holding 4.3 GB each are 64 GB, all of RAM.
+    /// How many settled stacks the 64 GB Mac runs at once, with 16 GB held
+    /// outside taskguard and each start booked by its history. DALP stacks
+    /// held 4.3 GB once settled; a production-default stack with the pruned
+    /// Anvil holds 3.2 to 3.6 GB. Admitted against the start-up peak, one to
+    /// two more stacks fit; fifteen do not fit by any booking, as fifteen
+    /// stacks of 3.2 GB are 48 GB, more than the 41.6 GB left under mem_max.
     #[test]
     fn settled_stacks_on_the_64_gb_mac() {
         let (before, after) = (stack_need(false), stack_need(true));
-        let held = 43 * GB / 10;
-        let (n_before, n_after) = (stacks_settled_in_turn(before, held, 15), stacks_settled_in_turn(after, held, 15));
-        eprintln!("settled at 4.3 GB: {n_before} stacks by the whole-run peak, {n_after} by the start-up peak");
-        assert_eq!(n_after, n_before + 1);
+        let fit = |held_tenths: u64| {
+            let held = held_tenths * GB / 10;
+            (stacks_settled_in_turn(before, held, 15), stacks_settled_in_turn(after, held, 15))
+        };
+        for tenths in [43, 36, 32] {
+            let (b, a) = fit(tenths);
+            eprintln!("settled at {:.1} GB: {b} stacks by the whole-run peak, {a} by the start-up peak", tenths as f64 / 10.0);
+        }
+        assert_eq!(fit(43), (6, 7));
+        assert_eq!(fit(36), (7, 8));
+        assert_eq!(fit(32), (8, 9));
     }
 }
