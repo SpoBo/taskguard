@@ -102,8 +102,9 @@ pub fn dump(args: &[String]) -> Result<i32> {
 /// queue entries. `given` is the command and directory when the user named
 /// one; otherwise both come from the newest run.
 fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a: &Args) -> Result<Value> {
-    let rows = db.runs_json(k, a.runs)?;
-    let newest = rows.first();
+    let mut rows = db.runs_json(k, a.runs)?;
+    let newest = rows.first().cloned();
+    let newest = newest.as_ref();
     let text = |r: Option<&Value>, f: &str| r.and_then(|r| r[f].as_str()).map(str::to_string);
     // The settings of the directory the job runs in, when it still exists.
     let (argv, cwd) = match given {
@@ -116,6 +117,12 @@ fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a:
     let cfg = Config::load(&cwd, &key::checkout_root(&cwd))?;
     let cls = cfg.classify(&argv, k)?;
     let rules = cfg.learn();
+    // As the runner does before it learns: see `Db::fill_startup_peaks`.
+    if let Some(s) = cfg.long_lived(&cls, cls.pool.as_ref().map(|p| p.0.as_str()))
+        && db.fill_startup_peaks(k, s)? > 0
+    {
+        rows = db.runs_json(k, a.runs)?;
+    }
     let (learned, history_key) =
         if given.is_some() { need::history(db, &cfg, &cwd, &argv, k) } else { (db.learned(k, &rules)?, k.to_string()) };
     let pool = cls.pool.as_ref().map(|p| p.0.clone());
@@ -125,7 +132,8 @@ fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a:
     let num = |f: &str| newest.and_then(|r| r[f].as_f64());
     let min_cpu = cls.min_cpu.or(num("min_cpu"));
     let min_mem = cls.min_mem_kb.or(num("min_mem_kb").map(|v| v as u64));
-    let next = need::derive(&need::inputs(&cfg, &learned, Some(&history_key), guess.as_ref(), min_cpu, min_mem));
+    let boost_on = cfg.boost(&cls, pool.as_deref());
+    let next = need::derive(&need::inputs(&cfg, &learned, Some(&history_key), guess.as_ref(), min_cpu, min_mem, boost_on));
 
     // What each run did to the need, in the order `Db::learned` reads them.
     let outliers: Vec<i64> = learned.outliers.iter().flat_map(|o| o.runs.iter().map(|r| r.run_id)).collect();
@@ -134,7 +142,8 @@ fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a:
     let mut runs = Vec::new();
     for mut r in rows {
         let id = r["id"].as_i64().unwrap_or(0);
-        let peak = r["peak_mem_kb"].as_i64().unwrap_or(0);
+        // What `Db::learned` counts: a long-lived job's start-up peak.
+        let peak = r["startup_mem_kb"].as_i64().or(r["peak_mem_kb"].as_i64()).unwrap_or(0);
         let exit = r["exit"].as_i64();
         let failed = exit.is_some_and(|e| e != 0);
         let finished = !r["ended_at"].is_null();
@@ -144,8 +153,9 @@ fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a:
             seen - 1
         });
         let in_window = place.is_some_and(|p| p < rules.keep);
-        let boost =
-            place.is_some_and(|p| p < rules.boost_runs) && db::boosts(r["starved"].as_str(), r["need_mem_kb"].as_i64(), peak, failed);
+        let boost = boost_on
+            && place.is_some_and(|p| p < rules.boost_runs)
+            && db::boosts(r["starved"].as_str(), r["need_mem_kb"].as_i64(), peak, failed);
         let mut notes = Vec::new();
         if !finished {
             notes.push("still waiting or running".to_string());
@@ -207,6 +217,7 @@ fn job(db: &Db, dir: &Path, k: &str, given: Option<(&Vec<String>, &PathBuf)>, a:
             "rules": {
                 "keep": rules.keep,
                 "boost_runs": rules.boost_runs,
+                "boost": boost_on,
                 "outlier_ratio": rules.outlier_ratio,
                 "outlier_min_kb": rules.outlier_min_kb,
                 "outlier_weights": rules.outlier_weights,

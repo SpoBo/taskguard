@@ -121,7 +121,20 @@ below).
   fills every core. Memory is checked for every job.
 - **"Promised" is the growth still to come.** A compile that sits at 2 GB
   but peaked at 20 GB last time still has 18 GB to take. Without this, a second
-  job is started into space the first one is about to use.
+  job is started into space the first one is about to use. Once a job is past
+  the point where its past runs peaked, it is promised only what they still
+  reached from its age on (`reserve = "remaining"`, the default): each run
+  records the most memory it reached from each moment on, and a running job
+  books the highest of its recent runs from a little before its age on
+  (a fifth of its age earlier, at least 10 s), plus 15%. A compile that peaked
+  at 20 GB in its first minute and sits at 2 GB for the next four stops
+  holding 18 GB for the rest. It counts once three runs have such a record.
+  A run that goes above it, or runs longer than any of them, books its whole
+  need again at once, for the rest of the run. On 48 hours of real samples
+  this lowered the memory reserved by 17%, and 0.9% of runs went above it, by
+  0.1 GB at the median and 2.2 GB at most. `reserve = "peak"` keeps the whole
+  peak promised until a job ends. A dev stack past its start-up follows what
+  it holds, as before; a need set by hand stays.
 - **The machine readings count everything.** Your browser and your editor
   count too, not only jobs that taskguard started.
 - **A little short is close enough.** A job short of memory by at most
@@ -189,7 +202,9 @@ below).
   (below) not while it cannot use the room.
 - **No starvation.** A job that newer jobs have passed for 2 minutes
   (`max_bypass`) gets a reservation. Nothing behind it in line starts until it
-  has started, except by backfill (below).
+  has started, except by backfill (below). A job whose own pool is full, such
+  as a second stack waiting for the one stack slot, holds nobody back: it
+  could not start in the room it holds.
 - **Part of its CPU need is enough for a job that cannot fit.** A job whose
   CPU need is above the whole limit never fits, and a job that waited past
   `max_bypass` is the one others are held for. Such a job starts on part of
@@ -255,8 +270,16 @@ below).
   down with each reading, so an idle stack releases its booking. A DALP dev
   stack wants almost every core while it
   starts and seeds, then idles at a few percent; without this it kept every
-  core for hours. Its history keeps both: the start-up peak, which the next
-  run is admitted against, and what it took after. Past its start-up it
+  core for hours. Its history keeps both: the peak of its start-up, which
+  the next run is admitted against, and what it took after. A stack grows
+  while it serves pages, so its whole-run peak would book every start for
+  the biggest it ever grew: on a 64 GB Mac 12 GB per start, where its
+  start-ups peaked at 9.6 GB at most. A run recorded before taskguard kept
+  the start-up peak apart counts with its whole-run peak, which is never
+  lower, until its samples (kept 48 hours) fill the start-up peak in.
+  Memory pressure on the machine while it runs does not count as starving
+  it: the pressure comes from the other jobs, and a bigger booking for the
+  next stack only makes the queue longer. Past its start-up it
   counts as load from outside taskguard: no job waits for it to end, and when
   nothing else runs, the first in line that fits starts. A waiting long-lived
   job itself starts that way next to it only under `mem_max`, or, when only
@@ -345,7 +368,10 @@ takes the higher of the two.
 
 Physical footprint is used on macOS because resident size hides compressed
 pages. One measured `tsc` reported 3.8 GB resident while it really held 22 GB.
-All readings are syscalls. They cost microseconds, not the 120 ms per process
+Resident size also counts the pages of files and binaries a process maps:
+a compiled Bun host held 3.4 GB resident and 585 MB of its own. So the
+kernel's peak resident size at the end of a run only stands in for a job
+that ended before its first sample. All readings are syscalls. They cost microseconds, not the 120 ms per process
 of `/usr/bin/footprint`.
 
 The whole process tree is measured, because the memory often lives in a
@@ -450,7 +476,9 @@ from the first run, with nothing to learn first.
 Long-running commands are never queued: watch modes, dev servers, `--version`
 and `--help` run straight through (the list is in `src/builtin.rs`). Add your
 own with `passthrough = ["storybook", "my-dev-server"]` in a config file; it
-adds to the built-in list. See `taskguard doctor --explain "COMMAND"`.
+adds to the built-in list. See `taskguard doctor --explain "COMMAND"`. An
+explicit `--id` or `-j` asks for a slot and beats the list:
+`taskguard --id stack -- devenv up` queues.
 
 ### What a waiting job prints
 
@@ -496,7 +524,10 @@ waited for a core more than half as long as they ran, it paged memory in while t
 took 1.5 times its usual time while the machine was full. A run starved of
 memory that reached 90% of its need teaches a higher need for the next run
 (+25%); one starved far below its need was squeezed by others, and more room
-would not have helped it. A run starved of CPU does not
+would not have helped it. `boost = false` in a `[pool.NAME]` or `[[job]]`
+section turns that off for its jobs, and `boost_runs = 0` for every job. A
+long-lived job is never starved of memory (see "Long-lived jobs"). A run
+starved of CPU does not
 raise the CPU need (see "Needs are learned"). With hints on it prints advice
 that can be pasted:
 
@@ -661,6 +692,7 @@ max_backfill = 600     # small jobs pass a stuck job this long, then the machine
 expect_wait = 5        # a dev stack waits this long for the work it expects to queue
 infer_work = true      # a dev stack books the work its history says follows it
 overcommit = true      # a lone job that only other programs keep out starts over RAM after a while
+reserve = "remaining"  # a running job past its peak books what its past runs still reached; "peak" = its whole peak
 
 [pool.e2e]             # a slot ceiling for one kind of job, per worktree
 max_slots = 1
@@ -704,6 +736,12 @@ repo. Put a repo's own scripts in its `.taskguard.toml`:
   they may use its CPU. Its memory stays reserved. taskguard also sees a job
   that someone stopped with `kill -STOP` and treats it as paused by hand. It
   cannot see a Ctrl-Z in the terminal: that stops taskguard itself too.
+- On macOS, memory that processes share without a file behind it, such as
+  PostgreSQL's shared buffers, counts once for each process that touched
+  it: the kernel charges it to every footprint, and only root may ask which
+  pages two processes share. On a DALP dev stack with 16 to 28 PostgreSQL
+  processes that is about 0.2 to 0.8 GB of the 3 to 4 GB it reads. Linux splits
+  such pages between the processes (PSS).
 - A job with no history reserves an estimate. A first run far bigger than
   similar jobs can still take more than its estimate before it is learned.
 - An outlier that is real growth is learned late: the next run still
@@ -805,6 +843,15 @@ Versions up to 0.11.0-rc.2 do not over-commit: a job of theirs waits where a
 newer version would start it over RAM. With nothing of taskguard's running a
 job that does not fit in RAM holds nobody back in any version, but while it
 is first in line, a newer job behind it does not over-commit either.
+Versions up to 0.11.0 do not keep a long-lived job's start-up peak apart
+(`runs.startup_mem_kb`): they admit a stack against the whole-run peaks
+of its history, so they book more for it, and a stack run they ran counts
+with its whole-run peak in every version. They ignore `boost = false` and
+still let memory pressure boost a stack. Nor do they know `reserve`: their
+jobs keep their whole peak promised, they do not record a run's curve
+(`runs.reach`), and a run they ran counts at its peak for its whole length.
+Their waiting jobs do read the lower need a newer version books for a job
+past its peak.
 A version before 0.4.0 does not
 know runs: its jobs never step aside for an older run. A version before
 0.2.0 does not

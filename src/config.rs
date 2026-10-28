@@ -58,6 +58,7 @@ pub struct Layer {
     pub overcommit_stuck_after: Option<f64>,
     pub overcommit_max_macos: Option<f64>,
     pub overcommit_max_linux: Option<f64>,
+    pub reserve: Option<Reserve>,
     pub recorder_idle_exit: Option<u64>,
     pub retention_raw_hours: Option<u64>,
     pub retention_rollup_days: Option<u64>,
@@ -89,6 +90,8 @@ pub struct PoolCfg {
     /// Its jobs run for hours, such as dev stacks: see `Config::long_lived`.
     pub long_lived: Option<bool>,
     pub startup: Option<u64>,
+    /// false: a memory-starved run does not add 25% to its jobs' next need.
+    pub boost: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -103,6 +106,7 @@ pub struct JobRule {
     pub priority: Option<i32>,
     pub long_lived: Option<bool>,
     pub startup: Option<u64>,
+    pub boost: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +117,17 @@ pub struct Pool {
     pub patterns: Vec<String>,
     pub long_lived: bool,
     pub startup: Option<u64>,
+    pub boost: Option<bool>,
+}
+
+/// What a running job reserves to grow into (`reserve`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Reserve {
+    /// Its whole need, the peak of its history, until it ends.
+    Peak,
+    /// The most its past runs still reached from its age on: see `reach`.
+    Remaining,
 }
 
 /// Seconds a long-lived job holds its start-up peak when no `startup` is set.
@@ -192,6 +207,9 @@ pub struct Config {
     pub overcommit_stuck_after: f64,
     pub overcommit_max_macos: f64,
     pub overcommit_max_linux: f64,
+    /// What a running job reserves: its whole need, or what its past runs
+    /// say it can still reach (see `reach`).
+    pub reserve: Reserve,
     pub recorder_idle_exit: u64,
     pub retention_raw_hours: u64,
     pub retention_rollup_days: u64,
@@ -250,6 +268,7 @@ impl Default for Config {
             overcommit_stuck_after: 1800.0,
             overcommit_max_macos: 120.0,
             overcommit_max_linux: 120.0,
+            reserve: Reserve::Remaining,
             recorder_idle_exit: 1800,
             retention_raw_hours: 48,
             retention_rollup_days: 90,
@@ -262,6 +281,7 @@ impl Default for Config {
                     patterns: p.iter().map(|s| s.to_string()).collect(),
                     long_lived: false,
                     startup: None,
+                    boost: None,
                 })
                 .collect(),
             labels: builtin::LABELS.iter().map(|(n, p)| (n.to_string(), p.iter().map(|s| s.to_string()).collect())).collect(),
@@ -699,6 +719,7 @@ impl Config {
         set!(overcommit_stuck_after);
         set!(overcommit_max_macos);
         set!(overcommit_max_linux);
+        set!(reserve);
         set!(recorder_idle_exit);
         set!(retention_raw_hours);
         set!(retention_rollup_days);
@@ -715,6 +736,7 @@ impl Config {
                 per_checkout: p.per_checkout.or(base.as_ref().map(|b| b.per_checkout)).unwrap_or(true),
                 long_lived: p.long_lived.or(base.as_ref().map(|b| b.long_lived)).unwrap_or(false),
                 startup: p.startup.or(base.as_ref().and_then(|b| b.startup)),
+                boost: p.boost.or(base.as_ref().and_then(|b| b.boost)),
                 patterns: if p.patterns.is_empty() { base.map(|b| b.patterns).unwrap_or_default() } else { p.patterns.clone() },
             };
             match existing {
@@ -791,6 +813,8 @@ pub struct Classified {
     /// Set by a [[job]] rule; otherwise the job's pool decides.
     pub long_lived: Option<bool>,
     pub startup: Option<u64>,
+    /// Set by a [[job]] rule; otherwise the job's pool decides.
+    pub boost: Option<bool>,
     /// For `doctor --explain`: which rule set what.
     pub why: Vec<String>,
 }
@@ -857,6 +881,10 @@ impl Config {
                 c.startup = Some(v);
                 c.why.push(format!("startup {v}s from [[job]] {what:?} in {layer}"));
             }
+            if let Some(v) = rule.boost {
+                c.boost = Some(v);
+                c.why.push(format!("boost = {v} from [[job]] {what:?} in {layer}"));
+            }
         }
         Ok(c)
     }
@@ -871,6 +899,14 @@ impl Config {
         let pool = pool.and_then(|p| self.pools.iter().find(|x| x.name == p));
         let on = cls.long_lived.or(pool.map(|p| p.long_lived)).unwrap_or(false);
         on.then(|| cls.startup.or(pool.and_then(|p| p.startup)).unwrap_or(STARTUP_S) as f64)
+    }
+
+    /// Does a memory-starved run add 25% to this job's next need? On, unless
+    /// `boost = false` in its [[job]] rule or its pool; `boost_runs = 0` turns
+    /// it off for every job. A [[job]] rule wins over the job's pool.
+    pub fn boost(&self, cls: &Classified, pool: Option<&str>) -> bool {
+        let pool = pool.and_then(|p| self.pools.iter().find(|x| x.name == p));
+        cls.boost.or(pool.and_then(|p| p.boost)).unwrap_or(true)
     }
 }
 
@@ -1082,6 +1118,27 @@ mod tests {
         // A later layer that only changes the ceiling keeps the mode.
         c.apply(&parse_layer("[pool.stack]\nmax_slots = 2\n").unwrap().0, "user");
         assert_eq!(long(&c, "dev-env up", Some("stack")), Some(STARTUP_S as f64));
+    }
+
+    #[test]
+    fn the_boost_is_turned_off_per_pool_or_per_job() {
+        let mut c = Config::default();
+        let (layer, unknown) = parse_layer(
+            "[pool.stack]\nboost = false\nmatch = [\"dev-env up\"]\n\
+             [[job]]\nmatch = \"dev-env up --profile canton\"\nboost = true\n\
+             [[job]]\nmatch = \"vitest run\"\nboost = false\n",
+        )
+        .unwrap();
+        assert_eq!(unknown, Vec::<String>::new());
+        c.apply(&layer, "repo");
+        let boost = |c: &Config, cmd: &str, pool: Option<&str>| c.boost(&c.classify(&argv(cmd), "k").unwrap(), pool);
+        assert!(!boost(&c, "dev-env up", Some("stack")));
+        assert!(boost(&c, "dev-env up --profile canton", Some("stack")), "a [[job]] rule wins over its pool");
+        assert!(!boost(&c, "vitest run", None));
+        assert!(boost(&c, "tsc -p .", None), "on for every other job");
+        // A later layer that only changes the ceiling keeps it off.
+        c.apply(&parse_layer("[pool.stack]\nmax_slots = 2\n").unwrap().0, "user");
+        assert!(!boost(&c, "dev-env up", Some("stack")));
     }
 
     #[test]

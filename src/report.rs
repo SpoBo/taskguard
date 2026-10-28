@@ -687,7 +687,12 @@ pub fn render_status(s: &Snapshot) -> String {
             (None, true) => " NOW".into(),
             (None, false) if e.steady() => " STEADY".into(),
             (None, false) => String::new(),
-        } + if e.over_ram { " OVER-RAM" } else { "" };
+        } + if e.over_ram { " OVER-RAM" } else { "" }
+            + &match (e.reach_flat_kb, e.reach_missed) {
+                (Some(flat), _) => format!(" PAST-PEAK (of {})", gb(flat)),
+                (None, true) => " ABOVE-CURVE".into(),
+                _ => String::new(),
+            };
         let est = if e.known || e.raised_by_min { "" } else { " est" };
         let needs_cpu = format!("{:.1}{est}", e.need_cpu);
         let needs_mem = format!("{}{est}", gb(e.need_mem_kb));

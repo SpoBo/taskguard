@@ -10,6 +10,50 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `boost = false` in a `[pool.NAME]` or `[[job]]` section: a run of that
+  pool or command that was starved of memory does not add 25% to its next
+  need. A `[[job]]` rule wins over its pool. `boost_runs = 0` still turns the
+  boost off for every job.
+- A running job past its peak keeps promised only what its past runs still
+  reached from its age on, plus 15%, not its whole peak until it ends
+  (`reserve = "remaining"`, the default; `reserve = "peak"` keeps the old
+  rule). Each run records that curve in a new column, `runs.reach`; a job
+  counts it once three runs have one. A run that goes above it, or runs
+  longer than any of them, books its whole need again for the rest of the
+  run. `taskguard status` marks such a job PAST-PEAK or ABOVE-CURVE, and the
+  dashboard says why. On 48 hours of real samples the memory reserved fell by
+  17%, and 0.9% of runs went above their curve.
+
+### Fixed
+
+- A long-lived job is admitted against the peak of its start-up, as the
+  README said, not the highest its whole run reached. The history keeps the
+  start-up peak in a new column, `runs.startup_mem_kb`. A dev stack grows
+  while it serves pages: on a 64 GB Mac its last ten runs booked every start
+  at 12 GB, where their start-ups peaked at 9.6 GB at most, and three stacks
+  starting together kept a fourth out with 46 GB of RAM free. A run from
+  before this release counts with its whole-run peak, which is never lower,
+  until its samples, kept for 48 hours, fill in its start-up peak; no
+  history is dropped.
+- Memory pressure on the machine no longer counts as starving a long-lived
+  job, so it no longer boosts the next stack's need by 25%. On one machine
+  124 of 300 stack runs were marked starved by pressure that came from the
+  other jobs.
+- A run's memory peak is what its processes hold themselves: physical
+  footprint on macOS, PSS on Linux. The kernel's peak resident size, which
+  also counts mapped files and binaries, no longer raises it; it only
+  stands in for a job that ended before its first sample. On macOS a
+  compiled Bun host held 3.4 GB resident and 585 MB of its own.
+- A job passed for `max_bypass` no longer holds every newer job back while
+  its own pool is full: a second dev stack waiting for the one stack slot
+  froze all other work until the first stack stopped. A higher priority
+  already skipped such a job.
+- An explicit `--id` or `-j` beats the passthrough list, so
+  `taskguard --id stack -- devenv up` queues instead of running straight
+  through.
+
 ## [0.11.0] - 2026-10-20
 
 ### Added

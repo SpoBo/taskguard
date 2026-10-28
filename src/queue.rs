@@ -130,6 +130,13 @@ pub struct Entry {
     /// hand. Work that takes over what it declared for it inherits that.
     /// Older versions leave it out.
     pub overcommitted: bool,
+    /// While its past runs say it can no longer reach its whole need: that
+    /// whole need, which `need_mem_kb` is lowered from (`Entry::reach`).
+    /// Older versions leave it out, and read the lowered need.
+    pub reach_flat_kb: Option<u64>,
+    /// It went above what its past runs reached at its age: it books its
+    /// whole need for the rest of its run. Older versions leave it out.
+    pub reach_missed: bool,
     /// Another job saw this one able to start for `STALL_S` while it still
     /// waited (`stall/<ticket>.<pid>`). It holds no job back any more. Read
     /// from the queue, never written into the entry.
@@ -333,6 +340,34 @@ impl Entry {
             self.need_mem_kb = mem_kb + mem_kb / 4;
         } else if used_recent > self.need_cpu {
             self.need_cpu = used_recent.min(ncpu);
+        }
+    }
+}
+
+impl Entry {
+    /// Lower a running job's memory need to `can_reach`, the most its past
+    /// runs still reached from its age on (`reach::Envelope::need_at`),
+    /// never above `flat`, the need it would book by its peak. Once it holds
+    /// more than that, it books `flat` for the rest of its run. A steady
+    /// long-lived job and needs set by hand are left alone. Returns true when
+    /// the job has just gone above it.
+    pub fn reach(&mut self, flat: u64, can_reach: Option<u64>) -> bool {
+        self.need_mem_kb = flat;
+        self.reach_flat_kb = None;
+        if self.reach_missed || self.steady() || self.by_hand.is_some() {
+            return false;
+        }
+        match can_reach {
+            Some(r) if self.live_mem_kb > r => {
+                self.reach_missed = true;
+                true
+            }
+            Some(r) if r < flat => {
+                self.need_mem_kb = r;
+                self.reach_flat_kb = Some(flat);
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -1161,22 +1196,27 @@ pub fn decide(
     // behind it that fit gains it nothing, and on Omarchy one such job kept
     // two dozen others out for half an hour.
     let may_hold = |w: &Entry| room.fits_once_drained(m, lim, running, w);
+    // A job whose own pool is full cannot start, whatever room it holds:
+    // holding others back for it gains nothing.
+    let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
+        (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
+        _ => false,
+    };
     // An older job that newer ones have passed for `max_bypass` goes first.
     // Only a job ahead in line holds `me` back, so a job of an older run is
     // never held back for one of a newer run, or for a job that queued after
     // that run began.
     if let Some(r) = older.iter().find(|w| {
-        w.bypassed_since.is_some() && now - w.queued_at > lim.max_bypass && may_hold(w) && (lim.max_backfill <= lim.max_bypass || holds(w))
+        w.bypassed_since.is_some()
+            && now - w.queued_at > lim.max_bypass
+            && !pool_full(w)
+            && may_hold(w)
+            && (lim.max_backfill <= lim.max_bypass || holds(w))
     }) {
         blockers.push(Blocker::Reserved { key: r.key.clone(), waited_s: now - r.queued_at });
     }
     // A waiting job with a higher priority goes first, unless its own pool is
-    // full: then it cannot start anyway, and holding others back gains nothing.
-    // With backfill on, it holds them back as a reservation does.
-    let pool_full = |w: &Entry| match (&w.pool_key, w.pool_slots) {
-        (Some(pk), Some(max)) => running.iter().filter(|e| e.pool_key.as_ref() == Some(pk)).count() as u32 >= max,
-        _ => false,
-    };
+    // full. With backfill on, it holds them back as a reservation does.
     if let Some(h) =
         older.iter().find(|w| w.priority > me.priority && !pool_full(w) && may_hold(w) && (lim.max_backfill <= 0.0 || holds(w)))
     {
@@ -2048,6 +2088,65 @@ mod tests {
         assert!(blockers(decide(&machine(0.0, 1), &LIM, &[], &[big.clone(), young.clone()], &young, 1000.0, &[])).is_empty());
     }
 
+    /// Three past runs of a `ci` job on a 32 GB machine: 2 GB, an 18 GB peak
+    /// from 40 s to 70 s, then 2 GB again until it ends at 300 s.
+    fn ci_envelope() -> crate::reach::Envelope {
+        let run = |shift: f64| -> Vec<(f64, u64)> {
+            (0..=150)
+                .map(|i| i as f64 * 2.0)
+                .map(|t| (t, if (40.0 + shift..=70.0 + shift).contains(&t) { 18 * GB } else { 2 * GB }))
+                .collect()
+        };
+        let curves = [0.0, 6.0, -6.0].iter().map(|s| crate::reach::Curve::from_samples(&run(*s), 300.0).unwrap()).collect();
+        crate::reach::Envelope::of(curves, 3).unwrap()
+    }
+
+    /// #7: a job past its peak books what its past runs still reached from
+    /// its age on, not its whole peak, so a waiting job starts. Before its
+    /// peak, and after it went above the curve, it books its whole need.
+    #[test]
+    fn a_job_past_its_peak_reserves_only_what_it_can_still_reach() {
+        let env = ci_envelope();
+        let mut ci = Entry { started_at: Some(1000.0), ..job(1, "ci", 2.0, 18) };
+        let test = job(2, "test", 1.0, 8);
+        let at = |ci: &mut Entry, age: f64, live_gb: u64| {
+            ci.live_mem_kb = live_gb * GB;
+            let flat = ci.reach_flat_kb.unwrap_or(ci.need_mem_kb);
+            ci.reach(flat, env.need_at(age))
+        };
+        let waits = |ci: &Entry| {
+            blockers(decide(&machine(1.0, 6), &LIM, std::slice::from_ref(ci), std::slice::from_ref(&test), &test, 1000.0, &[]))
+        };
+        // At 20 s its peak is still to come: 6 + 16 reserved + 8 > 27.2 GB.
+        assert!(!at(&mut ci, 20.0, 2));
+        assert_eq!(ci.need_mem_kb, 18 * GB);
+        assert_eq!(waits(&ci), vec!["memory"]);
+        // At 120 s its past runs reached 2 GB at most: it books 2.3 GB.
+        assert!(!at(&mut ci, 120.0, 2));
+        assert_eq!((ci.need_mem_kb, ci.reach_flat_kb), ((2.0 * GB as f64 * crate::reach::MARGIN) as u64, Some(18 * GB)));
+        assert_eq!(waits(&ci), Vec::<&str>::new(), "the test starts");
+        // It goes above that curve: its whole need again, for the rest of the run.
+        assert!(at(&mut ci, 140.0, 5), "it just went above the curve");
+        assert_eq!((ci.need_mem_kb, ci.reach_flat_kb, ci.reach_missed), (18 * GB, None, true));
+        assert!(!at(&mut ci, 200.0, 2));
+        assert_eq!(ci.need_mem_kb, 18 * GB);
+        // Past the end of its past runs, too.
+        let mut late = Entry { started_at: Some(1000.0), ..job(1, "ci", 2.0, 18) };
+        at(&mut late, 400.0, 2);
+        assert_eq!(late.need_mem_kb, 18 * GB);
+    }
+
+    #[test]
+    fn a_steady_stack_and_needs_set_by_hand_ignore_the_curve() {
+        let env = ci_envelope();
+        let mut by_hand = Entry { started_at: Some(1000.0), by_hand: Some("set by hand".into()), ..job(1, "ci", 2.0, 18) };
+        by_hand.reach(18 * GB, env.need_at(120.0));
+        assert_eq!(by_hand.need_mem_kb, 18 * GB);
+        let mut steady = Entry { started_at: Some(1000.0), steady_since: Some(1300.0), ..job(1, "stack", 2.0, 5) };
+        steady.reach(5 * GB, env.need_at(120.0));
+        assert_eq!(steady.need_mem_kb, 5 * GB, "a steady stack books what it holds plus a quarter, as before");
+    }
+
     #[test]
     fn memory_and_cpu_include_the_reserve() {
         let mut running = job(1, "api", 4.0, 18);
@@ -2798,6 +2897,40 @@ mod tests {
         assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])), vec!["memory"]);
         assert_eq!(need_with_booking(&stack, &busy), 94 * GB / 10 + 43 * GB / 10);
         assert!(blockers(decide(&machine(1.0, 15), &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+    }
+
+    /// #27, with its numbers: 10 cores, 32 GB, mem_max 90 (28.8 GB). Programs
+    /// outside taskguard held 17.4 GB; the stack needs 9.2 GB, its proof job
+    /// 4.0 GB. The stack alone fit and started, and then held 7.3 GB idle for
+    /// 39 minutes while its proof job waited, 1.8 GB short. Once the stack
+    /// expects the proof job, declared or from its history, it does not start
+    /// for a job that cannot; when it does start, its proof job does too.
+    #[test]
+    fn a_stack_is_not_started_for_a_proof_job_that_cannot_start() {
+        let lim = Limits { mem_max_pct: 90.0, outside_mem_max_pct: crate::commands::outside_ceiling(90.0, 92.0), ..LIM };
+        let alone = Entry { long_lived: true, priority: 10, need_mem_kb: 92 * GB / 10, ..job(2, "dev-env:stack", 3.0, 0) };
+        let mut stack = Entry { pid: 11, ..expecting(alone.clone()) };
+        stack.expects[0].mem_kb = 4 * GB;
+        let m = MachineSample::fixed(1.0, 10, 174 * GB / 10, 32 * GB);
+        // A small job of taskguard's runs, holding what it needs.
+        let busy = [Entry { started_at: Some(990.0), live_mem_kb: GB / 2, ..job(5, "lint", 1.0, 0) }];
+        // Before: the stack alone fits (26.6 of 28.8 GB) and starts.
+        assert!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&alone), &alone, 1000.0, &[])).is_empty());
+        // Expecting its proof job it waits: 30.6 GB, over 28.8 and over the
+        // 29.4 GB that outside_admit allows when only other programs keep it out.
+        assert_eq!(blockers(decide(&m, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])), vec!["memory"]);
+        // With 2 GB more free, the stack and its booked run fit together.
+        let freer = MachineSample::fixed(1.0, 10, 154 * GB / 10, 32 * GB);
+        assert!(blockers(decide(&freer, &lim, &busy, std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+        // With nothing of taskguard's running, the pair may start up to all of
+        // RAM; then, with the stack steady at 7.3 GB (24.7 GB held, as in the
+        // issue), its proof job is the first in line and starts too.
+        assert!(blockers(decide(&m, &lim, &[], std::slice::from_ref(&stack), &stack, 1000.0, &[])).is_empty());
+        let up = Entry { need_mem_kb: 92 * GB / 10, ..expecting(steady_stack(11, 0)) };
+        let up = Entry { live_mem_kb: 73 * GB / 10, expects: vec![Expect { mem_kb: 4 * GB, ..up.expects[0].clone() }], ..up };
+        let run = Entry { need_mem_kb: 4 * GB, ..run_for(Some(0)) };
+        let held = MachineSample::fixed(1.0, 10, 247 * GB / 10, 32 * GB);
+        assert!(blockers(decide(&held, &lim, std::slice::from_ref(&up), std::slice::from_ref(&run), &run, 3400.0, &[])).is_empty());
     }
 
     #[test]
@@ -3716,6 +3849,22 @@ mod tests {
         // A job outside any run is still held back by the reservation.
         let other = job(4, "other", 1.0, 1);
         assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, r, &[passed, other.clone()], &other, 1000.0, &[])), vec!["reserved"]);
+    }
+
+    /// #4: an e2e run passed for long holds nobody back while its own pool's
+    /// one slot is taken: it could not start in the room it holds.
+    #[test]
+    fn a_reservation_whose_pool_is_full_holds_nobody_back() {
+        let pooled = |e: Entry| Entry { pool_key: Some("e2e@/w".into()), pool_slots: Some(1), ..e };
+        let running = pooled(Entry { started_at: Some(500.0), ..job(1, "e2e:a", 1.0, 2) });
+        let mut passed = pooled(job(2, "e2e:b", 1.0, 2));
+        (passed.queued_at, passed.bypassed_since) = (600.0, Some(610.0));
+        let lint = job(3, "lint", 1.0, 1);
+        let waiting = [passed.clone(), lint.clone()];
+        assert!(blockers(decide(&machine(1.0, 8), &LIM, std::slice::from_ref(&running), &waiting, &lint, 1000.0, &[])).is_empty());
+        // Once its slot is free, it holds them back again.
+        let other = job(4, "other", 1.0, 1);
+        assert_eq!(blockers(decide(&machine(1.0, 8), &LIM, &[other], &waiting, &lint, 1000.0, &[])), vec!["reserved"]);
     }
 
     /// The circle seen with several DALP gates at once, all three jobs fitting:
