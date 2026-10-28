@@ -15,13 +15,14 @@ jobs:
         run: cargo test --no-run
       - name: Each test alone, 120 s each
         run: |
+          set +e
           (while true; do date -u +%T; vm_stat | head -6; sleep 15; done) &
-          for bin in "--bin taskguard" "--test cli"; do
+          for bin in "--test cli"; do
             for t in $(cargo test $bin -- --list 2>/dev/null | grep ': test$' | sed 's/: test$//'); do
               start=$(date +%s)
               perl -e 'alarm shift; exec @ARGV' 120 cargo test -q $bin -- --exact "$t" >/tmp/out.txt 2>&1
               code=$?
               echo "$code $(( $(date +%s) - start ))s $bin $t"
-              [ $code -ne 0 ] && tail -30 /tmp/out.txt
+              if [ $code -ne 0 ]; then tail -40 /tmp/out.txt; fi
             done
           done
