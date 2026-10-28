@@ -6,24 +6,35 @@ on:
 jobs:
   test:
     runs-on: macos-latest
-    timeout-minutes: 40
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build && cargo test --no-run
-      - name: Machine as taskguard sees it
+        run: cargo test --no-run
+      - name: Plain cargo test with a watchdog
         run: |
           set +e
-          sysctl hw.memsize hw.ncpu
-          vm_stat
-          memory_pressure | tail -3
-          TASKGUARD_DIR=/tmp/tgs target/debug/taskguard -- sh -c 'sleep 1'
-          TASKGUARD_DIR=/tmp/tgs target/debug/taskguard status | head -12
-      - name: Plain cargo test, 10 min
-        run: |
-          set +e
-          (while true; do sleep 20; date -u +%T; ps -axo pid,ppid,rss,etime,command | grep -E 'taskguard|sleep|sh -c' | grep -v grep | cut -c1-200; done) &
-          perl -e 'alarm shift; exec @ARGV' 600 cargo test
-          echo "exit $?"
+          cargo test > /tmp/test.log 2>&1 &
+          T=$!
+          start=$(date +%s)
+          while kill -0 $T 2>/dev/null; do
+            sleep 2
+            n=$(ps -ax | wc -l | tr -d ' ')
+            free=$(( $(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); print $3}') * 16 / 1024 ))
+            el=$(( $(date +%s) - start ))
+            [ $(( el % 20 )) -lt 2 ] && echo "t=${el}s procs=$n free=${free}MB"
+            if [ "$n" -gt 400 ] || [ "$free" -lt 400 ] || [ "$el" -gt 420 ]; then
+              echo "WATCHDOG t=${el}s procs=$n free=${free}MB"
+              ps -axo pid,ppid,rss,etime,command | sort -k3 -n -r | head -25 | cut -c1-220
+              echo "--- by command"
+              ps -axo command | cut -c1-120 | sort | uniq -c | sort -n -r | head -15
+              echo "--- test log tail"
+              tail -60 /tmp/test.log
+              pkill -9 -f 'target/debug' ; pkill -9 cargo
+              break
+            fi
+          done
+          wait $T; echo "exit $?"
+          grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
