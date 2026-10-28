@@ -14,42 +14,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo test --no-run
-      - name: Root watchdog for stopped processes
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Root watchdog for the test step
         run: |
           cat > /tmp/wd.sh <<'EOS'
           #!/bin/bash
-          while true; do
-            sleep 1
-            n=$(ps -axo stat=,user= | awk '$1 ~ /^T/ && $2 == "runner"' | wc -l | tr -d ' ')
-            if [ "$n" -gt 15 ]; then
-              {
-                echo "STOPPED $n processes at $(date -u +%T)"
-                ps -axo pid,ppid,user,stat,etime,command | awk 'NR==1 || $4 ~ /^T/' | head -40 | cut -c1-200
-                echo "--- test processes"
-                ps -axo pid,ppid,stat,etime,command | grep -E "target/debug|helper_|sleep|sh -c" | grep -v grep | cut -c1-220
-                echo "--- log tail"
-                tail -40 /tmp/test.log
-              } >> /tmp/wd.log
-              pkill -CONT -u runner
-              sleep 5
-              pkill -CONT -u runner
-            fi
-          done
+          # Wait for the test step to start, then give it 6 minutes.
+          until pgrep -f 'cargo test' >/dev/null; do sleep 1; done
+          sleep 360
+          {
+            echo "=== still running after 6 min at $(date -u +%T)"
+            ps -axo pid,ppid,user,stat,etime,command | grep -E "runner" | grep -vE "Runner\.|/System/|/usr/libexec|/usr/sbin" | cut -c1-220
+            echo "=== open pipes of runner processes"
+            lsof -nP -u runner 2>/dev/null | grep -E "PIPE|FIFO" | grep -vE "^(Runner|Spotlight)" | head -80
+          } > /tmp/wd.log 2>&1
+          pkill -9 -f 'target/debug'
+          pkill -9 cargo
           EOS
           chmod +x /tmp/wd.sh
           sudo nohup /tmp/wd.sh > /dev/null 2>&1 &
-      - name: Plain cargo test, twice
-        run: |
-          set +e
-          for round in 1 2; do
-            echo "=== round $round"
-            perl -e 'alarm shift; exec @ARGV' 300 cargo test > /tmp/test.log 2>&1
-            echo "exit $?"
-            grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
-            pkill -9 -f 'target/debug/deps'
-          done
-          echo "--- watchdog log"
-          cat /tmp/wd.log 2>/dev/null || echo "(nothing stopped)"
+      - name: Test
+        run: cargo test
+      - name: Watchdog log
+        if: always()
+        run: cat /tmp/wd.log 2>/dev/null || echo "(the test step ended within 6 minutes)"
