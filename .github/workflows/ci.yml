@@ -17,34 +17,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo test --no-run
-      - name: Plain cargo test with a watchdog
+      - name: Root watchdog for stopped processes
+        run: |
+          cat > /tmp/wd.sh <<'EOS'
+          #!/bin/bash
+          while true; do
+            sleep 1
+            n=$(ps -axo stat=,user= | awk '$1 ~ /^T/ && $2 == "runner"' | wc -l | tr -d ' ')
+            if [ "$n" -gt 15 ]; then
+              {
+                echo "STOPPED $n processes at $(date -u +%T)"
+                ps -axo pid,ppid,user,stat,etime,command | awk 'NR==1 || $4 ~ /^T/' | head -40 | cut -c1-200
+                echo "--- test processes"
+                ps -axo pid,ppid,stat,etime,command | grep -E "target/debug|helper_|sleep|sh -c" | grep -v grep | cut -c1-220
+                echo "--- log tail"
+                tail -40 /tmp/test.log
+              } >> /tmp/wd.log
+              pkill -CONT -u runner
+              sleep 5
+              pkill -CONT -u runner
+            fi
+          done
+          EOS
+          chmod +x /tmp/wd.sh
+          sudo nohup /tmp/wd.sh > /dev/null 2>&1 &
+      - name: Plain cargo test, twice
         run: |
           set +e
           for round in 1 2; do
-          echo "=== round $round"
-          cargo test > /tmp/test.log 2>&1 &
-          T=$!
-          start=$(date +%s)
-          while kill -0 $T 2>/dev/null; do
-            sleep 2
-            n=$(ps -ax | wc -l | tr -d ' ')
-            free=$(( $(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); print $3}') * 16 / 1024 ))
-            el=$(( $(date +%s) - start ))
-            [ $(( el % 20 )) -lt 2 ] && echo "t=${el}s procs=$n free=${free}MB"
-            if [ "$n" -gt 900 ] || [ "$free" -lt 250 ] || [ "$el" -gt 300 ]; then
-              echo "WATCHDOG t=${el}s procs=$n free=${free}MB"
-              grep -E "running for over" /tmp/test.log
-              for p in $(pgrep -f 'target/debug/deps'); do echo "--- sample $p"; sample $p 3 2>/dev/null | grep -E "taskguard|cli::|std::thread|wait|read|sleep" | head -40; done
-              echo "--- test processes"
-              ps -axo pid,ppid,stat,etime,command | grep -E "target/debug|sleep|sh -c|helper_" | grep -v grep | cut -c1-220
-              echo "--- by command"
-              ps -axo command | cut -c1-120 | sort | uniq -c | sort -n -r | head -15
-              echo "--- test log tail"
-              tail -60 /tmp/test.log
-              pkill -9 -f 'target/debug' ; pkill -9 cargo
-              break
-            fi
+            echo "=== round $round"
+            perl -e 'alarm shift; exec @ARGV' 300 cargo test > /tmp/test.log 2>&1
+            echo "exit $?"
+            grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
+            pkill -9 -f 'target/debug/deps'
           done
-          wait $T; echo "exit $?"
-          grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
-          done
+          echo "--- watchdog log"
+          cat /tmp/wd.log 2>/dev/null || echo "(nothing stopped)"
