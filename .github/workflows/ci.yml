@@ -21,9 +21,9 @@ jobs:
           memory_pressure | tail -3
           TASKGUARD_DIR=/tmp/tgs target/debug/taskguard -- sh -c 'sleep 1'
           TASKGUARD_DIR=/tmp/tgs target/debug/taskguard status | head -12
-      - name: CLI tests in parallel, 10 min
+      - name: Unit tests in parallel, 10 min
         run: |
           set +e
-          (while true; do sleep 20; date -u +%T; ps -axo pid,ppid,rss,etime,command | grep -E 'taskguard|helper_|sleep' | grep -v grep | cut -c1-200; done) &
-          perl -e 'alarm shift; exec @ARGV' 600 cargo test --test cli 2>&1
+          (while true; do sleep 20; date -u +%T; ps -axo pid,ppid,rss,etime,command | grep -E 'taskguard|sleep|sh -c' | grep -v grep | cut -c1-200; done) &
+          perl -e 'alarm shift; exec @ARGV' 600 cargo test --bin taskguard 2>&1
           echo "exit $?"
