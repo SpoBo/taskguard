@@ -11,18 +11,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build tests
-        run: cargo test --no-run
-      - name: Each test alone, 120 s each
+      - name: Build
+        run: cargo build && cargo test --no-run
+      - name: Machine as taskguard sees it
         run: |
           set +e
-          (while true; do date -u +%T; vm_stat | head -6; sleep 15; done) &
-          for bin in "--test cli"; do
-            for t in $(cargo test $bin -- --list 2>/dev/null | grep ': test$' | sed 's/: test$//'); do
-              start=$(date +%s)
-              perl -e 'alarm shift; exec @ARGV' 120 cargo test -q $bin -- --exact "$t" >/tmp/out.txt 2>&1
-              code=$?
-              echo "$code $(( $(date +%s) - start ))s $bin $t"
-              if [ $code -ne 0 ]; then tail -40 /tmp/out.txt; fi
-            done
-          done
+          sysctl hw.memsize hw.ncpu
+          vm_stat
+          memory_pressure | tail -3
+          TASKGUARD_DIR=/tmp/tgs target/debug/taskguard -- sh -c 'sleep 1'
+          TASKGUARD_DIR=/tmp/tgs target/debug/taskguard status | head -12
+      - name: CLI tests in parallel, 10 min
+        run: |
+          set +e
+          (while true; do sleep 20; date -u +%T; ps -axo pid,ppid,rss,etime,command | grep -E 'taskguard|helper_|sleep' | grep -v grep | cut -c1-200; done) &
+          perl -e 'alarm shift; exec @ARGV' 600 cargo test --test cli 2>&1
+          echo "exit $?"
