@@ -5,6 +5,10 @@ on:
 
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4]
     runs-on: macos-latest
     timeout-minutes: 25
     steps:
@@ -16,6 +20,8 @@ jobs:
       - name: Plain cargo test with a watchdog
         run: |
           set +e
+          for round in 1 2; do
+          echo "=== round $round"
           cargo test > /tmp/test.log 2>&1 &
           T=$!
           start=$(date +%s)
@@ -25,9 +31,12 @@ jobs:
             free=$(( $(vm_stat | awk '/Pages free/ {gsub("\\.","",$3); print $3}') * 16 / 1024 ))
             el=$(( $(date +%s) - start ))
             [ $(( el % 20 )) -lt 2 ] && echo "t=${el}s procs=$n free=${free}MB"
-            if [ "$n" -gt 900 ] || [ "$free" -lt 250 ] || [ "$el" -gt 420 ]; then
+            if [ "$n" -gt 900 ] || [ "$free" -lt 250 ] || [ "$el" -gt 300 ]; then
               echo "WATCHDOG t=${el}s procs=$n free=${free}MB"
-              ps -axo pid,ppid,rss,etime,command | sort -k3 -n -r | head -25 | cut -c1-220
+              grep -E "running for over" /tmp/test.log
+              for p in $(pgrep -f 'target/debug/deps'); do echo "--- sample $p"; sample $p 3 2>/dev/null | grep -E "taskguard|cli::|std::thread|wait|read|sleep" | head -40; done
+              echo "--- test processes"
+              ps -axo pid,ppid,stat,etime,command | grep -E "target/debug|sleep|sh -c|helper_" | grep -v grep | cut -c1-220
               echo "--- by command"
               ps -axo command | cut -c1-120 | sort | uniq -c | sort -n -r | head -15
               echo "--- test log tail"
@@ -38,3 +47,4 @@ jobs:
           done
           wait $T; echo "exit $?"
           grep -E "test result|running for over|panicked|FAILED" /tmp/test.log
+          done
