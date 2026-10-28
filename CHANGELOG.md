@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-28
+
 ### Added
 
 - `boost = false` in a `[pool.NAME]` or `[[job]]` section: a run of that
@@ -475,7 +477,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/SpoBo/taskguard/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/SpoBo/taskguard/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/SpoBo/taskguard/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/SpoBo/taskguard/compare/v0.8.0...v0.9.0
