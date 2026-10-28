@@ -360,14 +360,14 @@ fn helper_reads_a_mapped_file() {
 fn a_mapped_file_is_not_learned_as_memory() {
     let e = Env::new("sample_every = 0.2\n");
     let file = e.file("mapped");
-    std::fs::write(&file, vec![1u8; 192 << 20]).unwrap();
+    std::fs::write(&file, vec![1u8; 48 << 20]).unwrap();
     let me = std::env::current_exe().unwrap();
     let me = me.to_str().unwrap();
     let mut c = e.cmd(&["--key", "mapped", "--", me, "helper_reads_a_mapped_file", "--exact", "--test-threads=1"]);
     let out = c.env("TG_TEST_MAP", &file).output().unwrap();
     assert!(out.status.success(), "{}", stderr(&out));
     let peak: i64 = e.db().query_row("SELECT peak_mem_kb FROM runs WHERE key = 'mapped'", [], |r| r.get(0)).unwrap();
-    assert!(peak < 64 << 10, "it held {peak} kB of its own, not the 192 MB file it mapped");
+    assert!(peak < 24 << 10, "it held {peak} kB of its own, not the 48 MB file it mapped");
 }
 
 #[test]
@@ -671,12 +671,12 @@ fn holding(e: &Env, args: &[&str], hold: &str) -> Output {
 #[test]
 fn a_stack_that_grows_after_its_start_up_is_admitted_against_its_start_up_peak() {
     let e = Env::new("sample_every = 0.2\n[pool.stack]\nlong_lived = true\nstartup = 2\n");
-    // 40 MB while it starts, then it grows to 160 MB while it serves.
-    let out = holding(&e, &["--id", "stack", "--key", "stack"], "40:3,160:3");
+    // 10 MB while it starts, then it grows to 40 MB while it serves.
+    let out = holding(&e, &["--id", "stack", "--key", "stack"], "10:3,40:3");
     assert!(out.status.success(), "{}", stderr(&out));
     let (peak, startup): (i64, i64) =
         e.db().query_row("SELECT peak_mem_kb, startup_mem_kb FROM runs", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-    assert!(peak > 150 << 10 && startup < 100 << 10, "whole run {peak} kB, start-up {startup} kB");
+    assert!(peak > 35 << 10 && startup < 25 << 10, "whole run {peak} kB, start-up {startup} kB");
     let dump: serde_json::Value = serde_json::from_slice(&e.run(&["dump", "stack"]).stdout).unwrap();
     let next = dump["jobs"][0]["next_need"]["mem_kb"].as_i64().unwrap();
     assert_eq!(next, startup, "the next run is admitted against the start-up peak, not the {peak} kB it grew to");
@@ -689,9 +689,10 @@ fn a_running_job_past_its_peak_books_only_what_its_past_runs_still_reached() {
     let remaining = Env::new("sample_every = 0.2\n");
     let peak = Env::new("sample_every = 0.2\nreserve = \"peak\"\n");
     for e in [&remaining, &peak] {
-        // Three runs: 160 MB for 2 s, then 20 MB.
+        // Three runs: 64 MB for 2 s, then 8 MB. A curve keeps drops of more
+        // than 32 MB.
         for _ in 0..3 {
-            let out = holding(e, &["--key", "ci"], "160:2,20:1");
+            let out = holding(e, &["--key", "ci"], "64:2,8:1");
             assert!(out.status.success(), "{}", stderr(&out));
         }
         let curves: Vec<String> =
@@ -700,7 +701,7 @@ fn a_running_job_past_its_peak_books_only_what_its_past_runs_still_reached() {
             let c: serde_json::Value = serde_json::from_str(c).unwrap();
             let p = c["p"].as_array().unwrap();
             let (top, rest) = (p[0][1].as_u64().unwrap(), p.last().unwrap()[1].as_u64().unwrap());
-            assert!(top > 150 << 10 && rest < 80 << 10, "each run records the most it still reached from each moment on: {c}");
+            assert!(top > 56 << 10 && rest < 24 << 10, "each run records the most it still reached from each moment on: {c}");
         }
         // The curve is widened by at least 10 s; as if the runs went on idle
         // for minutes, so a run 13 s in is still within them.
@@ -709,7 +710,7 @@ fn a_running_job_past_its_peak_books_only_what_its_past_runs_still_reached() {
     let hold = |e: &Env| {
         let me = std::env::current_exe().unwrap();
         e.cmd(&["--key", "ci", "--", me.to_str().unwrap(), "helper_holds_memory", "--exact", "--test-threads=1"])
-            .env("TG_TEST_HOLD", "20:15")
+            .env("TG_TEST_HOLD", "8:15")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -726,11 +727,11 @@ fn a_running_job_past_its_peak_books_only_what_its_past_runs_still_reached() {
         std::thread::sleep(Duration::from_millis(200));
     };
     let (need, flat) = (lowered["need_mem_kb"].as_u64().unwrap(), lowered["reach_flat_kb"].as_u64().unwrap());
-    assert!(flat > 150 << 10 && need < 80 << 10, "it books {need} kB, not its peak of {flat} kB");
+    assert!(flat > 56 << 10 && need < 28 << 10, "it books {need} kB, not its peak of {flat} kB");
     let status = String::from_utf8_lossy(&remaining.run(&["status"]).stdout).into_owned();
     assert!(status.contains("PAST-PEAK"), "{status}");
     let kept = running_job(&peak).unwrap();
-    assert!(kept["reach_flat_kb"].is_null() && kept["need_mem_kb"].as_u64().unwrap() > 150 << 10, "{kept}");
+    assert!(kept["reach_flat_kb"].is_null() && kept["need_mem_kb"].as_u64().unwrap() > 56 << 10, "{kept}");
     for c in [a, b] {
         assert!(c.wait_with_output().unwrap().status.success());
     }
