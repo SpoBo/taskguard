@@ -10,6 +10,23 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `taskguard top` says where the load goes now, under "now, by where it
+  runs" in the Overview's legend. It shows CPU, memory and IO for this
+  machine, for taskguard's jobs, for each running dev stack (a `devenv up`
+  or `process-compose` tree, also one that taskguard did not start), and
+  what is left: "untracked", such as idle agents. A stack that runs as a
+  taskguard job has one line, in the colour of its namespace, and is not
+  counted again under jobs. On Linux the machine total comes from this
+  machine's own cgroup (CPU time, memory without the file cache the kernel
+  can drop, and bytes read and written). In a container, such as an LXC
+  container on Proxmox, /proc/stat and /proc/pressure describe the whole
+  host: the busy cores and the CPU and IO waits that the cgroup does not
+  explain show as "outside". On bare metal the cgroup is the whole host,
+  and that line is left out. macOS has no cgroups: the total is the
+  machine's, as in the chart, with no IO and no "outside" line.
+
 ## [0.13.0] - 2026-11-03
 
 ### Added

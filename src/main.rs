@@ -8,6 +8,7 @@ mod config;
 mod dash;
 mod db;
 mod dump;
+mod explain;
 mod groups;
 mod help;
 mod insight;

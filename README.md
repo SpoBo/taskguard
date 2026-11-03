@@ -604,7 +604,7 @@ run, and the minimum to pin when a job starves again and again.
 
 | View | What it shows |
 | --- | --- |
-| 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace. The load it did not start is split into groups: agents (with everything they started), browsers, editors, dev services such as databases, containers, and chat and other apps. The legend names the biggest programs in each group, so you can see what to close to make room. A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
+| 1 Overview | Machine CPU and memory over time. The load of jobs taskguard started is stacked in colour per namespace. The load it did not start is split into groups: agents (with everything they started), browsers, editors, dev services such as databases, containers, and chat and other apps. The legend names the biggest programs in each group, so you can see what to close to make room. Below them, "now, by where it runs" splits this machine's CPU, memory and IO into taskguard's jobs, each running dev stack, and what is left untracked, and shows the load outside this machine (see below). A strip shows how many jobs waited, coloured by reason, and `!` marks a starved run. |
 | 2 Queue | Running jobs, then waiting ones, as a tree: the jobs of one task-runner run sit under one row named by the command that started it (`bun run ci:local`), and the taskguard calls running inside a job (a dev stack's start-up builds) under that job, with their CPU and memory. `←` folds a row, `→` unfolds it, and `Enter` on a run's row does both. The bars show in red the load that running jobs have above their estimates. The Why panel checks every rule for the selected job, with numbers, and says what will unblock it and when. `g` starts a waiting job now, and `e` sets a job's needs for this run only (for example `2 4G`), so it can fit into room you know it will not outgrow. |
 | 3 Runs | Past runs, sortable and filterable, with the reasons each one waited. |
 | 4 Tasks | Every task taskguard knows, with its namespace, runs, last run, and what it learned. `n` (namespace), `/` (text) and `a` (not run for 1, 7, 30 or 90 days) filter the list. `x` prunes every run of the selected task; `X` prunes every task the filters leave, and needs a filter. Both ask first. Pruned runs move aside, as with `taskguard prune`, and `taskguard prune --undo --apply` puts them back. In a job's view, `x` prunes the selected run. |
@@ -612,6 +612,17 @@ run, and the minimum to pin when a job starves again and again.
 | 6 Warnings | Starved runs with the evidence, suggested minimums, trend alerts, and `--now` runs that went over a limit. |
 | 7 Namespaces | CPU-hours, GB-hours, runs, waits and starved runs per namespace. |
 | 8 Config | The limits, other settings and the slot ceiling of each pool. `←`/`→` change one. `Enter` on a pool lists its match patterns: `a` adds one, `d` removes one. `n` adds a new pool. The first change asks where to save it: your user config (every repo) or this worktree's `.taskguard.toml`; `w` switches later. Comments are kept. Jobs that already wait follow the change. |
+
+**Where the load goes now.** The Overview's legend splits the live load of
+this machine, with CPU, memory and IO for each line:
+
+| Line | What it is |
+| --- | --- |
+| machine | This machine. On Linux, its own cgroup v2: the top of the cgroup tree it can see (`cpu.stat` usage, `memory.current` without the file cache the kernel can drop, `io.stat` bytes). On macOS, or without a cgroup v2, the totals of the chart, with "no cgroup" under it. |
+| jobs | taskguard's running jobs that are not dev stacks. |
+| dev stacks | Each running `devenv up` or `process-compose` tree, named by the directory it runs in, also when taskguard did not start it (`▒▒`). A stack that runs as a taskguard job is one line in its namespace's colour (`██`), and is not counted again under jobs. |
+| untracked | The machine minus the jobs and the stacks: idle agents, editors, and so on. |
+| outside | Linux in a container only. In an LXC container `/proc/stat` and `/proc/pressure` describe the whole host, while the cgroup describes this machine. The busy cores, and the share of time tasks waited for a core or for IO ("some"), that the host shows beyond the cgroup are load outside this machine: another container on the same host. On bare metal the cgroup is the whole host, so the line is left out. |
 
 `Enter` on a row opens that job: its learned needs and where each comes
 from, sparklines over its runs, and what taskguard changed on its own. For a

@@ -65,7 +65,10 @@ const TOP: &str = "\
 taskguard top [--view NAME] [--range RANGE] [--job KEY] [--print [--width N] [--height N] [--keys]]
 
 The dashboard: the machine, the queue, past runs, every known task, trends
-and warnings. Inside it, ? lists the keys of the view you are in. In the
+and warnings. Inside it, ? lists the keys of the view you are in. The
+Overview says where the load goes now: taskguard's jobs, each running dev
+stack (devenv up, process-compose), what is left untracked on this machine,
+and on Linux in a container, the load of the host outside it. In the
 Queue view (tab 2), the jobs of one task-runner run (a `turbo run`) sit under
 one row named by the command that started it, and the taskguard calls running
 inside a job sit under that job: ← folds a row, → unfolds it, and Enter on a

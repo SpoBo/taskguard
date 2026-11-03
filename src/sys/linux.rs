@@ -42,30 +42,14 @@ pub fn raise_oom_score() {
 }
 
 pub fn cpu_ticks() -> CpuTicks {
-    let Ok(text) = fs::read_to_string("/proc/stat") else {
-        return CpuTicks::default();
-    };
-    let Some(line) = text.lines().find(|l| l.starts_with("cpu ")) else {
-        return CpuTicks::default();
-    };
-    // user nice system idle iowait irq softirq steal
-    let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
-    let get = |i: usize| v.get(i).copied().unwrap_or(0);
-    let busy = get(0) + get(1) + get(2) + get(5) + get(6) + get(7);
-    CpuTicks { busy, total: busy + get(3) + get(4) }
+    fs::read_to_string("/proc/stat").ok().and_then(|t| super::parse_stat(&t)).map(|(t, _)| t).unwrap_or_default()
 }
 
 /// One line ("some" or "full") of a pressure-stall file: "avg10", the share
 /// of the last 10 seconds in which tasks stalled, and "total", the
 /// microseconds they stalled since boot. None on a kernel without PSI.
 fn psi(resource: &str, line: &str) -> Option<Psi> {
-    parse_psi(&fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?, line)
-}
-
-pub(crate) fn parse_psi(text: &str, line: &str) -> Option<Psi> {
-    let l = text.lines().find(|l| l.split_whitespace().next() == Some(line))?;
-    let field = |name: &str| l.split_whitespace().find_map(|f| f.strip_prefix(name));
-    Some(Psi { avg10: field("avg10=")?.parse().ok()?, total_us: field("total=")?.parse().ok()? })
+    super::parse_psi(&fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?, line)
 }
 
 /// Memory "some avg10": the share of the last 10 seconds in which at least
@@ -192,17 +176,15 @@ pub fn proc_path(pid: i32) -> Option<String> {
     fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.display().to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Bytes the process and its threads read from and wrote to storage since it
+/// started. None when it is gone or belongs to another user.
+pub fn proc_io_bytes(pid: i32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    let field = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.trim().parse::<u64>().ok());
+    Some(field("read_bytes:")? + field("write_bytes:")?)
+}
 
-    #[test]
-    fn psi_lines_are_parsed() {
-        let cpu = "some avg10=40.93 avg60=24.50 avg300=18.84 total=200339435040\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
-        assert_eq!(parse_psi(cpu, "some"), Some(Psi { avg10: 40.93, total_us: 200339435040 }));
-        assert_eq!(parse_psi(cpu, "full"), Some(Psi { avg10: 0.0, total_us: 0 }));
-        // Kernels before 5.13 have no "full" line for CPU.
-        assert_eq!(parse_psi("some avg10=1.50 avg60=0 avg300=0 total=1\n", "full"), None);
-        assert_eq!(parse_psi("", "some"), None);
-    }
+/// The directory the process runs in.
+pub fn proc_cwd(pid: i32) -> Option<String> {
+    fs::read_link(format!("/proc/{pid}/cwd")).ok().map(|p| p.display().to_string())
 }
