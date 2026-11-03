@@ -31,6 +31,9 @@ pub fn limits(cfg: &Config) -> Limits {
         overcommit_max_pct: overcommit_max(cfg),
         overcommit_after: cfg.overcommit_after.max(0.0),
         overcommit_stuck_after: cfg.overcommit_stuck_after.max(0.0),
+        cpu_pressure_max: cfg.cpu_pressure_max.max(0.0),
+        io_pressure_max: cfg.io_pressure_max.max(0.0),
+        psi_settle: cfg.psi_settle.clamp(0.0, crate::machine::PSI_WINDOW),
     }
 }
 
@@ -536,6 +539,17 @@ pub fn doctor(args: &[String]) -> Result<i32> {
         gb(m.mem_total_kb),
         m.mem_pct(),
         m.mem_pressure.map(|p| format!(", pressure {p:.0}")).unwrap_or_default()
+    );
+    println!(
+        "CPU and IO pressure (PSI): {}",
+        match (m.cpu_pressure, m.io_pressure) {
+            (None, None) => "not available: the gate on them is off".into(),
+            (c, i) => format!(
+                "{}; {}",
+                report::psi_text("cpu some", c, None, cfg.cpu_pressure_max),
+                report::psi_text("io full", i, None, cfg.io_pressure_max)
+            ),
+        }
     );
     let me = sys::proc_sample(std::process::id() as i32);
     println!(

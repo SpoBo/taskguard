@@ -89,6 +89,9 @@ pub fn macbook_limits() -> Limits {
         overcommit_max_pct: 120.0,
         overcommit_after: 120.0,
         overcommit_stuck_after: 1800.0,
+        cpu_pressure_max: 25.0,
+        io_pressure_max: 10.0,
+        psi_settle: 5.0,
     }
 }
 

@@ -1,6 +1,6 @@
 //! Linux readings from /proc.
 
-use super::{CpuTicks, ProcInfo, ProcSample};
+use super::{CpuTicks, ProcInfo, ProcSample, Psi};
 use std::fs;
 use std::sync::OnceLock;
 
@@ -55,12 +55,34 @@ pub fn cpu_ticks() -> CpuTicks {
     CpuTicks { busy, total: busy + get(3) + get(4) }
 }
 
-/// The "some avg10" figure from pressure-stall information: the share of the
-/// last 10 seconds in which at least one task waited on memory.
+/// One line ("some" or "full") of a pressure-stall file: "avg10", the share
+/// of the last 10 seconds in which tasks stalled, and "total", the
+/// microseconds they stalled since boot. None on a kernel without PSI.
+fn psi(resource: &str, line: &str) -> Option<Psi> {
+    parse_psi(&fs::read_to_string(format!("/proc/pressure/{resource}")).ok()?, line)
+}
+
+pub(crate) fn parse_psi(text: &str, line: &str) -> Option<Psi> {
+    let l = text.lines().find(|l| l.split_whitespace().next() == Some(line))?;
+    let field = |name: &str| l.split_whitespace().find_map(|f| f.strip_prefix(name));
+    Some(Psi { avg10: field("avg10=")?.parse().ok()?, total_us: field("total=")?.parse().ok()? })
+}
+
+/// Memory "some avg10": the share of the last 10 seconds in which at least
+/// one task waited on memory.
 pub fn mem_pressure_pct() -> Option<f64> {
-    let text = fs::read_to_string("/proc/pressure/memory").ok()?;
-    let line = text.lines().find(|l| l.starts_with("some"))?;
-    line.split_whitespace().find_map(|f| f.strip_prefix("avg10=")).and_then(|v| v.parse().ok())
+    psi("memory", "some").map(|p| p.avg10)
+}
+
+/// CPU "some": at least one runnable task waited for a core. It counts every
+/// program on the machine, also the load taskguard did not start.
+pub fn cpu_pressure() -> Option<Psi> {
+    psi("cpu", "some")
+}
+
+/// IO "full": every task that could run was stalled on IO at once.
+pub fn io_pressure() -> Option<Psi> {
+    psi("io", "full")
 }
 
 /// The fields after the command name in /proc/<pid>/stat. The name is wrapped
@@ -168,4 +190,19 @@ pub fn proc_args(pid: i32) -> Option<Vec<String>> {
 /// The program's path, for grouping processes that share a name.
 pub fn proc_path(pid: i32) -> Option<String> {
     fs::read_link(format!("/proc/{pid}/exe")).ok().map(|p| p.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn psi_lines_are_parsed() {
+        let cpu = "some avg10=40.93 avg60=24.50 avg300=18.84 total=200339435040\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_psi(cpu, "some"), Some(Psi { avg10: 40.93, total_us: 200339435040 }));
+        assert_eq!(parse_psi(cpu, "full"), Some(Psi { avg10: 0.0, total_us: 0 }));
+        // Kernels before 5.13 have no "full" line for CPU.
+        assert_eq!(parse_psi("some avg10=1.50 avg60=0 avg300=0 total=1\n", "full"), None);
+        assert_eq!(parse_psi("", "some"), None);
+    }
 }

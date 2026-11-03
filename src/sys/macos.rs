@@ -122,6 +122,16 @@ pub fn cpu_ticks() -> CpuTicks {
     CpuTicks { busy, total: busy + t[2] as u64 }
 }
 
+/// macOS has no pressure-stall information for CPU or IO: the gate on them
+/// is off.
+pub fn cpu_pressure() -> Option<super::Psi> {
+    None
+}
+
+pub fn io_pressure() -> Option<super::Psi> {
+    None
+}
+
 /// macOS has no pressure-stall numbers. The kernel's own pressure level is
 /// read instead: 1 normal, 2 warning, 4 critical, mapped to 0, 50 and 100.
 pub fn mem_pressure_pct() -> Option<f64> {

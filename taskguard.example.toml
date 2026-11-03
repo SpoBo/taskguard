@@ -32,6 +32,21 @@ mem_max = 85          # percent of RAM
 pressure_max = 20     # nothing new starts at this memory pressure (macOS: 50 warning, 100 critical)
 warn_admit = true     # macOS warning: jobs still start while memory fits and no first run grows; false = warning stops all
 
+# Linux only (pressure-stall information). The busy cores only show what runs;
+# CPU pressure shows what waits for a core, from every program, also the load
+# taskguard did not start: dev stacks, git, the unwrapped rest of a lint chain.
+# While taskguard's own jobs run and a reading is above its limit, no new job
+# starts, until the reading has stayed at or under it for psi_settle seconds.
+# The gate reads the higher of the 10-second average and the share since the
+# last reading (about 2 s). Above half its limit, or with every core busy
+# while tasks wait, one job starts per reading, so a waiting queue does not
+# start all at once. Running jobs are never stopped. With nothing of taskguard's running but
+# long-lived jobs, the first in line still starts, so outside load cannot stop
+# the queue. Without PSI (macOS, kernels before 4.20) the gate is off.
+cpu_pressure_max = 25 # percent: /proc/pressure/cpu "some avg10"; 0 = off
+io_pressure_max = 10  # percent: /proc/pressure/io "full avg10"; 0 = off
+psi_settle = 5        # seconds the pressure must stay under its limit (at most 60)
+
 # ------------------------------------------------------------ auto pause ----
 # Off by default. When memory in use reaches pause_at, taskguard pauses a
 # running job (SIGSTOP on the command and every process below it): the one

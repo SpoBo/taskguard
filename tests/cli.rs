@@ -28,8 +28,10 @@ impl Env {
             .env("TASKGUARD_DIR", &self.dir)
             .env("TASKGUARD_CONF", &self.conf)
             .env("TASKGUARD_RECORDER_IDLE_EXIT", "3")
-            // Memory pressure on the test machine would hold every job back.
+            // Memory, CPU or IO pressure on the test machine would hold jobs back.
             .env("TASKGUARD_PRESSURE", "0")
+            .env("TASKGUARD_CPU_PRESSURE", "0")
+            .env("TASKGUARD_IO_PRESSURE", "0")
             .env_remove("TASKGUARD_HELD")
             .env_remove("npm_lifecycle_event")
             .env_remove("npm_package_json");
@@ -158,7 +160,8 @@ fn now_skips_the_queue_but_is_still_recorded() {
 #[test]
 fn hints_are_on_by_default_and_set_per_repo_or_per_call() {
     let e = Env::new("");
-    let holder = e.spawn(&["-j1", "--id", "t", "--", "sh", "-c", "touch held; sleep 4"]);
+    // Four waits of 1.5 s follow: the holder outlasts them on a busy machine.
+    let holder = e.spawn(&["-j1", "--id", "t", "--", "sh", "-c", "touch held; sleep 8"]);
     wait_for(&e.file("held"));
     let waiting = |extra: &[&str]| {
         let mut args = vec!["--st", "-1.5", "-j1", "--id", "t"];
@@ -534,6 +537,31 @@ fn nothing_starts_under_memory_pressure() {
     let out = e.cmd(&["--st", "-2", "--", "true"]).env("TASKGUARD_PRESSURE", "100").output().unwrap();
     assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
     assert!(stderr(&out).contains("memory pressure"), "{}", stderr(&out));
+}
+
+#[test]
+fn cpu_pressure_holds_the_next_job_and_status_says_why() {
+    let e = Env::new("learn_stagger = 0\n");
+    let hot = |c: &mut Command| {
+        c.env("TASKGUARD_CPU_PRESSURE", "60");
+    };
+    // With nothing of taskguard's running, the first job starts anyway: the
+    // load comes from other programs, and the queue must not stop.
+    let mut first = e.cmd(&["--", "sh", "-c", "touch a_started; sleep 4"]);
+    hot(&mut first);
+    let first = first.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    wait_for(&e.file("a_started"));
+    // Next to it, the next job waits for the pressure to ease.
+    let mut second = e.cmd(&["--st", "-2", "--", "true"]);
+    hot(&mut second);
+    let out = second.output().unwrap();
+    assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
+    assert!(stderr(&out).contains("CPU pressure: 60% (limit 25%)"), "{}", stderr(&out));
+    let mut status = e.cmd(&["status"]);
+    hot(&mut status);
+    let status = String::from_utf8_lossy(&status.output().unwrap().stdout).into_owned();
+    assert!(status.contains("PSI     cpu some 60.0% (limit 25%)   io full 0.0% (limit 10%)   HOLDS new jobs: CPU pressure"), "{status}");
+    assert!(first.wait_with_output().unwrap().status.success());
 }
 
 #[test]

@@ -33,6 +33,15 @@ pub struct ProcSample {
     pub pageins: u64,
 }
 
+/// One pressure-stall reading (Linux PSI).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Psi {
+    /// The share of the last 10 seconds in which tasks stalled, 0-100.
+    pub avg10: f64,
+    /// Microseconds tasks stalled since boot.
+    pub total_us: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcInfo {
     pub pid: i32,

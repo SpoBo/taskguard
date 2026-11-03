@@ -111,6 +111,36 @@ below).
   their start-up, the rule below for nothing running decides at warning too,
   up to all of RAM. `warn_admit = false` makes warning stop every new job
   again.
+- **CPU and IO pressure stop new jobs while taskguard's jobs run** (Linux).
+  The busy cores only show what runs, and top out at all of them; the
+  kernel's pressure-stall information shows what waits for a core, from
+  every program. On a 32-core machine at a load average of 68, taskguard saw
+  29.6 cores busy and 14.8 promised, and kept starting jobs: dev stacks,
+  `git status` and lint chains whose first command alone is wrapped load the
+  machine where taskguard does not see it, and `outside_admit` lets a job
+  start that only such load keeps out. So while CPU pressure
+  (`/proc/pressure/cpu` "some avg10") is above `cpu_pressure_max` (25), or IO
+  pressure (`/proc/pressure/io` "full avg10") above `io_pressure_max` (10),
+  no new job starts, until the reading has stayed at or under its limit for
+  `psi_settle` (5) seconds, so a reading that dips once does not let a burst
+  in. Running jobs are never stopped. With nothing of taskguard's running
+  but long-lived jobs past their start-up, the rule for nothing running
+  still starts the first in line, so load outside taskguard cannot stop the
+  queue; it then runs one job at a time until the pressure eases.
+  The 10-second average lags a burst, so the gate reads the higher of it
+  and the share since the last reading (about 2 seconds, from the kernel's
+  stall counter). And every waiting job decides on the same reading, so
+  near the limit (above half of it), or with every core busy while tasks
+  wait for one, one job starts per reading: the next waits until a reading
+  has seen it. Without that, the whole queue started the moment the gate
+  opened. `taskguard status` shows both readings on its `PSI` line and the
+  held job says which one holds it. `0` turns a limit off. macOS has no
+  such readings, so there the gate is off. In a model of that evening (26
+  cores busy outside taskguard, a job of 2 cores and 60 s queued every
+  second for two minutes), the gate cut the peak load from 58 to 42 and the
+  time over 1.5 times the cores from 288 s to none; programs outside
+  taskguard ran 1.20 times slower instead of 1.44, and the work ended 10%
+  later. On the 10-second average alone the peak load stayed at 50.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
@@ -360,6 +390,7 @@ below).
 | Machine CPU | host tick counters | `/proc/stat` |
 | Machine memory | the higher of active + wired + compressed, and the kernel's `memorystatus_level` | total - available |
 | Memory pressure | `memorystatus_vm_pressure_level` | `/proc/pressure/memory` |
+| CPU and IO pressure | none (the gate is off) | `/proc/pressure/cpu` "some", `/proc/pressure/io` "full" |
 
 On macOS, active + wired + compressed falls exactly when the machine is in
 trouble: under pressure the kernel moves pages to the inactive list and writes
@@ -687,6 +718,8 @@ mem_max = 85           # percent of RAM
 hints = true           # agent hints on status lines
 outlier_ratio = 1.5    # a peak this many times the next one is an outlier; 0 = off
 outside_admit = true   # start jobs that only other programs keep out
+cpu_pressure_max = 25  # Linux: no new job above this CPU pressure (PSI some avg10) while ours run; 0 = off
+io_pressure_max = 10   # Linux: the same for IO pressure (PSI full avg10)
 partial_fit = 0.5      # a job that cannot fit starts on half its CPU need; 0 = off
 max_backfill = 600     # small jobs pass a stuck job this long, then the machine drains
 expect_wait = 5        # a dev stack waits this long for the work it expects to queue
@@ -858,6 +891,13 @@ know runs: its jobs never step aside for an older run. A version before
 read priorities: its waiting jobs start in ticket order and do not step aside
 for a job with a higher priority. It does not know auto_pause either: its jobs
 are never paused, and its waiting jobs may start while another job is paused.
+
+Versions up to 0.12.0 do not know the CPU and IO pressure gate: their jobs
+start under such pressure, and they see a newer job it holds as one that
+could start, so after 10 seconds they mark it as stalled and pass it. Their
+recorder writes no pressure readings; a newer job then reads the pressure
+itself, without the readings of the last seconds, so it waits only while
+the reading is above its limit.
 
 Versions before 0.4.1 keep the line in ticket order; 0.4.1 and later order it
 by the age of a job's run first. With nothing running, an old and a new owner

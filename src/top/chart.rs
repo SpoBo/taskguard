@@ -128,6 +128,7 @@ pub fn blocker_color(name: &str) -> Color {
     match name {
         "cpu" => Color::Red,
         "pressure" | "paused" => Color::LightMagenta,
+        "cpu_pressure" | "io_pressure" => Color::LightRed,
         "memory" => Color::Magenta,
         "slots" => Color::Yellow,
         "reserved" | "priority" | "pipeline" => Color::Blue,

@@ -35,6 +35,25 @@ pub struct MachineSample {
     /// while their disk has space, what they have free plus that space.
     /// Older versions leave it out.
     pub swap_free_kb: Option<u64>,
+    /// CPU pressure (Linux PSI, `/proc/pressure/cpu` "some avg10"): the share
+    /// of the last 10 seconds in which a runnable task waited for a core.
+    /// None without PSI (macOS, old kernels); older versions leave it out.
+    pub cpu_pressure: Option<f64>,
+    /// IO pressure (Linux PSI, `/proc/pressure/io` "full avg10"): the share
+    /// of the last 10 seconds in which every runnable task stalled on IO.
+    pub io_pressure: Option<f64>,
+    /// The same shares since the reading before this one, from the kernel's
+    /// stall counters (`*_stall_us`): about the last 2 seconds. The 10-second
+    /// average lags a burst; this does not.
+    pub cpu_pressure_last: Option<f64>,
+    pub io_pressure_last: Option<f64>,
+    /// The kernel's stall counters at this reading, microseconds since boot.
+    pub cpu_stall_us: Option<u64>,
+    pub io_stall_us: Option<u64>,
+    /// The CPU and IO pressure the gate holds against (`psi`) over the last
+    /// `PSI_WINDOW` seconds, oldest first: the time, CPU and IO. A reading
+    /// the kernel does not give is 0. Older versions leave it out.
+    pub recent_psi: Vec<(f64, f64, f64)>,
 }
 
 impl MachineSample {
@@ -70,9 +89,65 @@ impl MachineSample {
         self.cpu_busy <= self.cpu_low() + (0.1 * self.ncpu as f64).max(1.0)
     }
 
+    /// The CPU or IO pressure readings of the last `secs` seconds before
+    /// `now`, the current one included, as (time, value). Empty when the
+    /// kernel gives none.
+    pub fn psi_window(&self, kind: Psi, now: f64, secs: f64) -> Vec<(f64, f64)> {
+        let Some(cur) = self.psi(kind) else { return Vec::new() };
+        let pick = |&(_, c, i): &(f64, f64, f64)| match kind {
+            Psi::Cpu => c,
+            Psi::Io => i,
+        };
+        let mut out: Vec<(f64, f64)> =
+            self.recent_psi.iter().filter(|r| r.0 > now - secs && r.0 < self.ts).map(|r| (r.0, pick(r))).collect();
+        out.push((self.ts, cur));
+        out
+    }
+
+    /// The CPU or IO pressure the gate holds against: the higher of the
+    /// 10-second average and the share since the last reading, so a burst
+    /// is seen within one reading and the gate opens only once both are low.
+    pub fn psi(&self, kind: Psi) -> Option<f64> {
+        let (avg10, last) = match kind {
+            Psi::Cpu => (self.cpu_pressure, self.cpu_pressure_last),
+            Psi::Io => (self.io_pressure, self.io_pressure_last),
+        };
+        match (avg10, last) {
+            (Some(a), Some(l)) => Some(a.max(l)),
+            (a, l) => a.or(l),
+        }
+    }
+
     pub fn mem_pct(&self) -> f64 {
         if self.mem_total_kb == 0 { 0.0 } else { self.mem_used_kb as f64 * 100.0 / self.mem_total_kb as f64 }
     }
+}
+
+/// The two pressure-stall readings that hold new jobs back (`queue::psi_hold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Psi {
+    Cpu,
+    Io,
+}
+
+/// CPU and IO pressure now. TASKGUARD_CPU_PRESSURE and TASKGUARD_IO_PRESSURE
+/// fix the 10-second average, with no stall counter, as TASKGUARD_PRESSURE
+/// does for memory, for tests that must not depend on how busy the machine
+/// that runs them is; a value that is no number, such as `none`, stands for
+/// a kernel without PSI.
+fn psi_now() -> (Option<sys::Psi>, Option<sys::Psi>) {
+    let fixed = |var: &str, read: fn() -> Option<sys::Psi>| match std::env::var(var) {
+        Ok(v) => v.parse().ok().map(|avg10| sys::Psi { avg10, total_us: 0 }),
+        Err(_) => read(),
+    };
+    (fixed("TASKGUARD_CPU_PRESSURE", sys::cpu_pressure), fixed("TASKGUARD_IO_PRESSURE", sys::io_pressure))
+}
+
+/// The share of time stalled between two counter readings `dt` seconds apart.
+fn stall_share(prev_us: Option<u64>, now: Option<sys::Psi>, dt: f64) -> Option<f64> {
+    let (prev, now) = (prev_us?, now.filter(|p| p.total_us > 0)?);
+    ((0.2..30.0).contains(&dt) && now.total_us >= prev).then(|| ((now.total_us - prev) as f64 / (dt * 1e4)).min(100.0))
 }
 
 fn path(dir: &Path) -> std::path::PathBuf {
@@ -130,7 +205,11 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
     let mut recent_cpu: Vec<(f64, f64)> =
         prev.map(|p| p.recent_cpu.iter().filter(|(ts, _)| now - ts < LOW_WINDOW).copied().collect()).unwrap_or_default();
     recent_cpu.push((now, cpu_busy));
-    MachineSample {
+    let (cpu_psi, io_psi) = psi_now();
+    let since = prev.map(|p| now - p.ts).unwrap_or(0.0);
+    let mut recent_psi: Vec<(f64, f64, f64)> =
+        prev.map(|p| p.recent_psi.iter().filter(|(ts, _, _)| now - ts < PSI_WINDOW).copied().collect()).unwrap_or_default();
+    let mut s = MachineSample {
         ts: now,
         cpu_busy,
         cpu_inst: inst,
@@ -148,11 +227,27 @@ pub fn measure(prev: Option<&MachineSample>, ours_kb: u64) -> MachineSample {
         ticks_busy: t.busy,
         ticks_total: t.total,
         swap_free_kb: sys::swap_free_kb(),
+        cpu_pressure: cpu_psi.map(|p| p.avg10),
+        io_pressure: io_psi.map(|p| p.avg10),
+        cpu_pressure_last: stall_share(prev.and_then(|p| p.cpu_stall_us), cpu_psi, since),
+        io_pressure_last: stall_share(prev.and_then(|p| p.io_stall_us), io_psi, since),
+        cpu_stall_us: cpu_psi.map(|p| p.total_us).filter(|t| *t > 0),
+        io_stall_us: io_psi.map(|p| p.total_us).filter(|t| *t > 0),
+        recent_psi: Vec::new(),
+    };
+    if s.cpu_pressure.is_some() || s.io_pressure.is_some() {
+        recent_psi.push((now, s.psi(Psi::Cpu).unwrap_or(0.0), s.psi(Psi::Io).unwrap_or(0.0)));
     }
+    s.recent_psi = recent_psi;
+    s
 }
 
 /// Seconds of memory readings the admission check takes the highest of.
 pub const PEAK_WINDOW: f64 = 10.0;
+
+/// Seconds of CPU and IO pressure readings the machine file keeps, for the
+/// gate that waits until pressure has stayed low for `psi_settle` seconds.
+pub const PSI_WINDOW: f64 = 60.0;
 
 /// Seconds of CPU readings a job that cannot fully fit looks back over, to
 /// start when the machine is about as quiet as it gets (`cpu_low`).
@@ -165,8 +260,15 @@ pub fn current(dir: &Path, max_age: f64, ours_kb: u64) -> MachineSample {
     if let Some(c) = &cached
         && crate::db::now() - c.ts <= max_age
     {
-        // A recorder of an older version reads no swap.
-        return MachineSample { swap_free_kb: c.swap_free_kb.or_else(sys::swap_free_kb), ..c.clone() };
+        // A recorder of an older version reads no swap and no CPU or IO
+        // pressure; then the pressure gate sees the reading of this moment.
+        let (cpu, io) = if c.cpu_pressure.is_none() && c.io_pressure.is_none() {
+            let (cpu, io) = psi_now();
+            (cpu.map(|p| p.avg10), io.map(|p| p.avg10))
+        } else {
+            (c.cpu_pressure, c.io_pressure)
+        };
+        return MachineSample { swap_free_kb: c.swap_free_kb.or_else(sys::swap_free_kb), cpu_pressure: cpu, io_pressure: io, ..c.clone() };
     }
     let s = measure(cached.as_ref(), ours_kb);
     write_cache(dir, &s);
@@ -185,6 +287,28 @@ mod tests {
         assert!(m.recent_cpu.is_empty());
         assert_eq!(m.cpu_low(), 6.0);
         assert!(m.near_cpu_low());
+    }
+
+    #[test]
+    fn the_stall_counter_gives_the_share_since_the_last_reading() {
+        let at = |total_us| Some(sys::Psi { avg10: 5.0, total_us });
+        // 0.6 s stalled in 2 s: 30%.
+        assert_eq!(stall_share(Some(1_000_000), at(1_600_000), 2.0), Some(30.0));
+        assert_eq!(stall_share(Some(1_000_000), at(9_000_000), 2.0), Some(100.0), "never above all of the time");
+        assert_eq!(stall_share(None, at(1_600_000), 2.0), None, "no reading before");
+        assert_eq!(stall_share(Some(1_000_000), at(900_000), 2.0), None, "a counter that went back");
+        assert_eq!(stall_share(Some(1_000_000), at(1_600_000), 60.0), None, "too old to say");
+        assert_eq!(stall_share(Some(1_000_000), at(0), 2.0), None, "a fixed reading has no counter");
+    }
+
+    #[test]
+    fn the_gate_reads_the_higher_of_the_average_and_the_last_share() {
+        let m = MachineSample { cpu_pressure: Some(12.0), cpu_pressure_last: Some(55.0), io_pressure: Some(3.0), ..Default::default() };
+        assert_eq!(m.psi(Psi::Cpu), Some(55.0), "a burst shows in the last share first");
+        assert_eq!(m.psi(Psi::Io), Some(3.0), "no counter: the average alone");
+        let easing = MachineSample { cpu_pressure: Some(30.0), cpu_pressure_last: Some(2.0), ..Default::default() };
+        assert_eq!(easing.psi(Psi::Cpu), Some(30.0), "it opens only once the average is low too");
+        assert_eq!(MachineSample::default().psi(Psi::Cpu), None);
     }
 
     #[test]

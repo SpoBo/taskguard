@@ -315,6 +315,163 @@ fn worst_small_wait(s: &Scenario, o: &Outcome) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// What a burst on a big Linux machine did to it: the load, the CPU
+/// pressure, and how long the work took.
+#[derive(Debug, Default)]
+struct CpuOutcome {
+    /// Highest number of runnable threads, all programs together: about the
+    /// load average.
+    peak_demand: f64,
+    /// Seconds the runnable threads were more than 1.5 times the cores.
+    overloaded_s: f64,
+    /// Highest CPU pressure (some avg10).
+    peak_psi: f64,
+    /// Seconds CPU pressure was above 25%.
+    psi_above_s: f64,
+    /// Jobs started while the CPU pressure was above the limit and others
+    /// of taskguard's ran.
+    started_above: usize,
+    /// How much slower programs outside taskguard ran, on average while
+    /// they were busy: runnable threads per core, at least 1.
+    outside_stretch: f64,
+    /// Seconds until the last job ended.
+    finished_at: f64,
+    all_ran: bool,
+}
+
+const BIG_NCPU: usize = 32;
+
+/// The kernel's CPU pressure, "some" over one instant, as a function of the
+/// runnable threads on `BIG_NCPU` cores. A model fitted to daystrom (32
+/// cores): about 40% some avg10 at a load of 49, 6% at 32, all of it at 75.
+fn cpu_some(demand: f64) -> f64 {
+    let n = BIG_NCPU as f64;
+    ((demand - 0.9 * n) / (1.5 * n)).clamp(0.0, 1.0) * 100.0
+}
+
+/// Drive `decide()` for `jobs` on a 32-core machine while programs outside
+/// taskguard want `outside(t)` cores. Unlike `run`, jobs slow down when the
+/// machine is short of cores: each gets cores / runnable threads of what it
+/// wants, so a burst that overloads the machine also ends later. CPU
+/// pressure is the exponential average over 10 s of `cpu_some`, as the
+/// kernel's avg10, and its mean since the last reading, as the stall counter
+/// gives it. The recorder reads both every 2 seconds.
+/// `with_last`: the reading has the share since the last reading, as this
+/// version's; without it the gate sees the 10-second average alone.
+fn run_cpu(jobs: &[Job], outside: impl Fn(f64) -> f64, lim: &Limits, with_last: bool) -> CpuOutcome {
+    let n = BIG_NCPU as f64;
+    let mut arriving: Vec<Entry> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| Entry {
+            ticket: i as u64 + 1,
+            key: format!("job{i}"),
+            need_mem_kb: j.need_kb,
+            need_cpu: j.need_cpu,
+            known: j.known,
+            est_dur_s: j.est_dur,
+            queued_at: j.arrive,
+            ..Default::default()
+        })
+        .collect();
+    let mut waiting: Vec<Entry> = Vec::new();
+    // Each running job with the work it has left, in seconds at full speed.
+    let mut running: Vec<(Entry, f64, f64)> = Vec::new();
+    // The machine has run its outside load for a while: the average starts
+    // where that load holds it.
+    let (mut avg10, mut recent_psi) = (cpu_some(outside(0.0)), Vec::new());
+    let (mut since_sum, mut since_n, mut read_at) = (0.0, 0.0, f64::MIN);
+    // What the recorder read last: the 10-second average and the share since
+    // the reading before.
+    let (mut read_avg10, mut read_last) = (avg10, avg10);
+    let mut out = CpuOutcome::default();
+    let (mut stretch_sum, mut stretch_n) = (0.0, 0.0);
+    let mut t = 0.0;
+    while t < 3600.0 && (!arriving.is_empty() || !waiting.is_empty() || !running.is_empty()) {
+        let (now_in, later): (Vec<Entry>, Vec<Entry>) = arriving.into_iter().partition(|e| e.queued_at <= t);
+        waiting.extend(now_in);
+        arriving = later;
+        let want: f64 = outside(t) + running.iter().map(|(_, cores, _)| cores).sum::<f64>();
+        let rate = if want > n { n / want } else { 1.0 };
+        running.retain_mut(|(_, _, left)| {
+            *left -= rate * TICK;
+            *left > 0.0
+        });
+        if running.is_empty() && waiting.is_empty() && arriving.is_empty() {
+            out.finished_at = t;
+        }
+        for (e, cores, _) in running.iter_mut() {
+            e.live_cpu = *cores * rate;
+        }
+        let ours: f64 = running.iter().map(|(_, cores, _)| cores).sum();
+        let demand = outside(t) + ours;
+        avg10 += (cpu_some(demand) - avg10) * (1.0 - (-TICK / 10.0f64).exp());
+        since_sum += cpu_some(demand);
+        since_n += 1.0;
+        if t - read_at >= 2.0 {
+            (read_avg10, read_last, read_at) = (avg10, since_sum / since_n, t);
+            (since_sum, since_n) = (0.0, 0.0);
+            recent_psi.retain(|(ts, _, _): &(f64, f64, f64)| t - ts < crate::machine::PSI_WINDOW);
+            recent_psi.push((t, if with_last { read_avg10.max(read_last) } else { read_avg10 }, 0.0));
+        }
+        out.peak_demand = out.peak_demand.max(demand);
+        out.peak_psi = out.peak_psi.max(avg10);
+        if demand > 1.5 * n {
+            out.overloaded_s += TICK;
+        }
+        if avg10 > 25.0 {
+            out.psi_above_s += TICK;
+        }
+        if outside(t) > 0.0 {
+            stretch_sum += (demand / n).max(1.0);
+            stretch_n += 1.0;
+        }
+        let m = MachineSample {
+            ts: read_at,
+            cpu_busy: demand.min(n),
+            ncpu: BIG_NCPU,
+            mem_used_kb: 40 * GB,
+            mem_total_kb: 128 * GB,
+            mem_pressure: Some(0.0),
+            recent_mem: vec![(t, 40 * GB, 0)],
+            swap_free_kb: Some(16 * GB),
+            cpu_pressure: Some(read_avg10),
+            cpu_pressure_last: with_last.then_some(read_last),
+            io_pressure: Some(0.0),
+            recent_psi: recent_psi.clone(),
+            ..Default::default()
+        };
+        let mut i = 0;
+        while i < waiting.len() {
+            let run_now: Vec<Entry> = running.iter().map(|(e, _, _)| e.clone()).collect();
+            let me = waiting[i].clone();
+            if matches!(decide(&m, lim, &run_now, &waiting, &me, t, &[]), Decision::Admit { .. }) {
+                if read_avg10.max(read_last) > lim.cpu_pressure_max && lim.cpu_pressure_max > 0.0 && !run_now.is_empty() {
+                    out.started_above += 1;
+                }
+                let job = &jobs[me.ticket as usize - 1];
+                running.push((Entry { started_at: Some(t), ..me }, job.cores, job.secs));
+                waiting.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        t += TICK;
+    }
+    out.outside_stretch = if stretch_n > 0.0 { stretch_sum / stretch_n } else { 1.0 };
+    out.all_ran = arriving.is_empty() && waiting.is_empty() && running.is_empty();
+    out
+}
+
+/// The evening of 2 Nov on daystrom (32 cores): dev stacks, `git status`
+/// and the unwrapped tails of lint chains keep about 26 cores busy outside
+/// taskguard for five minutes, then 6. Task runners queue a job of 2 cores
+/// and 60 s every second for two minutes: 120 jobs.
+fn daystrom_burst() -> (Vec<Job>, impl Fn(f64) -> f64) {
+    let jobs = (0..120).map(|i| known(1, 2.0, 60.0, i as f64)).collect();
+    (jobs, |t: f64| if t < 300.0 { 26.0 } else { 6.0 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +493,9 @@ mod tests {
         overcommit_max_pct: 0.0,
         overcommit_after: 120.0,
         overcommit_stuck_after: 1800.0,
+        cpu_pressure_max: 25.0,
+        io_pressure_max: 10.0,
+        psi_settle: 5.0,
     };
 
     #[test]
@@ -448,6 +608,61 @@ mod tests {
         let t = o.started[0].expect("it starts");
         assert!((400.0..410.0).contains(&t), "{t:.0}s");
         assert_eq!(o.started_at_critical, 0);
+    }
+
+    #[test]
+    fn cpu_pressure_holds_a_burst_that_the_cpu_reading_lets_in() {
+        // The machine config of 2 Nov: cpu_max 100, outside_admit on, so
+        // taskguard fills the cores with its own jobs whatever runs outside.
+        let lim = Limits { outside_admit: true, noise_cpu: 0.5, learn_stagger: 0.0, ..LIM };
+        let off = Limits { cpu_pressure_max: 0.0, io_pressure_max: 0.0, ..lim };
+        let (jobs, outside) = daystrom_burst();
+        let before = run_cpu(&jobs, &outside, &off, true);
+        let avg10_only = run_cpu(&jobs, &outside, &lim, false);
+        let after = run_cpu(&jobs, &outside, &lim, true);
+        let row = |a: &str, b: &str, c: &str, d: &str, e: &str, f: &str, g: &str, h: &str| {
+            eprintln!("{a:<30} {b:>6} {c:>11} {d:>6} {e:>10} {f:>8} {g:>8} {h:>6}")
+        };
+        row("", "peak", "overloaded", "peak", "CPU PSI", "outside", "started", "done");
+        row("", "load", "(load >48)", "PSI", "above 25%", "slower", "above", "after");
+        for (name, o) in
+            [("no gate (cpu_pressure_max = 0)", &before), ("gate on avg10 alone", &avg10_only), ("gate on avg10 and last 2s", &after)]
+        {
+            row(
+                name,
+                &format!("{:.1}", o.peak_demand),
+                &format!("{:.0}s", o.overloaded_s),
+                &format!("{:.0}%", o.peak_psi),
+                &format!("{:.0}s", o.psi_above_s),
+                &format!("{:.2}x", o.outside_stretch),
+                &o.started_above.to_string(),
+                &format!("{:.0}s", o.finished_at),
+            );
+        }
+        assert!(before.all_ran && avg10_only.all_ran && after.all_ran);
+        assert!(before.peak_demand > 55.0, "without the gate the burst fills the run queue: {:.1}", before.peak_demand);
+        assert_eq!(after.started_above, 0, "no job starts above the limit next to ours");
+        assert!(after.peak_demand < before.peak_demand - 10.0, "{:.1} vs {:.1}", after.peak_demand, before.peak_demand);
+        assert!(after.overloaded_s < before.overloaded_s * 0.1, "{:.0}s vs {:.0}s", after.overloaded_s, before.overloaded_s);
+        // The gate holds the pressure at its limit, not under it.
+        assert!(after.peak_psi < lim.cpu_pressure_max + 5.0, "{:.0}%", after.peak_psi);
+        assert!(after.overloaded_s < avg10_only.overloaded_s, "the 10-second average alone reacts late");
+        assert!(after.outside_stretch < before.outside_stretch, "programs outside taskguard get their cores back");
+        // The same work still gets done, a little later: the cores were full
+        // either way.
+        assert!(after.finished_at < before.finished_at * 1.15, "{:.0}s vs {:.0}s", after.finished_at, before.finished_at);
+    }
+
+    #[test]
+    fn under_outside_cpu_pressure_alone_the_queue_still_moves_one_job_at_a_time() {
+        // Outside programs keep the machine at about 60% CPU pressure for
+        // good. Nothing of taskguard's would ease it, so it must not stop.
+        let lim = Limits { outside_admit: true, learn_stagger: 0.0, ..LIM };
+        let jobs: Vec<Job> = (0..10).map(|i| known(1, 2.0, 30.0, 0.1 * i as f64)).collect();
+        let o = run_cpu(&jobs, |_| 75.0, &lim, true);
+        eprintln!("constant outside pressure: 10 jobs done after {:.0}s, peak load {:.1}", o.finished_at, o.peak_demand);
+        assert!(o.all_ran);
+        assert!(o.peak_demand <= 75.0 + 2.0, "one job at a time: {:.1}", o.peak_demand);
     }
 
     #[test]
