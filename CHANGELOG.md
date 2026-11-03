@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-03
+
 ### Added
 
 - `taskguard top` says where the load goes now, under "now, by where it
@@ -516,7 +518,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/SpoBo/taskguard/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/SpoBo/taskguard/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/SpoBo/taskguard/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/SpoBo/taskguard/compare/v0.10.0...v0.11.0
