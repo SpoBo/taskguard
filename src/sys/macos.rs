@@ -197,6 +197,26 @@ pub fn proc_sample(pid: i32) -> Option<ProcSample> {
     })
 }
 
+/// Bytes the process read from and wrote to disk since it started. None when
+/// it is gone or belongs to another user.
+pub fn proc_io_bytes(pid: i32) -> Option<u64> {
+    let mut ri: libc::rusage_info_v4 = unsafe { zeroed() };
+    let r = unsafe { libc::proc_pid_rusage(pid, RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t) };
+    (r == 0).then_some(ri.ri_diskio_bytesread + ri.ri_diskio_byteswritten)
+}
+
+/// The directory the process runs in.
+pub fn proc_cwd(pid: i32) -> Option<String> {
+    let mut info: libc::proc_vnodepathinfo = unsafe { zeroed() };
+    let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let r = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDVNODEPATHINFO, 0, &mut info as *mut _ as *mut c_void, size) };
+    if r != size {
+        return None;
+    }
+    let raw: Vec<u8> = info.pvi_cdir.vip_path.iter().flatten().map(|c| *c as u8).take_while(|b| *b != 0).collect();
+    (!raw.is_empty()).then(|| String::from_utf8_lossy(&raw).into_owned())
+}
+
 /// `proc_sample` for a sweep over every process. The footprint is cheap to
 /// read here, so nothing is reused.
 pub fn proc_sample_with(pid: i32, _now: f64, _footprints: &mut super::Footprints) -> Option<ProcSample> {

@@ -137,6 +137,8 @@ pub struct Data {
     /// by the job's pid, and the command each task-runner run stands for.
     pub subs: HashMap<i32, Vec<tree::Sub>>,
     pub labels: HashMap<String, String>,
+    /// The Overview, live: where the CPU, memory and IO go now.
+    pub explain: Option<crate::explain::Explain>,
 }
 
 pub struct JobData {
@@ -215,6 +217,8 @@ pub struct App {
     pub folded: HashSet<String>,
     /// CPU time of each nested call at the last load, for its cores.
     sub_cpu: HashMap<i32, (f64, u64)>,
+    /// Counters between two loads, for the rates of `Data::explain`.
+    explain: crate::explain::Sampler,
     /// Kept open between loads.
     db: Option<Db>,
     history: Option<History>,
@@ -282,6 +286,7 @@ impl App {
             pool_edit: None,
             folded: HashSet::new(),
             sub_cpu: HashMap::new(),
+            explain: Default::default(),
             db: None,
             history: None,
         }
@@ -432,6 +437,9 @@ impl App {
             }
             _ => Default::default(),
         };
+        // It reads the process table too, so only while the live Overview shows.
+        let explain = (self.view == View::Overview && self.window_end.is_none())
+            .then(|| self.explain.sample(snap.as_ref().map_or(&[][..], |s| &s.running)));
         self.data = Data {
             now,
             from,
@@ -459,6 +467,7 @@ impl App {
             run_spans,
             subs,
             labels,
+            explain,
         };
         self.pick = self.pick.map(|p| p.min(self.data.cursor_runs.len().saturating_sub(1))).filter(|_| !self.data.cursor_runs.is_empty());
         Ok(())
@@ -1298,8 +1307,12 @@ pub fn run(args: &[String]) -> Result<i32> {
         let w = arg("--width").and_then(|v| v.parse().ok()).unwrap_or(w.max(100));
         let h = arg("--height").and_then(|v| v.parse().ok()).unwrap_or(h.max(30));
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h))?;
-        // The first draw sizes the chart; the second draws it with data for that size.
-        for _ in 0..2 {
+        // The first draw sizes the chart; the second draws it with data for that
+        // size, and with the rates of the Overview, which need two readings.
+        for i in 0..2 {
+            if i == 1 && app.view == View::Overview {
+                std::thread::sleep(Duration::from_millis(500));
+            }
             app.load()?;
             term.draw(|f| views::draw(f, &mut app))?;
         }

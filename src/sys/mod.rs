@@ -114,6 +114,28 @@ impl Footprints {
     }
 }
 
+/// One line ("some" or "full") of a pressure-stall file, such as
+/// /proc/pressure/cpu or a cgroup's cpu.pressure: "avg10", the share of the
+/// last 10 seconds in which tasks stalled, and "total", the microseconds they
+/// stalled since boot.
+pub fn parse_psi(text: &str, line: &str) -> Option<Psi> {
+    let l = text.lines().find(|l| l.split_whitespace().next() == Some(line))?;
+    let field = |name: &str| l.split_whitespace().find_map(|f| f.strip_prefix(name));
+    Some(Psi { avg10: field("avg10=")?.parse().ok()?, total_us: field("total=")?.parse().ok()? })
+}
+
+/// The CPU ticks of /proc/stat, and how many cores its "cpuN" lines count.
+/// In a container both can be the host's.
+pub fn parse_stat(text: &str) -> Option<(CpuTicks, usize)> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    // user nice system idle iowait irq softirq steal
+    let v: Vec<u64> = line.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+    let get = |i: usize| v.get(i).copied().unwrap_or(0);
+    let busy = get(0) + get(1) + get(2) + get(5) + get(6) + get(7);
+    let cores = text.lines().filter(|l| l.strip_prefix("cpu").is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))).count();
+    Some((CpuTicks { busy, total: busy + get(3) + get(4) }, cores))
+}
+
 pub fn ncpu() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
@@ -181,6 +203,23 @@ mod tests {
         child.wait().unwrap();
         assert_eq!(args.map(|a| a[1..].to_vec()), Some(vec!["30".to_string()]));
         assert_eq!(proc_args(-1), None);
+    }
+
+    #[test]
+    fn psi_lines_are_parsed() {
+        let cpu = "some avg10=40.93 avg60=24.50 avg300=18.84 total=200339435040\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
+        assert_eq!(parse_psi(cpu, "some"), Some(Psi { avg10: 40.93, total_us: 200339435040 }));
+        assert_eq!(parse_psi(cpu, "full"), Some(Psi { avg10: 0.0, total_us: 0 }));
+        // Kernels before 5.13 have no "full" line for CPU.
+        assert_eq!(parse_psi("some avg10=1.50 avg60=0 avg300=0 total=1\n", "full"), None);
+        assert_eq!(parse_psi("", "some"), None);
+    }
+
+    #[test]
+    fn proc_stat_gives_ticks_and_cores() {
+        let stat = "cpu  100 5 50 800 20 3 2 10 0 0\ncpu0 50 2 25 400 10 1 1 5 0 0\ncpu1 50 3 25 400 10 2 1 5 0 0\nintr 1 2 3\nctxt 99\n";
+        assert_eq!(parse_stat(stat), Some((CpuTicks { busy: 170, total: 990 }, 2)));
+        assert_eq!(parse_stat("intr 1\n"), None);
     }
 
     #[test]
@@ -271,6 +310,10 @@ mod tests {
         let t = cpu_ticks();
         assert!(t.total >= t.busy);
         assert!(list_procs().iter().any(|p| p.pid == std::process::id() as i32));
+        assert!(proc_io_bytes(std::process::id() as i32).is_some());
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let got = proc_cwd(std::process::id() as i32).map(|c| std::path::PathBuf::from(c).canonicalize().unwrap());
+        assert_eq!(got, Some(cwd));
     }
 
     #[test]

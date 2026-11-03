@@ -485,6 +485,9 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::styled(format!("   programs hold {} more,", gb(beyond as u64)), DIM));
             lines.push(Line::styled("   compressed or in swap".to_string(), DIM));
         }
+        if let (None, Some(e)) = (at, &d.explain) {
+            lines.extend(explain_lines(app, e, &machine_at));
+        }
     }
     lines.push(Line::from(vec![
         Span::styled("╌╌ ", Style::default().fg(Color::Yellow)),
@@ -522,6 +525,56 @@ fn legend(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     f.render_widget(Paragraph::new(lines).block(Block::new().borders(Borders::LEFT).border_style(DIM)), area);
+}
+
+/// Where the load goes now: this machine's total, taskguard's jobs, each dev
+/// stack, what none of them explains, and the host's load outside this
+/// machine. Without a cgroup the total is the machine's, as in the chart.
+fn explain_lines(app: &App, e: &crate::explain::Explain, today: &dash::Bucket) -> Vec<Line<'static>> {
+    use crate::explain::Usage;
+    let cores = |v: Option<f64>| v.map_or("-".into(), |c| format!("{c:.1}c"));
+    let mem = |v: Option<u64>| v.map_or("-".into(), |kb| gb(kb).replace(" GB", "G").replace(" MB", "M"));
+    let io = |v: Option<f64>| match v {
+        None => "-".into(),
+        Some(b) if b < 1024.0 * 1024.0 => format!("{:.0}K/s", b / 1024.0),
+        Some(b) if b < 1024.0 * 1024.0 * 1024.0 => format!("{:.1}M/s", b / 1024.0 / 1024.0),
+        Some(b) => format!("{:.1}G/s", b / 1024.0 / 1024.0 / 1024.0),
+    };
+    let row = |mark: Span<'static>, name: &str, u: &Usage| {
+        Line::from(vec![
+            mark,
+            Span::styled(format!("{:<11}", trunc(name, 11)), BOLD),
+            Span::raw(format!(" {:>5} {:>6} {:>7}", cores(u.cores), mem(u.mem_kb), io(u.io_bps))),
+        ])
+    };
+    let machine = e.machine.unwrap_or(Usage { cores: Some(today.cpu), mem_kb: Some(today.mem_kb as u64), io_bps: None });
+    let mut lines = vec![Line::raw(""), Line::styled("now, by where it runs:", BOLD), row(Span::raw("   "), "machine", &machine)];
+    if e.machine.is_none() {
+        lines.push(Line::styled("   no cgroup: machine totals", DIM));
+    }
+    lines.push(row(Span::raw("██ "), "jobs", &e.jobs));
+    if !e.stacks.is_empty() {
+        lines.push(Line::styled("dev stacks:", DIM));
+    }
+    for s in &e.stacks {
+        // Admitted as a job, a stack has its namespace's colour, like the
+        // jobs above; outside the queue it is drawn like the other programs.
+        let mark = match &s.job {
+            Some((_, ns)) => Span::styled("██ ", Style::default().fg(ns_color(app, ns))),
+            None => Span::styled("▒▒ ", Style::default().fg(chart::group_color("dev services"))),
+        };
+        lines.push(row(mark, &s.label, &s.usage));
+    }
+    lines.push(row(Span::styled("░░ ", DIM), "untracked", &e.untracked(machine)));
+    if let Some(o) = e.outside {
+        lines.push(Line::from(vec![Span::styled(format!("   {:<11}", "outside"), BOLD), Span::raw(format!(" {:>5}", cores(o.cores)))]));
+        let psi: Vec<String> =
+            [("CPU", o.cpu_psi), ("IO", o.io_psi)].iter().filter_map(|(name, v)| v.map(|v| format!("{name} +{v:.0}%"))).collect();
+        if !psi.is_empty() {
+            lines.push(Line::styled(format!("   waits outside: {}", psi.join(", ")), DIM));
+        }
+    }
+    lines
 }
 
 /// The runs at the time cursor, with the picked one marked, and when each ran.
@@ -1709,6 +1762,43 @@ mod tests {
         app.show_other = false;
         let s = screen(&mut app, 160, 40);
         assert!(!s.contains("not started by taskguard"), "o hides everything taskguard did not start");
+    }
+
+    #[test]
+    fn the_load_is_split_by_where_it_runs() {
+        use crate::explain::{Explain, Outside, Stack, Usage};
+        let (_t, mut app) = fixture();
+        let u = |c: f64, gb: u64, mb_s: f64| Usage { cores: Some(c), mem_kb: Some(gb << 20), io_bps: Some(mb_s * 1024.0 * 1024.0) };
+        let stack =
+            |label: &str, job: bool, usage| Stack { pid: 1, label: label.into(), job: job.then(|| ("stack".into(), "dalp".into())), usage };
+        // A container: its cgroup is the machine, and the host is busier.
+        app.data.explain = Some(Explain {
+            machine: Some(u(7.0, 20, 12.0)),
+            jobs: u(2.0, 5, 3.0),
+            stacks: vec![stack("3/dalp", true, u(1.5, 6, 1.0)), stack("5/dalp", false, u(1.0, 3, 0.5))],
+            outside: Some(Outside { cores: Some(9.5), cpu_psi: Some(30.0), io_psi: Some(4.0) }),
+        });
+        // The legend's columns, with runs of spaces as one.
+        let flat = |app: &mut App| screen(app, 150, 50).split_whitespace().collect::<Vec<_>>().join(" ");
+        let s = flat(&mut app);
+        for want in ["now, by where it runs:", "machine 7.0c 20.0G 12.0M/s", "jobs 2.0c 5.0G 3.0M/s", "dev stacks:"] {
+            assert!(s.contains(want), "{want:?}:\n{s}");
+        }
+        assert!(s.contains("3/dalp 1.5c 6.0G 1.0M/s") && s.contains("5/dalp 1.0c 3.0G 512K/s"), "{s}");
+        assert!(s.contains("untracked 2.5c 6.0G 7.5M/s"), "what no job or stack explains:\n{s}");
+        assert!(s.contains("outside 9.5c") && !s.contains("9.5c -") && s.contains("waits outside: CPU +30%, IO +4%"), "{s}");
+        assert!(!s.contains("no cgroup"), "{s}");
+
+        // macOS: no cgroup, so the machine totals of the chart and nothing outside.
+        app.data.explain = Some(Explain { jobs: u(2.0, 5, 0.0), ..Default::default() });
+        let s = flat(&mut app);
+        assert!(s.contains("machine 6.0c 16.0G -") && s.contains("no cgroup: machine totals"), "{s}");
+        assert!(s.contains("untracked 4.0c 11.0G -"), "{s}");
+        assert!(!s.contains("outside") && !s.contains("dev stacks"), "{s}");
+
+        // A cursor in the past: these are readings of now, so they go.
+        app.cursor = Some(10);
+        assert!(!flat(&mut app).contains("by where it runs"));
     }
 
     #[test]
