@@ -32,6 +32,9 @@ pub struct Layer {
     pub learn_stagger: Option<f64>,
     pub cpu_min_duration: Option<f64>,
     pub pressure_max: Option<f64>,
+    pub cpu_pressure_max: Option<f64>,
+    pub io_pressure_max: Option<f64>,
+    pub psi_settle: Option<f64>,
     pub warn_admit: Option<bool>,
     pub priority: Option<i32>,
     pub auto_pause: Option<bool>,
@@ -151,6 +154,13 @@ pub struct Config {
     pub learn_stagger: f64,
     pub cpu_min_duration: f64,
     pub pressure_max: f64,
+    /// Linux: no new job starts while taskguard's jobs run and CPU pressure
+    /// (PSI "some avg10") is above this, or IO pressure (PSI "full avg10")
+    /// above `io_pressure_max`, until it has stayed under for `psi_settle`
+    /// seconds. 0 turns one off. Without PSI (macOS) both are off.
+    pub cpu_pressure_max: f64,
+    pub io_pressure_max: f64,
+    pub psi_settle: f64,
     /// macOS: at the kernel's warning level, jobs still start while memory
     /// fits and no first run still grows. Off: warning stops every new job.
     pub warn_admit: bool,
@@ -242,6 +252,9 @@ impl Default for Config {
             learn_stagger: 5.0,
             cpu_min_duration: 5.0,
             pressure_max: 20.0,
+            cpu_pressure_max: 25.0,
+            io_pressure_max: 10.0,
+            psi_settle: 5.0,
             warn_admit: true,
             priority: 0,
             auto_pause: false,
@@ -328,7 +341,7 @@ pub enum SettingKind {
     Size(u64, u64, u64),
 }
 
-pub const SETTINGS: [Setting; 14] = [
+pub const SETTINGS: [Setting; 16] = [
     Setting {
         key: "enabled",
         what: "off: every command runs straight through, unqueued and unmeasured (as TASKGUARD_DISABLE=1)",
@@ -348,6 +361,16 @@ pub const SETTINGS: [Setting; 14] = [
         key: "pressure_max",
         what: "no new job at this memory pressure (Linux: PSI share; macOS: 50 warning, 100 critical)",
         kind: SettingKind::Number(5.0, 5.0, 90.0, "%"),
+    },
+    Setting {
+        key: "cpu_pressure_max",
+        what: "Linux: no new job while CPU pressure (PSI some avg10) is above this and taskguard's jobs run; 0 = off",
+        kind: SettingKind::Number(5.0, 0.0, 100.0, "%"),
+    },
+    Setting {
+        key: "io_pressure_max",
+        what: "Linux: no new job while IO pressure (PSI full avg10) is above this and taskguard's jobs run; 0 = off",
+        kind: SettingKind::Number(5.0, 0.0, 100.0, "%"),
     },
     Setting {
         key: "warn_admit",
@@ -400,6 +423,8 @@ impl Config {
             "cpu_max" => format!("{:.0}%", self.cpu_max),
             "mem_max" => format!("{:.0}%", self.mem_max),
             "pressure_max" => format!("{:.0}%", self.pressure_max),
+            "cpu_pressure_max" => off_or_pct(self.cpu_pressure_max),
+            "io_pressure_max" => off_or_pct(self.io_pressure_max),
             "enabled" => (if self.enabled { "on" } else { "off" }).into(),
             "hints" => (if self.hints { "on" } else { "off" }).into(),
             "auto_pause" => (if self.auto_pause { "on" } else { "off" }).into(),
@@ -447,6 +472,8 @@ impl Config {
             "cpu_max" => self.cpu_max,
             "mem_max" => self.mem_max,
             "pressure_max" => self.pressure_max,
+            "cpu_pressure_max" => self.cpu_pressure_max,
+            "io_pressure_max" => self.io_pressure_max,
             "pause_at" => self.pause_at,
             "resume_at" => self.resume_at,
             "max_bypass" => self.max_bypass as f64,
@@ -456,6 +483,11 @@ impl Config {
             _ => 0.0,
         }
     }
+}
+
+/// A limit where 0 means off, as the Config view shows it.
+fn off_or_pct(v: f64) -> String {
+    if v > 0.0 { format!("{v:.0}%") } else { "off".into() }
 }
 
 /// The slot ceiling of a pool, as the Config view shows it.
@@ -683,6 +715,9 @@ impl Config {
         set!(learn_stagger);
         set!(cpu_min_duration);
         set!(pressure_max);
+        set!(cpu_pressure_max);
+        set!(io_pressure_max);
+        set!(psi_settle);
         set!(warn_admit);
         set!(priority);
         set!(auto_pause);

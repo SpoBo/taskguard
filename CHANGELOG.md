@@ -10,6 +10,21 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- On Linux, CPU and IO pressure hold new jobs back. While taskguard's own
+  jobs run and `/proc/pressure/cpu` "some avg10" is above `cpu_pressure_max`
+  (25), or `/proc/pressure/io` "full avg10" above `io_pressure_max` (10), no
+  new job starts until the reading has stayed under its limit for
+  `psi_settle` (5) seconds. The busy cores only show what runs; pressure
+  shows what waits, also from programs taskguard did not start. On a
+  32-core machine at a load average of 68, taskguard saw 29.6 cores busy and
+  14.8 promised and kept starting jobs. Running jobs are never stopped, and
+  with nothing of taskguard's running but long-lived jobs the first in line
+  still starts. `taskguard status` shows both readings on a `PSI` line, and a
+  held job says which pressure holds it; `doctor` prints them too. `0` turns
+  a limit off; macOS has no PSI, so there the gate is off.
+
 ## [0.12.0] - 2026-10-28
 
 ### Added

@@ -6,7 +6,7 @@
 //! queue. The kernel releases the lock itself when its holder dies, which
 //! replaces tsc-queue's mkdir lock and its stale-age guess.
 
-use crate::machine::MachineSample;
+use crate::machine::{MachineSample, Psi};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -736,6 +736,15 @@ pub struct Limits {
     /// Seconds the first job in line waits before it may start over RAM
     /// while other jobs queue too.
     pub overcommit_stuck_after: f64,
+    /// CPU pressure (PSI "some avg10", 0-100) above which no new job starts
+    /// while taskguard's own jobs run. 0 turns it off.
+    pub cpu_pressure_max: f64,
+    /// IO pressure (PSI "full avg10", 0-100) above which no new job starts
+    /// while taskguard's own jobs run. 0 turns it off.
+    pub io_pressure_max: f64,
+    /// Seconds CPU and IO pressure must stay at or under their limits before
+    /// new jobs start again.
+    pub psi_settle: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -789,6 +798,22 @@ pub enum Blocker {
         #[serde(skip_serializing_if = "Option::is_none")]
         next_in: Option<f64>,
     },
+    /// The kernel reports CPU or IO pressure (Linux PSI) above its limit, or
+    /// it fell under the limit less than `psi_settle` seconds ago
+    /// (`settle_in` left): no new job starts while taskguard's own jobs run.
+    /// `level` is the reading now.
+    /// `paced`: the reading is under the limit but above `PSI_PACE` of it,
+    /// and a job started after it was taken: the next starts after the next
+    /// reading.
+    Psi {
+        kind: Psi,
+        level: f64,
+        limit: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        settle_in: Option<f64>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        paced: bool,
+    },
     /// A running job is paused for memory: it resumes before anything new starts.
     Paused {
         key: String,
@@ -839,6 +864,8 @@ impl Blocker {
             Blocker::LearnStagger { .. } | Blocker::Settling { .. } => "learning",
             Blocker::Memory { .. } => "memory",
             Blocker::Pressure { .. } => "pressure",
+            Blocker::Psi { kind: Psi::Cpu, .. } => "cpu_pressure",
+            Blocker::Psi { kind: Psi::Io, .. } => "io_pressure",
             Blocker::Paused { .. } => "paused",
             Blocker::Stack { .. } => "stack",
             Blocker::Expect { .. } => "expect",
@@ -1018,6 +1045,49 @@ pub fn over(running: &[Entry]) -> (f64, u64) {
     })
 }
 
+/// Does CPU or IO pressure hold new jobs back? It does while a reading is
+/// above its limit, and until it has stayed at or under the limit for
+/// `psi_settle` seconds, so a reading that dips under the limit for one
+/// sample does not let a burst of jobs in. CPU is checked first. None
+/// without PSI (macOS, old kernels), or with both limits at 0.
+///
+/// Near the limit, above `PSI_PACE` of it, or while every core is busy or
+/// promised and tasks wait for one, one job starts per reading: a job that started after the
+/// reading was taken has not shown in it yet, and every waiting job decides
+/// on that same reading. With every core busy the busy cores cannot tell
+/// whether a job has room, and `outside_admit` would start the whole queue
+/// at once, up to `cpu_max`: the pressure can tell, once it has seen the
+/// job before.
+///
+/// The machine's busy cores only count what is running; the CPU pressure
+/// counts what waits for a core, from every program: dev stacks, `git
+/// status`, the second half of a lint chain whose first command alone is
+/// wrapped. On a 32-core machine at a load average of 68 taskguard saw 29.6
+/// cores busy and 14.8 promised, and kept starting jobs.
+pub fn psi_hold(m: &MachineSample, lim: &Limits, running: &[Entry], now: f64) -> Option<Blocker> {
+    let started_since_reading = running.iter().any(|e| e.started_at.is_some_and(|s| s >= m.ts));
+    let cores_full = m.cpu_busy + reserve(running).0 >= cpu_limit(m, lim);
+    [(Psi::Cpu, lim.cpu_pressure_max), (Psi::Io, lim.io_pressure_max)].into_iter().filter(|(_, limit)| *limit > 0.0).find_map(
+        |(kind, limit)| {
+            let level = m.psi(kind)?;
+            if level > limit {
+                return Some(Blocker::Psi { kind, level, limit, settle_in: None, paced: false });
+            }
+            let last_above = m.psi_window(kind, now, lim.psi_settle).iter().filter(|(_, v)| *v > limit).map(|(ts, _)| *ts).reduce(f64::max);
+            if let Some(left) = last_above.map(|t| t + lim.psi_settle - now).filter(|l| *l > 0.0) {
+                return Some(Blocker::Psi { kind, level, limit, settle_in: Some(left), paced: false });
+            }
+            // Every core busy and tasks already waiting for one.
+            let near = level > limit * PSI_PACE || (kind == Psi::Cpu && cores_full && level > 0.0);
+            (near && started_since_reading).then_some(Blocker::Psi { kind, level, limit, settle_in: None, paced: true })
+        },
+    )
+}
+
+/// Above this share of its limit, CPU or IO pressure lets one job start per
+/// reading (`psi_hold`).
+pub const PSI_PACE: f64 = 0.5;
+
 /// May `me` start now? A pure function of the machine reading and the queue,
 /// so the status screen and the waiting job always agree.
 pub fn decide(
@@ -1155,6 +1225,15 @@ pub fn decide(
                 Decision::Wait { blockers }
             }
         };
+    }
+
+    // CPU or IO pressure (Linux PSI) holds back every new job while
+    // taskguard's own jobs run: they end, and the pressure with them. With
+    // nothing of taskguard's running but long-lived jobs, the rule above
+    // still starts the first in line, so load outside taskguard cannot stop
+    // the queue; it then runs one job at a time until the pressure eases.
+    if let Some(b) = psi_hold(m, lim, running, now) {
+        return Decision::Wait { blockers: vec![b] };
     }
 
     let mut blockers = Vec::new();
@@ -1948,6 +2027,9 @@ mod tests {
         overcommit_max_pct: 0.0,
         overcommit_after: 120.0,
         overcommit_stuck_after: 1800.0,
+        cpu_pressure_max: 25.0,
+        io_pressure_max: 10.0,
+        psi_settle: 5.0,
     };
 
     /// A running entry exactly as v0.1.2 writes it.
@@ -3691,6 +3773,124 @@ mod tests {
         assert_eq!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])), vec!["pressure"]);
         m.mem_pressure = Some(0.0);
         assert!(blockers(decide(&m, &LIM, &[], std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty(), "it eases: the job starts");
+    }
+
+    /// A machine at `cpu` CPU and `io` IO pressure, read at `ts`, with
+    /// earlier readings `recent` of (time, cpu, io).
+    fn psi(cpu: f64, io: f64, ts: f64, recent: &[(f64, f64, f64)]) -> MachineSample {
+        let mut m = machine(1.0, 8);
+        m.ts = ts;
+        m.cpu_pressure = Some(cpu);
+        m.io_pressure = Some(io);
+        m.recent_psi = recent.iter().copied().chain(std::iter::once((ts, cpu, io))).collect();
+        m
+    }
+
+    #[test]
+    fn cpu_or_io_pressure_holds_new_jobs_while_ours_run() {
+        let running = job(1, "r", 1.0, 1);
+        let me = job(2, "tsc", 1.0, 1);
+        let d = |m: &MachineSample| decide(m, &LIM, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 1000.0, &[]);
+        assert_eq!(blockers(d(&psi(41.0, 0.0, 1000.0, &[]))), vec!["cpu_pressure"]);
+        assert_eq!(blockers(d(&psi(0.0, 14.0, 1000.0, &[]))), vec!["io_pressure"]);
+        assert_eq!(blockers(d(&psi(41.0, 14.0, 1000.0, &[]))), vec!["cpu_pressure"], "CPU is named first");
+        // At the limit is not above it.
+        assert!(blockers(d(&psi(25.0, 10.0, 1000.0, &[]))).is_empty());
+        let Decision::Wait { blockers: held } = d(&psi(41.0, 0.0, 1000.0, &[])) else { panic!() };
+        assert_eq!(held[0], Blocker::Psi { kind: Psi::Cpu, level: 41.0, limit: 25.0, settle_in: None, paced: false });
+    }
+
+    #[test]
+    fn pressure_must_stay_under_the_limit_for_psi_settle_seconds() {
+        let running = job(1, "r", 1.0, 1);
+        let me = job(2, "tsc", 1.0, 1);
+        let d = |m: &MachineSample, now: f64| decide(m, &LIM, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, now, &[]);
+        // Above at 996 and 998, under now: held until 998 + 5.
+        let m = psi(12.0, 0.0, 1000.0, &[(996.0, 40.0, 0.0), (998.0, 30.0, 0.0)]);
+        let Decision::Wait { blockers: held } = d(&m, 1000.0) else { panic!("held") };
+        assert_eq!(held[0], Blocker::Psi { kind: Psi::Cpu, level: 12.0, limit: 25.0, settle_in: Some(3.0), paced: false });
+        assert!(crate::report::blocker_text(&held[0]).contains("eased to 12%"), "{held:?}");
+        assert_eq!(blockers(d(&m, 1002.9)), vec!["cpu_pressure"]);
+        assert!(blockers(d(&m, 1003.1)).is_empty(), "under for 5 s: it starts");
+        // The same for IO, and a high reading older than the window holds nothing.
+        let m = psi(0.0, 2.0, 1000.0, &[(990.0, 90.0, 50.0), (997.0, 0.0, 11.0)]);
+        assert_eq!(blockers(d(&m, 1000.0)), vec!["io_pressure"]);
+        assert!(blockers(d(&m, 1002.5)).is_empty());
+        // psi_settle = 0: it starts as soon as the reading is under.
+        let lim = Limits { psi_settle: 0.0, ..LIM };
+        let m = psi(12.0, 0.0, 1000.0, &[(999.0, 40.0, 0.0)]);
+        assert!(blockers(decide(&m, &lim, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn near_the_limit_one_job_starts_per_reading() {
+        let me = job(3, "tsc", 1.0, 1);
+        let waiting = std::slice::from_ref(&me);
+        let m = psi(15.0, 0.0, 1000.0, &[]);
+        let before = Entry { started_at: Some(990.0), ..job(1, "r", 1.0, 1) };
+        let after = Entry { started_at: Some(1000.5), ..job(2, "s", 1.0, 1) };
+        // The running job shows in the reading: the next may start.
+        assert!(blockers(decide(&m, &LIM, std::slice::from_ref(&before), waiting, &me, 1001.0, &[])).is_empty());
+        // One started after it: the next waits for a reading that shows it.
+        let d = decide(&m, &LIM, &[before.clone(), after.clone()], waiting, &me, 1001.0, &[]);
+        let Decision::Wait { blockers: held } = d else { panic!("paced") };
+        assert!(matches!(held[0], Blocker::Psi { paced: true, .. }));
+        assert!(crate::report::blocker_text(&held[0]).contains("one new job per pressure reading"), "{held:?}");
+        let later = MachineSample { ts: 1002.0, ..m.clone() };
+        assert!(blockers(decide(&later, &LIM, &[before.clone(), after.clone()], waiting, &me, 1002.0, &[])).is_empty());
+        // Far under the limit there is no pacing, unless every core is busy:
+        // then the busy cores cannot tell whether it has room.
+        let low = psi(12.0, 0.0, 1000.0, &[]);
+        let lim = Limits { outside_admit: true, ..LIM };
+        let both = [before, after];
+        assert!(blockers(decide(&low, &lim, &both, waiting, &me, 1001.0, &[])).is_empty());
+        let full = MachineSample { cpu_busy: 12.0, ..low };
+        assert_eq!(blockers(decide(&full, &lim, &both, waiting, &me, 1001.0, &[])), vec!["cpu_pressure"]);
+        // No task waits: the cores have room for one more.
+        let idle = MachineSample { cpu_busy: 12.0, ..psi(0.0, 0.0, 1000.0, &[]) };
+        assert!(blockers(decide(&idle, &lim, &both, waiting, &me, 1001.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn with_nothing_of_ours_running_the_first_in_line_still_starts_under_cpu_pressure() {
+        let me = job(2, "tsc", 1.0, 1);
+        let m = psi(80.0, 30.0, 1000.0, &[]);
+        let waiting = std::slice::from_ref(&me);
+        // Load outside taskguard cannot stop the queue.
+        assert!(blockers(decide(&m, &LIM, &[], waiting, &me, 1000.0, &[])).is_empty());
+        // Nor can steady dev stacks.
+        let stacks = [steady_stack(11, 4), steady_stack(12, 4)];
+        assert!(blockers(decide(&m, &LIM, &stacks, waiting, &me, 1000.0, &[])).is_empty());
+        // Once one of ours runs, the next one waits.
+        let mut running = stacks.to_vec();
+        running.push(job(1, "r", 1.0, 1));
+        assert_eq!(blockers(decide(&m, &LIM, &running, waiting, &me, 1000.0, &[])), vec!["cpu_pressure"]);
+    }
+
+    #[test]
+    fn without_psi_or_with_the_limits_at_0_there_is_no_gate() {
+        let running = job(1, "r", 1.0, 1);
+        let me = job(2, "tsc", 1.0, 1);
+        let d =
+            |m: &MachineSample, lim: &Limits| decide(m, lim, std::slice::from_ref(&running), std::slice::from_ref(&me), &me, 1000.0, &[]);
+        // macOS and kernels without PSI: no reading.
+        assert!(blockers(d(&machine(1.0, 8), &LIM)).is_empty());
+        let off = Limits { cpu_pressure_max: 0.0, io_pressure_max: 0.0, ..LIM };
+        assert!(blockers(d(&psi(99.0, 99.0, 1000.0, &[]), &off)).is_empty());
+        let io_off = Limits { io_pressure_max: 0.0, ..LIM };
+        assert!(blockers(d(&psi(10.0, 99.0, 1000.0, &[]), &io_off)).is_empty());
+    }
+
+    #[test]
+    fn a_reading_from_an_older_version_has_no_pressure_and_this_one_reads_back() {
+        let old =
+            r#"{"ts":100.0,"cpu_busy":6.0,"cpu_inst":6.0,"ncpu":10,"mem_used_kb":1,"mem_total_kb":2,"mem_pressure":null,"recent_mem":[]}"#;
+        let m: MachineSample = serde_json::from_str(old).unwrap();
+        assert_eq!((m.cpu_pressure, m.io_pressure, m.recent_psi.len()), (None, None, 0));
+        assert!(psi_hold(&m, &LIM, &[], 100.0).is_none());
+        let new = psi(30.0, 1.0, 100.0, &[(98.0, 20.0, 0.5)]);
+        let back: MachineSample = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back, new);
     }
 
     #[test]

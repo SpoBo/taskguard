@@ -2,8 +2,8 @@
 //! report. Both are rendered from `decide()` output, so they always say what
 //! the scheduler really thinks.
 
-use crate::machine::MachineSample;
-use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, own_guess, reserve};
+use crate::machine::{MachineSample, Psi};
+use crate::queue::{Blocker, Decision, Entry, Limits, booked, is_guess, need_with_booking, own_guess, psi_hold, reserve};
 use serde::Serialize;
 use std::fmt::Write as _;
 
@@ -60,6 +60,19 @@ pub fn blocker_text(b: &Blocker) -> String {
         Blocker::Pressure { level, .. } => {
             format!("memory pressure: the kernel reports {} ({level:.0}); nothing new starts until it eases", pressure_word(*level))
         }
+        Blocker::Psi { kind, level, limit, paced: true, .. } => format!(
+            "{} pressure {level:.0}% (limit {limit:.0}%) is near its limit, or every core is busy: one new job per pressure reading, and one started since the last",
+            psi_name(*kind)
+        ),
+        Blocker::Psi { kind, level, limit, settle_in: None, .. } => format!(
+            "{} pressure: {level:.0}% (limit {limit:.0}%); no new job starts while it stays above and taskguard's jobs run",
+            psi_name(*kind)
+        ),
+        Blocker::Psi { kind, level, limit, settle_in: Some(s), .. } => format!(
+            "{} pressure eased to {level:.0}% (limit {limit:.0}%); new jobs start once it stays under for {:.0}s more",
+            psi_name(*kind),
+            s.ceil()
+        ),
         Blocker::Paused { key } => format!("{key} is paused for memory; it resumes before anything new starts"),
         Blocker::Stack { key } => format!("work for {key}, which has not started yet; it starts after it"),
         Blocker::Expect { work, wait_s } => format!(
@@ -97,6 +110,26 @@ pub fn stall_text(s: &crate::queue::Stall) -> String {
         dur(s.waited_s),
         s.by_key
     )
+}
+
+/// "CPU" or "IO", and what its pressure reading counts.
+fn psi_name(kind: Psi) -> &'static str {
+    match kind {
+        Psi::Cpu => "CPU",
+        Psi::Io => "IO",
+    }
+}
+
+/// One pressure reading with its limit, for `doctor` and `status`: the
+/// 10-second average, and the share since the last reading when there is
+/// one: "cpu some 41.0%, last 2s 55% (limit 25%)". A limit of 0 is off.
+pub fn psi_text(what: &str, avg10: Option<f64>, last: Option<f64>, limit: f64) -> String {
+    let lim = if limit > 0.0 { format!("limit {limit:.0}%") } else { "gate off".into() };
+    let last = last.map(|l| format!(", last 2s {l:.0}%")).unwrap_or_default();
+    match avg10 {
+        Some(a) => format!("{what} {a:.1}%{last} ({lim})"),
+        None => format!("{what} not available"),
+    }
 }
 
 /// Words for a pressure reading: macOS reports levels (50 warning, 100
@@ -173,6 +206,13 @@ fn unblock(b: &Blocker, running: &[Entry], now: f64) -> (String, Option<f64>) {
         }
         Blocker::Pressure { paced: true, .. } => ("starts when memory fits".into(), None),
         Blocker::Pressure { .. } => ("starts when the memory pressure eases".into(), None),
+        Blocker::Psi { paced: true, .. } => ("starts after the next pressure reading, if the pressure stays under its limit".into(), None),
+        Blocker::Psi { kind, limit, settle_in: None, .. } => {
+            (format!("starts when the {} pressure has stayed under {limit:.0}% for a few seconds", psi_name(*kind)), None)
+        }
+        Blocker::Psi { kind, limit, settle_in: Some(s), .. } => {
+            (format!("starts if the {} pressure stays under {limit:.0}% for {:.0}s more", psi_name(*kind), s.ceil()), Some(*s))
+        }
         Blocker::Paused { key } => (format!("starts after {key} has resumed"), None),
         Blocker::Stack { key } => (format!("starts after {key} has started"), None),
         Blocker::Expect { wait_s, .. } => (format!("decides in at most {:.0}s", wait_s.ceil()), Some(*wait_s)),
@@ -392,6 +432,9 @@ pub struct Snapshot {
     pub mem_limit_kb: u64,
     pub reserve_cpu: f64,
     pub reserve_mem_kb: u64,
+    /// What holds new jobs back for CPU or IO pressure, when it does: see
+    /// `queue::psi_hold`. It holds only while taskguard's own jobs run.
+    pub psi_hold: Option<Blocker>,
     pub running: Vec<Entry>,
     pub waiting: Vec<Waiting>,
     pub warnings: Vec<String>,
@@ -437,6 +480,7 @@ impl Snapshot {
             now,
             cpu_limit: crate::queue::cpu_limit(&machine, &limits),
             mem_limit_kb: (machine.mem_total_kb as f64 * limits.mem_max_pct / 100.0) as u64,
+            psi_hold: psi_hold(&machine, &limits, &running, now),
             machine,
             limits,
             reserve_cpu: rc,
@@ -479,11 +523,22 @@ pub fn rule_checks(s: &Snapshot, w: &Waiting) -> Vec<(bool, String)> {
             },
         ));
     }
-    // Under memory pressure the decision stops before it checks CPU and
-    // memory, so for those two lines the numbers decide what is shown.
-    let pressure = failed("pressure");
+    // Under memory, CPU or IO pressure the decision stops before it checks
+    // CPU and memory, so for those two lines the numbers decide what is shown.
+    let pressure = failed("pressure").or(failed("cpu_pressure")).or(failed("io_pressure"));
     if let Some(b) = pressure {
         out.push((false, blocker_text(b)));
+    } else if m.cpu_pressure.is_some() || m.io_pressure.is_some() {
+        let held = s.psi_hold.is_some();
+        out.push((
+            true,
+            format!(
+                "CPU and IO pressure: {}, {}{}",
+                psi_text("cpu some", m.cpu_pressure, m.cpu_pressure_last, s.limits.cpu_pressure_max),
+                psi_text("io full", m.io_pressure, m.io_pressure_last, s.limits.io_pressure_max),
+                if held { "; above, but it holds new jobs only while taskguard's own jobs run" } else { "" }
+            ),
+        ));
     }
     let checked = |name: &str, fits: bool| if pressure.is_some() { fits } else { failed(name).is_none() };
     let cpu_would = m.cpu_busy + s.reserve_cpu + e.need_cpu;
@@ -673,6 +728,23 @@ pub fn render_status(s: &Snapshot) -> String {
         s.limits.mem_max_pct,
         if over_mem >= 1024 { format!("   {} over estimates", gb(over_mem)) } else { String::new() }
     );
+    if m.cpu_pressure.is_some() || m.io_pressure.is_some() {
+        // With nothing of taskguard's running that ends by itself, the
+        // first in line still starts (see `decide`).
+        let held = match &s.psi_hold {
+            Some(b) if s.running.iter().all(Entry::steady) => {
+                format!("   above the limit, but the first in line still starts: {}", blocker_text(b))
+            }
+            Some(b) => format!("   HOLDS new jobs: {}", blocker_text(b)),
+            None => String::new(),
+        };
+        let _ = writeln!(
+            o,
+            "PSI     {}   {}{held}",
+            psi_text("cpu some", m.cpu_pressure, m.cpu_pressure_last, s.limits.cpu_pressure_max),
+            psi_text("io full", m.io_pressure, m.io_pressure_last, s.limits.io_pressure_max)
+        );
+    }
     let _ = writeln!(o, "         # in use now   ! above the estimates   + promised to running jobs   | limit");
     let _ = writeln!(o);
     let _ =
@@ -802,6 +874,9 @@ mod tests {
             overcommit_max_pct: 0.0,
             overcommit_after: 120.0,
             overcommit_stuck_after: 1800.0,
+            cpu_pressure_max: 25.0,
+            io_pressure_max: 10.0,
+            psi_settle: 5.0,
         }
     }
 
@@ -982,6 +1057,9 @@ mod tests {
             overcommit_max_pct: 0.0,
             overcommit_after: 120.0,
             overcommit_stuck_after: 1800.0,
+            cpu_pressure_max: 25.0,
+            io_pressure_max: 10.0,
+            psi_settle: 5.0,
         };
         let mut m = MachineSample::fixed(10.0, 10, 23 * GB, 32 * GB);
         m.mem_pressure = Some(50.0);
@@ -1013,6 +1091,9 @@ mod tests {
             overcommit_max_pct: 0.0,
             overcommit_after: 120.0,
             overcommit_stuck_after: 1800.0,
+            cpu_pressure_max: 25.0,
+            io_pressure_max: 10.0,
+            psi_settle: 5.0,
         };
         let m = MachineSample::fixed(7.4, 12, 23 * GB, 32 * GB);
         let api = Entry {
