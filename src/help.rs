@@ -45,7 +45,8 @@ then the OOM killer's first pick.
 
 On Linux, CPU and IO pressure (PSI) above cpu_pressure_max (25) or
 io_pressure_max (10) hold every new job while taskguard's own jobs run, until
-it has stayed under for psi_settle (5) seconds. Running jobs keep running.
+it has stayed under for psi_settle (5) seconds; near the limit one job
+starts per reading. Running jobs keep running.
 
 Options go before the command. Words after the command, --help too, belong
 to the command.

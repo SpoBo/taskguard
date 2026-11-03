@@ -21,9 +21,14 @@ and the versions follow [semver](https://semver.org).
   32-core machine at a load average of 68, taskguard saw 29.6 cores busy and
   14.8 promised and kept starting jobs. Running jobs are never stopped, and
   with nothing of taskguard's running but long-lived jobs the first in line
-  still starts. `taskguard status` shows both readings on a `PSI` line, and a
-  held job says which pressure holds it; `doctor` prints them too. `0` turns
-  a limit off; macOS has no PSI, so there the gate is off.
+  still starts. The gate reads the higher of the 10-second average and the
+  share since the last reading (about 2 s), and near the limit, or with
+  every core busy while tasks wait, one job starts per reading, so the queue
+  does not start all at once when the gate opens. `taskguard status` shows
+  both readings on a `PSI` line, and a held job says which pressure holds
+  it; `doctor` prints them too. `0` turns a limit off; macOS has no PSI, so
+  there the gate is off. In a model of the burst, the peak load fell from 58
+  to 42 on 32 cores and the work ended 10% later.
 
 ## [0.12.0] - 2026-10-28
 

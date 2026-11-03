@@ -127,12 +127,20 @@ below).
   but long-lived jobs past their start-up, the rule for nothing running
   still starts the first in line, so load outside taskguard cannot stop the
   queue; it then runs one job at a time until the pressure eases.
-  `taskguard status` shows both readings on its `PSI` line and the held job
-  says which one holds it. `0` turns a limit off. macOS has no such
-  readings, so there the gate is off. In a model of that burst (80 jobs of
-  2 cores, 26 cores busy outside), the gate cut the peak load from 58 to 44
-  and the time above 25% pressure by more than half, and the work ended
-  about as soon.
+  The 10-second average lags a burst, so the gate reads the higher of it
+  and the share since the last reading (about 2 seconds, from the kernel's
+  stall counter). And every waiting job decides on the same reading, so
+  near the limit (above half of it), or with every core busy while tasks
+  wait for one, one job starts per reading: the next waits until a reading
+  has seen it. Without that, the whole queue started the moment the gate
+  opened. `taskguard status` shows both readings on its `PSI` line and the
+  held job says which one holds it. `0` turns a limit off. macOS has no
+  such readings, so there the gate is off. In a model of that evening (26
+  cores busy outside taskguard, a job of 2 cores and 60 s queued every
+  second for two minutes), the gate cut the peak load from 58 to 42 and the
+  time over 1.5 times the cores from 288 s to none; programs outside
+  taskguard ran 1.20 times slower instead of 1.44, and the work ended 10%
+  later. On the 10-second average alone the peak load stayed at 50.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually

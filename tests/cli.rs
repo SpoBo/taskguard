@@ -160,7 +160,8 @@ fn now_skips_the_queue_but_is_still_recorded() {
 #[test]
 fn hints_are_on_by_default_and_set_per_repo_or_per_call() {
     let e = Env::new("");
-    let holder = e.spawn(&["-j1", "--id", "t", "--", "sh", "-c", "touch held; sleep 4"]);
+    // Four waits of 1.5 s follow: the holder outlasts them on a busy machine.
+    let holder = e.spawn(&["-j1", "--id", "t", "--", "sh", "-c", "touch held; sleep 8"]);
     wait_for(&e.file("held"));
     let waiting = |extra: &[&str]| {
         let mut args = vec!["--st", "-1.5", "-j1", "--id", "t"];
