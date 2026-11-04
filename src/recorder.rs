@@ -32,6 +32,8 @@ pub fn run() -> Result<()> {
     let db = Db::open_dir(&dir)?;
     let started = db::now();
     let (mut last_top, mut last_rollup, mut last_prune) = (0.0, db::now(), 0.0);
+    // The newest run that fix_namespaces looked at.
+    let mut named = 0;
     let mut prev_cpu: HashMap<i32, (u64, f64)> = HashMap::new();
     let mut known: HashMap<i32, Known> = HashMap::new();
     let mut footprints = sys::Footprints::default();
@@ -69,7 +71,9 @@ pub fn run() -> Result<()> {
             let _ = db.prune(cfg.retention_raw_hours, cfg.retention_rollup_days);
             // Hourly, so runs that an older version still files under a
             // wrong name move too.
-            let _ = db.fix_namespaces();
+            if let Ok((_, last)) = db.fix_namespaces(named) {
+                named = last;
+            }
         }
         let idle_since = q.last_activity().max(started);
         if waiting + running == 0 && q.viewers() == 0 && now - idle_since >= idle_exit {
@@ -110,7 +114,8 @@ fn others(
     now: f64,
     with_top: bool,
 ) -> Result<()> {
-    let procs = sys::list_procs();
+    let swept = sys::list_procs_stat();
+    let procs: Vec<sys::ProcInfo> = swept.iter().map(|(p, _)| *p).collect();
     let children = sys::children_map(&procs);
     let mut ours: HashSet<i32> = HashSet::new();
     for e in q.running() {
@@ -137,11 +142,11 @@ fn others(
     let mut rows: Vec<(String, i32, u64, f64)> = Vec::new();
     let mut seen: HashMap<i32, (u64, f64)> = HashMap::new();
     let mut by_group: HashMap<&str, Tally> = HashMap::new();
-    for p in &procs {
+    for (p, stat) in &swept {
         if ours.contains(&p.pid) {
             continue;
         }
-        let Some(s) = sys::proc_sample_with(p.pid, now, footprints) else { continue };
+        let Some(s) = sys::proc_sample_stat(p.pid, stat, now, footprints) else { continue };
         let cores = match prev_cpu.get(&p.pid) {
             Some((c, t)) if now > *t => s.cpu_ns.saturating_sub(*c) as f64 / 1e9 / (now - t),
             _ => 0.0,

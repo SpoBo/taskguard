@@ -2347,9 +2347,8 @@ mod tests {
     }
 
     /// Finished runs of `key` in `ns`, ended `ago` seconds ago. The dashboard
-    /// reads them at the next load, not 10 seconds later.
+    /// reads them at the next load.
     fn add_runs(app: &mut App, ns: &str, key: &str, n: usize, ago: f64) {
-        app.history = None;
         let db = Db::open_dir(&app.dir).unwrap();
         for _ in 0..n {
             let id = db.insert_run(&NewRun { ns, key, ..Default::default() }).unwrap();

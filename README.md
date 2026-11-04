@@ -858,6 +858,10 @@ the others write:
   `--apply`, prune only shows what it would do.
 - The database only gains tables and columns. A new column is nullable or has
   a default, so older versions can still insert rows.
+- Triggers count in the table `changes` the runs that are deleted, put back
+  or changed after their end, and the samples that are deleted. They fire for
+  the writes of every version, so `taskguard top` can read only the rows that
+  are new and still see every other change.
 - A job gets the same history key in every version.
 - `TASKGUARD_HELD` keeps its meaning, so a nested call never takes a second
   slot, whatever version the outer call was.

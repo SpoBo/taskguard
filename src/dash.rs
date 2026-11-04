@@ -18,7 +18,7 @@ pub struct Bucket {
 
 /// Raw samples cover the last 48 hours; longer ranges read the one-minute
 /// rollups.
-fn use_raw(from: f64) -> bool {
+pub fn use_raw(from: f64) -> bool {
     crate::db::now() - from <= 48.0 * 3600.0
 }
 
@@ -39,11 +39,11 @@ fn spread(t: f64, span: f64, from: f64, w: f64, n: usize, mut add: impl FnMut(us
 }
 
 /// Machine load per bucket, `n` buckets from `from` to `to`, as the time
-/// weighted average of the samples that cover each bucket.
+/// weighted average of the samples that cover each bucket. `top::store`
+/// keeps these series up to date from the new rows alone; these read them
+/// in full, to test it against.
+#[cfg(test)]
 pub fn machine_series(db: &Db, from: f64, to: f64, n: usize) -> Result<(Vec<Bucket>, usize, f64)> {
-    let w = (to - from) / n as f64;
-    let mut out: Vec<Bucket> = (0..n).map(|i| Bucket { t: from + w * i as f64, ..Default::default() }).collect();
-    let mut cover = vec![0.0f64; n];
     let (rows, span): (Vec<(f64, f64, f64)>, f64) = if use_raw(from) {
         let mut s = db.conn.prepare_cached("SELECT ts, cpu_busy, mem_used_kb FROM machine_samples WHERE ts >= ?1 AND ts < ?2 + 60")?;
         let v = s
@@ -51,14 +51,38 @@ pub fn machine_series(db: &Db, from: f64, to: f64, n: usize) -> Result<(Vec<Buck
             .collect::<std::result::Result<_, _>>()?;
         (v, 2.0)
     } else {
-        let mut s = db
-            .conn
-            .prepare_cached("SELECT (minute + 1) * 60, cpu_avg, mem_avg_kb FROM machine_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2")?;
-        let v = s
-            .query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        (v, 60.0)
+        (machine_minutes(db, from, to)?, 60.0)
     };
+    let (ncpu, total) = machine_size(db);
+    Ok((machine_buckets(rows, span, from, to, n), ncpu, total))
+}
+
+/// The one-minute rollups from `from` to `to`: end of the minute, cores busy, memory.
+pub fn machine_minutes(db: &Db, from: f64, to: f64) -> Result<Vec<(f64, f64, f64)>> {
+    let mut s = db
+        .conn
+        .prepare_cached("SELECT (minute + 1) * 60, cpu_avg, mem_avg_kb FROM machine_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2")?;
+    let v = s
+        .query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
+/// The CPU count and the memory of the machine at its newest sample.
+pub fn machine_size(db: &Db) -> (usize, f64) {
+    let (ncpu, total): (i64, i64) = db
+        .conn
+        .query_row("SELECT ncpu, mem_total_kb FROM machine_samples ORDER BY ts DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap_or((crate::sys::ncpu() as i64, crate::sys::mem_total_kb() as i64));
+    (ncpu as usize, total as f64)
+}
+
+/// `machine_series` from samples already read: (time, cores busy, memory),
+/// each standing for the `span` seconds before it.
+pub fn machine_buckets(rows: impl IntoIterator<Item = (f64, f64, f64)>, span: f64, from: f64, to: f64, n: usize) -> Vec<Bucket> {
+    let w = (to - from) / n as f64;
+    let mut out: Vec<Bucket> = (0..n).map(|i| Bucket { t: from + w * i as f64, ..Default::default() }).collect();
+    let mut cover = vec![0.0f64; n];
     for (t, c, m) in rows {
         spread(t, span, from, w, n, |i, o| {
             out[i].cpu += c * o;
@@ -73,21 +97,14 @@ pub fn machine_series(db: &Db, from: f64, to: f64, n: usize) -> Result<(Vec<Buck
             b.has_data = true;
         }
     }
-    let (ncpu, total): (i64, i64) = db
-        .conn
-        .query_row("SELECT ncpu, mem_total_kb FROM machine_samples ORDER BY ts DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap_or((crate::sys::ncpu() as i64, crate::sys::mem_total_kb() as i64));
-    Ok((out, ncpu as usize, total as f64))
+    out
 }
 
 /// taskguard's own load per namespace per bucket: ns -> (cores, mem_kb) per
 /// bucket, time weighted the same way as the machine series.
+#[cfg(test)]
 pub fn ns_series(db: &Db, from: f64, to: f64, n: usize, sample_every: f64) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
-    let w = (to - from) / n as f64;
-    let mut out: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-    // (end of the covered interval, namespace, cores, memory, seconds covered)
-    type Row = (f64, String, f64, f64, f64);
-    let rows: Vec<Row> = if use_raw(from) {
+    let rows: Vec<Load> = if use_raw(from) {
         let mut s = db.conn.prepare_cached(
             "SELECT js.ts, r.ns, js.cores_used, js.mem_kb, coalesce(js.span_s, ?3) FROM job_samples js JOIN runs r ON r.id = js.run_id
              WHERE js.ts >= ?1 AND js.ts < ?2 + 60",
@@ -95,69 +112,100 @@ pub fn ns_series(db: &Db, from: f64, to: f64, n: usize, sample_every: f64) -> Re
         s.query_map(params![from, to, sample_every], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as f64, r.get(4)?)))?
             .collect::<std::result::Result<_, _>>()?
     } else {
-        let mut s = db.conn.prepare_cached(
-            "SELECT (minute + 1) * 60, ns, cores_avg, mem_avg_kb FROM ns_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2",
-        )?;
-        s.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?, r.get(3)?, 60.0)))?
-            .collect::<std::result::Result<_, _>>()?
+        ns_minutes(db, from, to)?
     };
-    for (t, ns, c, m, span) in rows {
-        let v = out.entry(ns).or_insert_with(|| vec![(0.0, 0.0); n]);
+    Ok(load_buckets(rows, from, to, n))
+}
+
+/// One reading of a namespace's or a group's load: the end of the interval
+/// it covers, its name, cores, memory, and the seconds it covers.
+pub type Load = (f64, String, f64, f64, f64);
+
+/// The one-minute rollups of the namespaces from `from` to `to`.
+pub fn ns_minutes(db: &Db, from: f64, to: f64) -> Result<Vec<Load>> {
+    let mut s = db
+        .conn
+        .prepare_cached("SELECT (minute + 1) * 60, ns, cores_avg, mem_avg_kb FROM ns_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2")?;
+    let v = s
+        .query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?, r.get(3)?, 60.0)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
+}
+
+/// The series of `ns_series` and `group_series` from readings already read.
+pub fn load_buckets<S: AsRef<str>>(
+    rows: impl IntoIterator<Item = (f64, S, f64, f64, f64)>,
+    from: f64,
+    to: f64,
+    n: usize,
+) -> BTreeMap<String, Vec<(f64, f64)>> {
+    let w = (to - from) / n as f64;
+    let mut out: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
+    for (t, name, c, m, span) in rows {
+        let name = name.as_ref();
+        if !out.contains_key(name) {
+            out.insert(name.to_string(), vec![(0.0, 0.0); n]);
+        }
+        let v = out.get_mut(name).expect("just inserted");
         spread(t, span, from, w, n, |i, o| {
             v[i].0 += c * o / w;
             v[i].1 += m * o / w;
         });
     }
-    Ok(out)
+    out
 }
 
 /// Per group of programs outside taskguard (agents, browsers, ...): cores and
 /// memory per bucket. Each reading stands for the recorder interval before it.
+#[cfg(test)]
 pub fn group_series(db: &Db, from: f64, to: f64, n: usize, every: f64) -> Result<BTreeMap<String, Vec<(f64, f64)>>> {
-    let w = (to - from) / n as f64;
-    let mut out: BTreeMap<String, Vec<(f64, f64)>> = BTreeMap::new();
-    type Row = (f64, String, f64, f64, f64);
-    let rows: Vec<Row> = if use_raw(from) {
+    let rows: Vec<Load> = if use_raw(from) {
         let mut s = db.conn.prepare_cached("SELECT ts, grp, cores, mem_kb FROM group_samples WHERE ts >= ?1 AND ts < ?2 + 60")?;
         s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? as f64, every)))?
             .collect::<std::result::Result<_, _>>()?
     } else {
-        let mut s = db.conn.prepare_cached(
-            "SELECT (minute + 1) * 60, grp, cores_avg, mem_avg_kb FROM group_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2",
-        )?;
-        s.query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?, r.get(3)?, 60.0)))?
-            .collect::<std::result::Result<_, _>>()?
+        group_minutes(db, from, to)?
     };
-    for (t, g, c, m, span) in rows {
-        let v = out.entry(g).or_insert_with(|| vec![(0.0, 0.0); n]);
-        spread(t, span, from, w, n, |i, o| {
-            v[i].0 += c * o / w;
-            v[i].1 += m * o / w;
-        });
-    }
-    Ok(out)
+    Ok(load_buckets(rows, from, to, n))
+}
+
+/// The one-minute rollups of the groups from `from` to `to`.
+pub fn group_minutes(db: &Db, from: f64, to: f64) -> Result<Vec<Load>> {
+    let mut s = db.conn.prepare_cached(
+        "SELECT (minute + 1) * 60, grp, cores_avg, mem_avg_kb FROM group_1m WHERE minute * 60 >= ?1 AND minute * 60 < ?2",
+    )?;
+    let v = s
+        .query_map(params![from, to], |r| Ok((r.get::<_, i64>(0)? as f64, r.get(1)?, r.get(2)?, r.get(3)?, 60.0)))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(v)
 }
 
 /// How many jobs waited in each bucket, and the most common main blocker.
+#[cfg(test)]
 pub fn waiting_series(db: &Db, from: f64, to: f64, n: usize) -> Result<Vec<(usize, String)>> {
-    let w = (to - from) / n as f64;
     let mut s = db.conn.prepare_cached("SELECT from_ts, to_ts, blocker FROM wait_spans WHERE to_ts >= ?1 AND from_ts < ?2")?;
     let spans: Vec<(f64, f64, String)> =
         s.query_map(params![from, to], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<std::result::Result<_, _>>()?;
-    Ok((0..n)
+    Ok(waiting_buckets(&spans, from, to, n))
+}
+
+/// `waiting_series` from wait spans already read: from, to, blocker.
+pub fn waiting_buckets<S: AsRef<str>>(spans: &[(f64, f64, S)], from: f64, to: f64, n: usize) -> Vec<(usize, String)> {
+    let w = (to - from) / n as f64;
+    (0..n)
         .map(|i| {
             let (a, b) = (from + w * i as f64, from + w * (i + 1) as f64);
             let mut by: BTreeMap<&str, usize> = BTreeMap::new();
-            for (f, t, bl) in &spans {
+            for (f, t, bl) in spans {
                 if *f < b && *t >= a {
-                    *by.entry(bl.as_str()).or_default() += 1;
+                    *by.entry(bl.as_ref()).or_default() += 1;
                 }
             }
             let total = by.values().sum();
             let main = by.iter().max_by_key(|(_, c)| **c).map(|(k, _)| k.to_string()).unwrap_or_default();
             (total, main)
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -331,7 +379,7 @@ pub fn adjustment_text(kind: &str, old: Option<f64>, new: Option<f64>) -> String
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrendRow {
     pub key: String,
     pub ns: String,
@@ -352,36 +400,56 @@ impl TrendRow {
 
 pub fn trends(db: &Db, n: usize) -> Result<Vec<TrendRow>> {
     let mut s = db.conn.prepare_cached(
-        "SELECT key, ns, cores_wanted, peak_mem_kb, ended_at - started_at FROM runs
-         WHERE ended_at IS NOT NULL AND peak_mem_kb > 0 AND imported = 0 AND exit = 0 ORDER BY ended_at",
+        "SELECT key, ns, cores_wanted, peak_mem_kb, ended_at - started_at, ended_at, id FROM runs
+         WHERE ended_at IS NOT NULL AND peak_mem_kb > 0 AND imported = 0 AND exit = 0 ORDER BY ended_at, id",
     )?;
-    let mut by: BTreeMap<String, TrendRow> = BTreeMap::new();
+    let mut by: BTreeMap<String, Vec<TrendRun>> = BTreeMap::new();
     for r in s.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<f64>>(2)?, r.get::<_, i64>(3)?, r.get::<_, Option<f64>>(4)?))
+        let run = TrendRun { ended_at: r.get(5)?, id: r.get(6)?, ns: r.get(1)?, cores: r.get(2)?, mem_kb: r.get(3)?, dur: r.get(4)? };
+        Ok((r.get::<_, String>(0)?, run))
     })? {
-        let (k, ns, c, m, d) = r?;
-        let e = by.entry(k.clone()).or_insert_with(|| TrendRow { key: k, ns, ..Default::default() });
-        e.runs += 1;
-        if let Some(c) = c {
-            e.spark_cpu.push(c);
+        let (k, run) = r?;
+        by.entry(k).or_default().push(run);
+    }
+    let mut v: Vec<TrendRow> = by.iter().filter_map(|(k, runs)| trend_row(k, runs, n)).collect();
+    sort_trends(&mut v);
+    Ok(v)
+}
+
+/// One finished run that counts for the trends.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrendRun {
+    pub ended_at: f64,
+    pub id: i64,
+    pub ns: String,
+    /// Cores wanted.
+    pub cores: Option<f64>,
+    pub mem_kb: i64,
+    pub dur: Option<f64>,
+}
+
+/// The trend of one key from its runs, oldest first, over the last `n`
+/// runs. None when nothing about it changed enough to show.
+pub fn trend_row(key: &str, runs: &[TrendRun], n: usize) -> Option<TrendRow> {
+    let mut t = TrendRow { key: key.to_string(), ns: runs.first()?.ns.clone(), runs: runs.len(), ..Default::default() };
+    for r in runs {
+        if let Some(c) = r.cores {
+            t.spark_cpu.push(c);
         }
-        e.spark_mem.push(m as f64);
-        if let Some(d) = d {
-            e.spark_dur.push(d);
+        t.spark_mem.push(r.mem_kb as f64);
+        if let Some(d) = r.dur {
+            t.spark_dur.push(d);
         }
     }
-    let mut v: Vec<TrendRow> = by
-        .into_values()
-        .map(|mut t| {
-            t.cpu = insight::trend(&t.spark_cpu, n);
-            t.mem = insight::trend(&t.spark_mem, n);
-            t.dur = insight::trend(&t.spark_dur, n);
-            t
-        })
-        .filter(|t| t.cpu.is_some() || t.mem.is_some() || t.dur.is_some())
-        .collect();
+    t.cpu = insight::trend(&t.spark_cpu, n);
+    t.mem = insight::trend(&t.spark_mem, n);
+    t.dur = insight::trend(&t.spark_dur, n);
+    (t.cpu.is_some() || t.mem.is_some() || t.dur.is_some()).then_some(t)
+}
+
+/// The biggest change first.
+pub fn sort_trends(v: &mut [TrendRow]) {
     v.sort_by(|a, b| b.biggest().total_cmp(&a.biggest()));
-    Ok(v)
 }
 
 pub fn trend_text(t: &TrendRow) -> String {
@@ -414,13 +482,34 @@ pub fn warnings(db: &Db, since: f64, cpu_max: f64, mem_max: f64) -> Result<Vec<W
 
 /// `warnings`, with the `trends` the caller already has.
 pub fn warnings_with(db: &Db, since: f64, cpu_max: f64, mem_max: f64, trends: &[TrendRow]) -> Result<Vec<Warning>> {
+    let (mut out, _) = stored_warnings(db, since, cpu_max, mem_max)?;
+    out.extend(trend_warnings(trends, crate::db::now()));
+    out.sort_by(|a, b| b.ts.total_cmp(&a.ts));
+    Ok(out)
+}
+
+/// The warnings about runs that are growing, dated `now`.
+pub fn trend_warnings(trends: &[TrendRow], now: f64) -> Vec<Warning> {
+    trends
+        .iter()
+        .filter(|t| t.biggest() >= 50.0)
+        .map(|t| Warning { ts: now, kind: "trend", key: t.key.clone(), title: format!("growing: {}", t.key), lines: vec![trend_text(t)] })
+        .collect()
+}
+
+/// The warnings that come from the database, in no order, and the oldest
+/// moment they were read from: they change when that moment leaves the
+/// window, or when the runs or the adjustments change.
+pub fn stored_warnings(db: &Db, since: f64, cpu_max: f64, mem_max: f64) -> Result<(Vec<Warning>, f64)> {
     let mut out = Vec::new();
     let adj = adjustments(db, None, since)?;
+    let mut oldest = adj.iter().map(|a| a.ts).fold(f64::INFINITY, f64::min);
     let mut s = db
         .conn
         .prepare_cached(&format!("SELECT {RUN_COLS} FROM runs WHERE starved IS NOT NULL AND ended_at >= ?1 ORDER BY ended_at DESC"))?;
     let starved: Vec<RunRow> = s.query_map([since], run_row)?.collect::<std::result::Result<_, _>>()?;
     for r in starved {
+        oldest = oldest.min(r.ended_at);
         let mut lines = r.starved_detail.clone();
         if let Some(a) = adj.iter().find(|a| a.key == r.key && a.kind != "suggest_min") {
             lines.push(format!("taskguard changed: {}", adjustment_text(&a.kind, a.old, a.new)));
@@ -457,29 +546,20 @@ pub fn warnings_with(db: &Db, since: f64, cpu_max: f64, mem_max: f64, trends: &[
             ],
         });
     }
-    for t in trends {
-        if t.biggest() < 50.0 {
-            continue;
-        }
-        out.push(Warning {
-            ts: crate::db::now(),
-            kind: "trend",
-            key: t.key.clone(),
-            title: format!("growing: {}", t.key),
-            lines: vec![trend_text(t)],
-        });
-    }
     // --now runs that pushed the machine over a limit while they ran. CROSS
     // JOIN keeps runs outside, so each run looks up its own samples by time;
     // the other way round read every machine sample (0.3 s at 87k samples).
+    // Grouped in the order of index runs_now: by id alone, the order of the
+    // table, it read every run.
     let mut s = db.conn.prepare_cached(
         "SELECT r.id, r.key, r.started_at, max(m.cpu_busy * 100.0 / m.ncpu), max(m.mem_used_kb * 100.0 / m.mem_total_kb)
          FROM runs r CROSS JOIN machine_samples m ON m.ts BETWEEN r.started_at AND coalesce(r.ended_at, r.started_at)
-         WHERE r.now = 1 AND r.started_at >= ?1 GROUP BY r.id",
+         WHERE r.now = 1 AND r.started_at >= ?1 GROUP BY r.started_at, r.id",
     )?;
     let rows: Vec<(i64, String, f64, f64, f64)> =
         s.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?.collect::<std::result::Result<_, _>>()?;
     for (_id, key, ts, cpu, mem) in rows {
+        oldest = oldest.min(ts);
         if cpu >= cpu_max || mem >= mem_max {
             out.push(Warning {
                 ts,
@@ -492,8 +572,7 @@ pub fn warnings_with(db: &Db, since: f64, cpu_max: f64, mem_max: f64, trends: &[
             });
         }
     }
-    out.sort_by(|a, b| b.ts.total_cmp(&a.ts));
-    Ok(out)
+    Ok((out, oldest))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -559,32 +638,34 @@ pub struct TaskRow {
     pub cpu: Option<f64>,
 }
 
-/// Every task with a finished run, newest first. One query: reading what
-/// each of thousands of keys learned would take a second.
-pub fn tasks(db: &Db) -> Result<Vec<TaskRow>> {
-    let mut s = db.conn.prepare_cached(
-        "WITH r AS (
-           SELECT key, ns, peak_mem_kb, coalesce(cores_used, cores_wanted) AS cores, exit, ended_at,
-                  row_number() OVER (PARTITION BY key ORDER BY ended_at DESC) AS rn
-           FROM runs WHERE ended_at IS NOT NULL)
-         SELECT key, max(CASE WHEN rn = 1 THEN ns END), count(*), max(ended_at), max(CASE WHEN rn = 1 THEN exit END),
-                max(CASE WHEN rn <= 10 THEN peak_mem_kb END), avg(CASE WHEN rn <= 10 THEN cores END)
-         FROM r GROUP BY key ORDER BY max(ended_at) DESC",
-    )?;
-    let rows = s
-        .query_map([], |r| {
-            Ok(TaskRow {
-                key: r.get(0)?,
-                ns: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                runs: r.get::<_, i64>(2)? as usize,
-                last_end: r.get(3)?,
-                last_exit: r.get(4)?,
-                mem_kb: r.get::<_, Option<i64>>(5)?.filter(|m| *m > 0).map(|m| m as u64),
-                cpu: r.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<_, _>>()?;
-    Ok(rows)
+/// One finished run as the Tasks view counts it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskRun {
+    pub ended_at: f64,
+    pub id: i64,
+    pub ns: String,
+    pub exit: Option<i64>,
+    pub peak_mem_kb: Option<i64>,
+    /// Cores used, or wanted where it was not measured.
+    pub cores: Option<f64>,
+}
+
+/// How many runs a task keeps for its memory and cores.
+pub const TASK_RUNS: usize = 10;
+
+/// The row of a task with `runs` finished runs, from its newest ones,
+/// newest first, at most TASK_RUNS.
+pub fn task_row(key: &str, runs: usize, newest: &[TaskRun]) -> TaskRow {
+    let cores: Vec<f64> = newest.iter().filter_map(|r| r.cores).collect();
+    TaskRow {
+        key: key.to_string(),
+        ns: newest.first().map(|r| r.ns.clone()).unwrap_or_default(),
+        runs,
+        last_end: newest.first().map_or(0.0, |r| r.ended_at),
+        last_exit: newest.first().and_then(|r| r.exit),
+        mem_kb: newest.iter().filter_map(|r| r.peak_mem_kb).max().filter(|m| *m > 0).map(|m| m as u64),
+        cpu: (!cores.is_empty()).then(|| cores.iter().sum::<f64>() / cores.len() as f64),
+    }
 }
 
 /// One row per key for `taskguard history`.

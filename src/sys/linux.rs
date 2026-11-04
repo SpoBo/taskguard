@@ -88,6 +88,15 @@ pub fn proc_stopped(pid: i32) -> Option<bool> {
 }
 
 pub fn list_procs() -> Vec<ProcInfo> {
+    list_procs_stat().into_iter().map(|(p, _)| p).collect()
+}
+
+/// The fields of /proc/<pid>/stat after the name, as a sweep read them.
+pub struct Stat(Vec<String>);
+
+/// `list_procs` with the stat of each process, so a sweep that samples them
+/// after reads it once and not twice.
+pub fn list_procs_stat() -> Vec<(ProcInfo, Stat)> {
     let Ok(dir) = fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -95,7 +104,7 @@ pub fn list_procs() -> Vec<ProcInfo> {
         .filter_map(|pid| {
             // after the name: state ppid ...
             let f = stat_fields(pid)?;
-            Some(ProcInfo { pid, ppid: f.get(1)?.parse().ok()? })
+            Some((ProcInfo { pid, ppid: f.get(1)?.parse().ok()? }, Stat(f)))
         })
         .collect()
 }
@@ -139,10 +148,15 @@ pub fn proc_sample(pid: i32) -> Option<ProcSample> {
 /// `proc_sample` for a sweep over every process: the footprint comes from
 /// `footprints` while the last full reading still holds.
 pub fn proc_sample_with(pid: i32, now: f64, footprints: &mut super::Footprints) -> Option<ProcSample> {
-    let f = stat_fields(pid)?;
+    proc_sample_stat(pid, &Stat(stat_fields(pid)?), now, footprints)
+}
+
+/// `proc_sample_with` from the stat that `list_procs_stat` read.
+pub fn proc_sample_stat(pid: i32, stat: &Stat, now: f64, footprints: &mut super::Footprints) -> Option<ProcSample> {
+    let f = &stat.0;
     // starttime is field 22, rss (in pages) 24.
-    let kb = footprints.get(pid, stat_num(&f, 22), stat_num(&f, 24) * page_kb(), now, || footprint_kb(pid));
-    sample_from(pid, &f, kb)
+    let kb = footprints.get(pid, stat_num(f, 22), stat_num(f, 24) * page_kb(), now, || footprint_kb(pid));
+    sample_from(pid, f, kb)
 }
 
 fn sample_from(pid: i32, f: &[String], footprint_kb: u64) -> Option<ProcSample> {

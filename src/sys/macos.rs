@@ -223,6 +223,18 @@ pub fn proc_sample_with(pid: i32, _now: f64, _footprints: &mut super::Footprints
     proc_sample(pid)
 }
 
+/// Nothing: a sample here reads the process in one call.
+pub struct Stat;
+
+/// `list_procs`, in the shape of the Linux sweep that keeps each stat.
+pub fn list_procs_stat() -> Vec<(ProcInfo, Stat)> {
+    list_procs().into_iter().map(|p| (p, Stat)).collect()
+}
+
+pub fn proc_sample_stat(pid: i32, _stat: &Stat, now: f64, footprints: &mut super::Footprints) -> Option<ProcSample> {
+    proc_sample_with(pid, now, footprints)
+}
+
 pub fn proc_name(pid: i32) -> String {
     let mut buf = [0u8; 256];
     let n = unsafe { libc::proc_name(pid, buf.as_mut_ptr() as *mut c_void, buf.len() as u32) };

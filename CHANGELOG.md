@@ -10,6 +10,23 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- `taskguard top` no longer reads the whole history every second. It read
+  the full `runs` table (45 MB in a history of 87,000 runs) on each refresh,
+  and more every 10 to 30 seconds: about 60 MB/s while it was open, and 36 GB
+  in 10 minutes. Now it reads the history once and then only the rows that
+  are new since the last refresh, and the runs that were still going on. With
+  nothing new, a refresh reads about 16 database pages. What it shows does
+  not change. New indexes serve the queries that remain, and triggers count
+  in the new table `changes` what new rows do not show (a run pruned, put
+  back, or renamed, and samples deleted), so `top` reads that part again only
+  then. The first open of the database with this version builds the indexes
+  once.
+- The recorder reads each process's `/proc/<pid>/stat` once per sweep, not
+  twice, and its hourly fix of old namespace names looks only at the runs
+  that are new since the last one, not at the whole history.
+
 ## [0.14.0] - 2026-11-03
 
 ### Added
