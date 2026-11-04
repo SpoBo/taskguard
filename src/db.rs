@@ -23,6 +23,14 @@ pub struct Db {
 ///   `span_s` is, because `CREATE TABLE IF NOT EXISTS` skips existing tables.
 /// - Queries name their columns: no `SELECT *`.
 ///
+/// The triggers count in `changes` what a reader cannot see from the newest
+/// row id alone: a run deleted, put back under its old id, or changed after
+/// its end, and samples deleted. A reader that keeps rows between reads, as
+/// `taskguard top` does, reads again in full only when a count moved. They
+/// also count every update of a run, so it reads the runs that were going on
+/// again only after one. They fire for the writes of every version, older
+/// ones too.
+///
 /// `tests::schema_stays_compatible` checks the NOT NULL columns.
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS runs (
@@ -188,6 +196,33 @@ CREATE TABLE IF NOT EXISTS pruned_runs (
   prune_reason TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS pruned_runs_key ON pruned_runs(key);
+CREATE INDEX IF NOT EXISTS adjustments_ts ON adjustments(ts);
+CREATE INDEX IF NOT EXISTS runs_ns ON runs(ns, ended_at);
+CREATE INDEX IF NOT EXISTS runs_starved ON runs(ended_at) WHERE starved IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runs_now ON runs(started_at) WHERE now = 1;
+CREATE TABLE IF NOT EXISTS changes (
+  name TEXT PRIMARY KEY,
+  n INTEGER NOT NULL DEFAULT 0
+);
+CREATE TRIGGER IF NOT EXISTS runs_deleted AFTER DELETE ON runs
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'runs'; END;
+CREATE TRIGGER IF NOT EXISTS runs_restored AFTER INSERT ON runs WHEN NEW.id < (SELECT max(id) FROM runs)
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'runs'; END;
+CREATE TRIGGER IF NOT EXISTS runs_updated AFTER UPDATE ON runs
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'updates'; END;
+CREATE TRIGGER IF NOT EXISTS runs_changed AFTER UPDATE ON runs
+WHEN OLD.ended_at IS NOT NULL OR NEW.ns IS NOT OLD.ns OR NEW.key IS NOT OLD.key OR NEW.imported IS NOT OLD.imported
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'runs'; END;
+CREATE TRIGGER IF NOT EXISTS machine_samples_deleted AFTER DELETE ON machine_samples
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'samples'; END;
+CREATE TRIGGER IF NOT EXISTS job_samples_deleted AFTER DELETE ON job_samples
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'samples'; END;
+CREATE TRIGGER IF NOT EXISTS group_samples_deleted AFTER DELETE ON group_samples
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'samples'; END;
+CREATE TRIGGER IF NOT EXISTS wait_spans_deleted AFTER DELETE ON wait_spans
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'samples'; END;
+CREATE TRIGGER IF NOT EXISTS adjustments_deleted AFTER DELETE ON adjustments
+BEGIN UPDATE changes SET n = n + 1 WHERE name = 'runs'; END;
 "#;
 
 /// The columns `prune` moves from `runs` to `pruned_runs` and back. A column
@@ -600,6 +635,13 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Seeded once, and not on every open: an INSERT takes the write lock.
+        let seeded: i64 = conn.query_row("SELECT count(*) FROM changes", [], |r| r.get(0))?;
+        if seeded < 3 {
+            for name in ["runs", "samples", "updates"] {
+                conn.execute("INSERT OR IGNORE INTO changes (name) VALUES (?1)", [name])?;
+            }
+        }
         // Databases made before a sample said how many seconds it covers.
         let has_span: bool = conn.prepare("SELECT 1 FROM pragma_table_info('job_samples') WHERE name = 'span_s'")?.exists([])?;
         if !has_span {
@@ -639,6 +681,20 @@ impl Db {
             }
         }
         Ok(Db { conn })
+    }
+
+    /// How many database pages this connection asked for so far, from its
+    /// cache or from the file: what its queries read.
+    #[cfg(test)]
+    pub fn pages_read(&self) -> i64 {
+        let count = |op| {
+            let (mut cur, mut high) = (0, 0);
+            // SAFETY: the handle stays valid while `self.conn` lives, and the
+            // call only reads the connection's counters.
+            unsafe { rusqlite::ffi::sqlite3_db_status(self.conn.handle(), op, &mut cur, &mut high, 0) };
+            cur as i64
+        };
+        count(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_HIT) + count(rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS)
     }
 
     /// A long-lived job's memory need is the peak of its start-up, so a run
@@ -1310,10 +1366,14 @@ impl Db {
     }
 
     /// File runs that older versions put under a wrong namespace under the
-    /// right one (see `key::renamed_namespace`). Returns how many names moved.
-    pub fn fix_namespaces(&self) -> Result<usize> {
-        let mut stmt = self.conn.prepare("SELECT ns, max(cwd) FROM runs WHERE cwd IS NOT NULL GROUP BY ns")?;
-        let names: Vec<(String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
+    /// right one (see `key::renamed_namespace`), of the runs past run id
+    /// `after`: the runs looked at before stay where they were put. Returns
+    /// how many names moved, and the newest run looked at.
+    pub fn fix_namespaces(&self, after: i64) -> Result<(usize, i64)> {
+        let last: i64 = self.conn.query_row("SELECT coalesce(max(id), 0) FROM runs", [], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare("SELECT ns, max(cwd) FROM runs WHERE id > ?1 AND id <= ?2 AND cwd IS NOT NULL GROUP BY ns")?;
+        let names: Vec<(String, String)> =
+            stmt.query_map([after, last], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<std::result::Result<_, _>>()?;
         let mut moved = 0;
         for (ns, cwd) in names {
             if let Some(right) = crate::key::renamed_namespace(Path::new(&cwd), &ns) {
@@ -1321,7 +1381,7 @@ impl Db {
                 moved += 1;
             }
         }
-        Ok(moved)
+        Ok((moved, last))
     }
 
     /// Move every run and every minute of load from one namespace to another.
@@ -1360,6 +1420,25 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespaces_are_fixed_for_new_runs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join(".no-mistakes/repos/8bebdfba2234.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        std::fs::write(bare.join("config"), "[remote \"origin\"]\n\turl = git@github.com:settlemint/dalp.git\n").unwrap();
+        let cwd = tmp.path().join(".no-mistakes/worktrees/8bebdfba2234/GONE/packages/api");
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let cwd = cwd.to_string_lossy();
+        let add = || db.insert_run(&NewRun { ns: "GONE", key: "k", cwd: &cwd, ..Default::default() }).unwrap();
+        let first = add();
+        assert_eq!(db.fix_namespaces(0).unwrap(), (1, first));
+        assert_eq!(db.fix_namespaces(first).unwrap(), (0, first), "nothing new, nothing read");
+        let second = add();
+        assert_eq!(db.fix_namespaces(first).unwrap(), (1, second));
+        let left: i64 = db.conn.query_row("SELECT count(*) FROM runs WHERE ns = 'GONE'", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 0);
+    }
 
     #[test]
     fn schema_stays_compatible() {
