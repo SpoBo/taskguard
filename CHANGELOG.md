@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-11-04
+
 ### Fixed
 
 - A running job's own `taskguard` process uses much less CPU on Linux. It
@@ -550,7 +552,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.14.2...HEAD
+[0.14.2]: https://github.com/SpoBo/taskguard/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/SpoBo/taskguard/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/SpoBo/taskguard/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/SpoBo/taskguard/compare/v0.12.0...v0.13.0
