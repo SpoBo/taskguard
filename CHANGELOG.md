@@ -17,8 +17,8 @@ and the versions follow [semver](https://semver.org).
   and more every 10 to 30 seconds: about 60 MB/s while it was open, and 36 GB
   in 10 minutes. Now it reads the history once and then only the rows that
   are new since the last refresh, and the runs that were still going on. With
-  nothing new, a refresh reads about 16 database pages. What it shows does
-  not change. New indexes serve the queries that remain, and triggers count
+  nothing new, a refresh reads about 50 database pages, not 21,000, and 10
+  minutes of `top` read 158 MB, not 36 GB. What it shows does not change. New indexes serve the queries that remain, and triggers count
   in the new table `changes` what new rows do not show (a run pruned, put
   back, or renamed, and samples deleted), so `top` reads that part again only
   then. The first open of the database with this version builds the indexes
