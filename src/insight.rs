@@ -3,7 +3,7 @@
 
 use crate::report::gb;
 use crate::sys::{self, ProcSample};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Seconds of the rolling window that "sustained" load is averaged over, so a
 /// short spike does not count.
@@ -31,6 +31,9 @@ pub struct Tracker {
     pub steady_peak_mem_kb: u64,
     /// A long-lived job's memory peak before it left its start-up.
     startup_peak_mem_kb: Option<u64>,
+    /// The tree's footprints between two full readings, as the recorder
+    /// keeps them for the whole machine.
+    pub footprints: sys::Footprints,
 }
 
 #[derive(Clone, Copy)]
@@ -62,14 +65,23 @@ impl Tracker {
         Tracker { last_ts: Some(t), first_ts: Some(t), ..Default::default() }
     }
 
-    /// Read the whole tree under `root` now, found in `procs`, a list of
-    /// processes the caller just read.
-    pub fn sample(&mut self, root: i32, ts: f64, procs: &[sys::ProcInfo]) -> Option<Reading> {
-        let tree = sys::descendants(root, &sys::children_map(procs));
+    /// Read the whole tree under `root` now, found in `swept`, the processes
+    /// and their stat that the caller just read.
+    ///
+    /// A footprint is read in full (on Linux, PSS from smaps_rollup, which
+    /// walks every page) at most once per `sys::FOOTPRINT_REUSE` seconds per
+    /// process, and again sooner when its resident size moves by more than a
+    /// quarter. In between it moves with the resident size. So the memory
+    /// peak can miss a change in shared pages for up to two minutes, and
+    /// growth of more than a quarter is read in full on the next sample.
+    pub fn sample(&mut self, root: i32, ts: f64, swept: &[(sys::ProcInfo, sys::Stat)]) -> Option<Reading> {
+        let procs: Vec<sys::ProcInfo> = swept.iter().map(|(p, _)| *p).collect();
+        let tree: HashSet<i32> = sys::descendants(root, &sys::children_map(&procs)).into_iter().collect();
+        self.footprints.retain(|pid| tree.contains(&pid));
         let mut cur: HashMap<i32, ProcSample> = HashMap::new();
-        for pid in tree {
-            if let Some(s) = sys::proc_sample(pid) {
-                cur.insert(pid, s);
+        for (p, stat) in swept.iter().filter(|(p, _)| tree.contains(&p.pid)) {
+            if let Some(s) = sys::proc_sample_stat(p.pid, stat, ts, &mut self.footprints) {
+                cur.insert(p.pid, s);
             }
         }
         self.add(cur, ts)
@@ -441,6 +453,56 @@ mod tests {
         t.add(two, 1000.0);
         t.add(at(2.0, 0.0, 10), 1002.0);
         assert_eq!(t.cpu_ns, 7_000_000_000);
+    }
+
+    /// What keeps a job's own samples cheap: PSS costs the kernel a walk over
+    /// every page, so a tree sampled every two seconds reads it in full only
+    /// when it is due again or the resident size moved by more than a quarter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sample_reads_footprints_in_full_only_when_due_or_moved() {
+        use std::io::Write;
+        let mut child = std::process::Command::new("bash")
+            .args(["-c", "read; printf -v s '%*s' 64000000 ''; read"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        // Resident pages, the second field of statm.
+        let rss = || {
+            let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).unwrap_or_default();
+            statm.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pause = || {
+            assert!(std::time::Instant::now() < deadline, "bash did not settle or grow");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Settled: bash started and waits on its first read.
+        let mut last = 0;
+        while sys::proc_name(pid) != "bash" || rss() != last {
+            last = rss();
+            pause();
+        }
+        let mut t = Tracker::default();
+        let now = crate::db::now();
+        let first = t.sample(pid, now, &sys::list_procs_stat()).unwrap();
+        assert_eq!(t.footprints.reads, 1);
+        t.sample(pid, now + 2.0, &sys::list_procs_stat()).unwrap();
+        assert_eq!(t.footprints.reads, 1, "within the window, nothing is read again");
+        let before = rss();
+        writeln!(child.stdin.as_mut().unwrap()).unwrap();
+        // 64 MB more, in 4 kB pages.
+        while rss() < before + 15_000 {
+            pause();
+        }
+        let grown = t.sample(pid, now + 4.0, &sys::list_procs_stat()).unwrap();
+        assert_eq!(t.footprints.reads, 2, "a move of more than a quarter is read in full");
+        assert!(grown.mem_kb > first.mem_kb + 30_000, "{} then {}", first.mem_kb, grown.mem_kb);
+        t.sample(pid, now + 4.0 + sys::FOOTPRINT_REUSE, &sys::list_procs_stat()).unwrap();
+        assert_eq!(t.footprints.reads, 3, "due again");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn facts() -> RunFacts {

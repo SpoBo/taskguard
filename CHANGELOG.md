@@ -10,6 +10,19 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Fixed
+
+- A running job's own `taskguard` process uses much less CPU on Linux. It
+  read the PSS of every process in the job's tree from
+  `/proc/<pid>/smaps_rollup` on each sample, every 2 seconds, and the kernel
+  walks every page for that: an idle dev stack cost 3 to 4% of a core. Now
+  it keeps the footprints between samples, as the recorder does: a process's
+  PSS is read in full at most once every 2 minutes, and again on the next
+  sample when its resident size moves by more than a quarter. In between, the
+  footprint moves with the resident size. So a job's memory peak can miss a
+  change in shared pages for up to 2 minutes, and large growth still shows on
+  the next sample.
+
 ## [0.14.1] - 2026-11-04
 
 ### Fixed

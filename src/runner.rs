@@ -906,7 +906,8 @@ pub fn run(mut o: Opts) -> Result<i32> {
             // it behind the back of whoever paused it.
             // One list of processes for this round: reading /proc is the
             // cost of a sample on a busy machine.
-            let procs = sys::list_procs();
+            let swept = sys::list_procs_stat();
+            let procs: Vec<sys::ProcInfo> = swept.iter().map(|(p, _)| *p).collect();
             match (outside_stopped(child_pid, &procs), me.paused_since.is_some()) {
                 (Some(true), false) => {
                     pause_cmd(&q, &mut me, now, true);
@@ -946,7 +947,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
                 let _ = q.write(&q.run_path(me_pid), &me);
                 say(&format!("expected {} - the work its history suggested did not come in time; it no longer books room for it", me.key));
             }
-            if let Some(r) = tracker.sample(child_pid, now, &procs) {
+            if let Some(r) = tracker.sample(child_pid, now, &swept) {
                 me.live_cpu = r.used;
                 me.live_mem_kb = r.mem_kb;
                 if r.mem_kb > seen_peak_kb + seen_peak_kb / 10 {
