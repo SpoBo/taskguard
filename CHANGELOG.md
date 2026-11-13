@@ -10,6 +10,8 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-13
+
 ### Changed
 
 - Short jobs pass CPU pressure. A job that usually ends within
@@ -569,7 +571,8 @@ and the versions follow [semver](https://semver.org).
   needs, and starts it when the machine has room for it.
 - Prebuilt binaries for macOS and Linux on each version tag.
 
-[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.14.2...HEAD
+[Unreleased]: https://github.com/SpoBo/taskguard/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/SpoBo/taskguard/compare/v0.14.2...v0.15.0
 [0.14.2]: https://github.com/SpoBo/taskguard/compare/v0.14.1...v0.14.2
 [0.14.1]: https://github.com/SpoBo/taskguard/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/SpoBo/taskguard/compare/v0.13.0...v0.14.0
