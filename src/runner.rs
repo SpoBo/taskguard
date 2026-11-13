@@ -242,6 +242,79 @@ fn pipeline_of() -> Option<(String, i32)> {
     })
 }
 
+/// Shells whose `-c` script a job may be the first command of.
+const SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ash", "ksh"];
+
+/// Is this process the first command of the shell script its parent runs,
+/// with more commands after it that do not go through taskguard? Then CPU
+/// pressure holds it even when it is short: the pressure stands for the rest
+/// of the chain too (`Entry::chain_head`).
+fn chain_head() -> bool {
+    let me = std::env::args().next().unwrap_or_default();
+    sys::proc_args(std::os::unix::process::parent_id() as i32).is_some_and(|p| heads_chain(&p, base_name(&me)))
+}
+
+fn base_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// `parent` is the parent's command line, `me` the name this process was
+/// started by: `sh -c "taskguard tsc && eslint ."` heads a chain; `sh -c
+/// "taskguard tsc && taskguard eslint ."` does not, nor does `sh -c
+/// "taskguard sh -c 'tsc && eslint .'"`.
+fn heads_chain(parent: &[String], me: &str) -> bool {
+    let Some(shell) = parent.first() else { return false };
+    if !SHELLS.contains(&base_name(shell).trim_start_matches('-')) {
+        return false;
+    }
+    // `-c`, also among other flags (`-ec`, `-lc`).
+    let Some(i) = parent.iter().skip(1).position(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c')) else {
+        return false;
+    };
+    let Some(script) = parent.get(i + 2) else { return false };
+    let ours = |c: &String| {
+        let first = c.split_whitespace().find(|w| !w.contains('=')).map(|w| base_name(w.trim_matches(['\'', '"'])));
+        first.is_some_and(|w| w == me || w == "taskguard")
+    };
+    let commands = shell_commands(script);
+    commands.len() > 1 && ours(&commands[0]) && !commands[1..].iter().all(ours)
+}
+
+/// The commands of a shell script, split at `&&`, `||`, `;`, `|`, `&` and
+/// new lines outside quotes. Redirections such as `2>&1` stay whole.
+fn shell_commands(script: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut quote: Option<char> = None;
+    let mut prev = ' ';
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        let cur = out.last_mut().expect("never empty");
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (None, '\'' | '"') => quote = Some(c),
+            (q, '\\') if q != Some('\'') => {
+                cur.push(c);
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                prev = c;
+                continue;
+            }
+            (None, '&') if prev == '>' || prev == '<' || chars.peek() == Some(&'>') => {}
+            (None, ';' | '&' | '|' | '\n') => {
+                chars.next_if(|n| *n == c);
+                out.push(String::new());
+                prev = c;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        prev = c;
+    }
+    out.into_iter().map(|c| c.trim().to_string()).filter(|c| !c.is_empty()).collect()
+}
+
 /// The `name` of the package the job runs for: the package.json the package
 /// manager names (`npm_package_json`), else the one in the working directory.
 fn package_name(cwd: &Path) -> Option<String> {
@@ -561,6 +634,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
         me.pipeline_since = Some(q.pipeline_since(&id, pid, t0));
         me.pipeline = Some(id);
     }
+    me.chain_head = !o.now && chain_head();
     {
         let _g = q.lock()?;
         me.ticket = q.next_ticket()?;
@@ -578,6 +652,7 @@ pub fn run(mut o: Opts) -> Result<i32> {
     } else {
         let mut announced = false;
         let mut advised = false;
+        let mut chain_warned = false;
         let mut last_line = t0;
         let mut span: Option<(String, String, f64)> = None;
         let mut started_by_hand = false;
@@ -773,6 +848,20 @@ pub fn run(mut o: Opts) -> Result<i32> {
             if !announced {
                 announced = true;
                 lines.queued(&me, learned.runs, o.timeout);
+            }
+            // A short job that CPU pressure holds only for heading a chain
+            // would start if the whole chain were wrapped.
+            if me.chain_head
+                && !chain_warned
+                && !o.quiet
+                && queue::short(&limits, &me)
+                && matches!(report::main_blocker(&decision), Some(queue::Blocker::Psi { kind: machine::Psi::Cpu, .. }))
+            {
+                chain_warned = true;
+                say(&format!(
+                    "warning {} - CPU pressure holds it: it is the first command of a shell chain whose rest taskguard does not see; wrap the whole chain (taskguard sh -c '... && ...')",
+                    me.key
+                ));
             }
             // A job that cannot fit says so once it is clear, and again with
             // each status line, with what an agent can do about it.
@@ -1434,6 +1523,31 @@ mod tests {
         // Stricter settings, or later than the window, infer nothing.
         assert!(infer(&Config { infer_work_min: 4, ..Config::default() }).is_empty());
         assert!(infer(&Config { infer_work_within: 300, ..Config::default() }).is_empty());
+    }
+
+    #[test]
+    fn a_job_heads_a_chain_when_unwrapped_commands_follow_it_in_its_parent_shell() {
+        let heads = |argv: &[&str]| heads_chain(&argv.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "taskguard");
+        assert!(heads(&["sh", "-c", "taskguard tsc && eslint ."]));
+        assert!(heads(&["/bin/bash", "-ec", "taskguard tsc; eslint ."]));
+        assert!(heads(&["sh", "-c", "CI=1 /usr/local/bin/taskguard tsc --noEmit || echo failed"]));
+        assert!(heads(&["sh", "-c", "taskguard tsc | tee log"]));
+        assert!(heads(&["sh", "-c", "taskguard tsc\neslint ."]));
+        assert!(heads(&["sh", "-c", "'/opt/bin/taskguard' tsc && eslint ."]));
+        // One command, a redirection, or a chain wrapped whole or call by call.
+        assert!(!heads(&["sh", "-c", "taskguard tsc"]));
+        assert!(!heads(&["sh", "-c", "taskguard tsc 2>&1"]));
+        assert!(!heads(&["sh", "-c", "taskguard sh -c 'tsc && eslint .'"]));
+        assert!(!heads(&["sh", "-c", "taskguard tsc && taskguard eslint ."]));
+        assert!(!heads(&["sh", "-c", "taskguard tsc --filter 'a && b'"]));
+        // Not the first command, not a shell, or no script.
+        assert!(!heads(&["sh", "-c", "cd web && taskguard tsc"]));
+        assert!(!heads(&["turbo", "run", "lint"]));
+        assert!(!heads(&["zsh", "-l"]));
+        assert!(!heads(&[]));
+        // Started by another name, as a shim.
+        let argv: Vec<String> = ["sh", "-c", "tsc && eslint ."].iter().map(|s| s.to_string()).collect();
+        assert!(heads_chain(&argv, "tsc"));
     }
 
     #[test]

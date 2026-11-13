@@ -141,6 +141,23 @@ below).
   time over 1.5 times the cores from 288 s to none; programs outside
   taskguard ran 1.20 times slower instead of 1.44, and the work ended 10%
   later. On the 10-second average alone the peak load stayed at 50.
+- **Short jobs pass CPU pressure, two at a time.** A job that usually ends
+  within 5 seconds (`cpu_min_duration`) is over before it adds much to the
+  wait for a core, so CPU pressure does not hold it back: a `bun install` of
+  one second waited five hours over four days behind it, and short jobs made
+  41% of the waiting time in DALP's worktrees. It still has to fit
+  `cpu_max` and memory, and IO pressure still holds it. At most two short
+  jobs run past the pressure at once; a short job that runs past three times
+  its learned duration, and past `cpu_min_duration`, counts as heavy from
+  then on and leaves its place to the next. A job that CPU pressure holds no
+  longer holds the jobs behind it back, as a reserved job, a higher
+  priority or an older task-runner run would: it cannot start, so a short job
+  that can starts. One exception: a short job that is the first command of a
+  shell chain whose rest runs without taskguard (`taskguard tsc && eslint .`
+  in a package.json script) still waits on CPU pressure, because the
+  pressure stands for the rest of the chain too, which taskguard does not
+  see. taskguard finds that in its parent shell's command line and prints a
+  warning. Wrap the whole chain instead: `taskguard sh -c 'tsc && eslint .'`.
 - **Memory is read at its recent peak.** Admission uses the highest reading
   of the last 10 seconds, so a job never starts in a short dip.
 - **Short jobs skip the CPU reading, not the CPU budget.** A job that usually
@@ -913,6 +930,12 @@ could start, so after 10 seconds they mark it as stalled and pass it. Their
 recorder writes no pressure readings; a newer job then reads the pressure
 itself, without the readings of the last seconds, so it waits only while
 the reading is above its limit.
+
+Versions up to 0.14.2 hold short jobs on CPU pressure too, and their jobs
+that pressure holds still hold newer ones back as a reservation, a priority
+or an older run. A newer version sees a short job of theirs as one that
+could start, so after 10 seconds it marks it as stalled and passes it. They
+ignore `chain_head` in a newer entry: they hold that job on pressure anyway.
 
 Versions before 0.4.1 keep the line in ticket order; 0.4.1 and later order it
 by the age of a job's run first. With nothing running, an old and a new owner

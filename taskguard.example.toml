@@ -43,6 +43,10 @@ warn_admit = true     # macOS warning: jobs still start while memory fits and no
 # start all at once. Running jobs are never stopped. With nothing of taskguard's running but
 # long-lived jobs, the first in line still starts, so outside load cannot stop
 # the queue. Without PSI (macOS, kernels before 4.20) the gate is off.
+# Short jobs (under cpu_min_duration) pass CPU pressure, at most two at a
+# time, and a job the pressure holds does not hold them back. Not the first
+# command of a shell chain whose rest runs unwrapped ("taskguard tsc &&
+# eslint ."): the pressure stands for that rest too. Wrap the whole chain.
 cpu_pressure_max = 25 # percent: /proc/pressure/cpu "some avg10"; 0 = off
 io_pressure_max = 10  # percent: /proc/pressure/io "full avg10"; 0 = off
 psi_settle = 5        # seconds the pressure must stay under its limit (at most 60)
