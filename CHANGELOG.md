@@ -10,6 +10,23 @@ and the versions follow [semver](https://semver.org).
 
 ## [Unreleased]
 
+### Changed
+
+- Short jobs pass CPU pressure. A job that usually ends within
+  `cpu_min_duration` (5 s) no longer waits while CPU pressure is above
+  `cpu_pressure_max`: it still has to fit `cpu_max` and memory, and IO
+  pressure still holds it. At most two short jobs run past the pressure at
+  once, and one that runs past three times its learned duration counts as
+  heavy from then on. In DALP's worktrees short jobs made 41% of the waiting
+  time, and a one-second `bun install` waited five hours over four days.
+- A job that CPU or IO pressure holds no longer holds newer jobs back as a
+  reserved job, a higher priority or an older task-runner run: it cannot
+  start, so a job that can starts.
+- A short job that is the first command of a shell chain whose rest runs
+  without taskguard (`sh -c "taskguard tsc && eslint ."`) still waits on CPU
+  pressure, which stands for the rest of the chain too, and prints a warning
+  to wrap the whole chain: `taskguard sh -c 'tsc && eslint .'`.
+
 ## [0.14.2] - 2026-11-04
 
 ### Fixed

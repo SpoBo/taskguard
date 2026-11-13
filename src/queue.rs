@@ -103,6 +103,11 @@ pub struct Entry {
     /// Older versions leave both out, and their jobs never step aside.
     pub pipeline: Option<String>,
     pub pipeline_since: Option<f64>,
+    /// It is the first command of a shell chain whose rest runs without
+    /// taskguard (`sh -c "taskguard tsc && eslint ."`): CPU pressure holds
+    /// it even when it is short, for the rest of the chain. Older versions
+    /// leave it out.
+    pub chain_head: bool,
     /// A long-lived job (a dev stack) left its start-up phase then: from
     /// that moment its needs follow what it uses. Older versions leave it out.
     pub steady_since: Option<f64>,
@@ -1084,6 +1089,40 @@ pub fn psi_hold(m: &MachineSample, lim: &Limits, running: &[Entry], now: f64) ->
     )
 }
 
+/// The pressure that holds `job` back. CPU pressure does not hold a short
+/// job (`fast_lane`): it ends before it adds much to the wait for a core,
+/// and a `bun install` of one second waited five hours over four days
+/// behind it. IO pressure still does.
+pub fn psi_hold_for(m: &MachineSample, lim: &Limits, running: &[Entry], job: &Entry, now: f64) -> Option<Blocker> {
+    if fast_lane(lim, running, job, now) {
+        return psi_hold(m, &Limits { cpu_pressure_max: 0.0, ..*lim }, running, now);
+    }
+    psi_hold(m, lim, running, now)
+}
+
+/// May `job` start past CPU pressure? Only a short job, and only while
+/// fewer than `FAST_LANE` short jobs run, so a burst of them cannot add to
+/// the pressure. Not a job that heads a chain whose rest taskguard does not
+/// see (`Entry::chain_head`): the pressure stands for that rest too.
+pub fn fast_lane(lim: &Limits, running: &[Entry], job: &Entry, now: f64) -> bool {
+    short(lim, job) && !job.chain_head && running.iter().filter(|e| running_short(lim, e, now)).count() < FAST_LANE
+}
+
+/// Short jobs that may run past CPU pressure at once.
+pub const FAST_LANE: usize = 2;
+
+/// A running job that is short, and has not run far past its learned
+/// duration: `OVERRUN` times it, and at least `cpu_min_duration`. One that
+/// has is heavy from then on, and leaves the fast lane to the next.
+pub fn running_short(lim: &Limits, e: &Entry, now: f64) -> bool {
+    let ran = e.started_at.map_or(0.0, |s| now - s - e.paused_s);
+    short(lim, e) && e.est_dur_s.is_some_and(|d| ran <= (d * OVERRUN).max(lim.cpu_min_duration))
+}
+
+/// How far past its learned duration a short job runs before it counts as
+/// heavy (`running_short`).
+pub const OVERRUN: f64 = 3.0;
+
 /// Above this share of its limit, CPU or IO pressure lets one job start per
 /// reading (`psi_hold`).
 pub const PSI_PACE: f64 = 0.5;
@@ -1232,9 +1271,14 @@ pub fn decide(
     // nothing of taskguard's running but long-lived jobs, the rule above
     // still starts the first in line, so load outside taskguard cannot stop
     // the queue; it then runs one job at a time until the pressure eases.
-    if let Some(b) = psi_hold(m, lim, running, now) {
+    // A short job passes CPU pressure, a few at a time (`fast_lane`).
+    if let Some(b) = psi_hold_for(m, lim, running, me, now) {
         return Decision::Wait { blockers: vec![b] };
     }
+    // A short job may start while CPU pressure holds the jobs ahead of it.
+    // Those cannot start, so they hold it back no more than a job that
+    // waits for memory does.
+    let pressure_held = |w: &Entry| psi_hold_for(m, lim, running, w, now).is_some();
 
     let mut blockers = Vec::new();
     // With backfill on, a job ahead that goes first holds its turn only while
@@ -1289,6 +1333,7 @@ pub fn decide(
         w.bypassed_since.is_some()
             && now - w.queued_at > lim.max_bypass
             && !pool_full(w)
+            && !pressure_held(w)
             && may_hold(w)
             && (lim.max_backfill <= lim.max_bypass || holds(w))
     }) {
@@ -1296,8 +1341,9 @@ pub fn decide(
     }
     // A waiting job with a higher priority goes first, unless its own pool is
     // full. With backfill on, it holds them back as a reservation does.
-    if let Some(h) =
-        older.iter().find(|w| w.priority > me.priority && !pool_full(w) && may_hold(w) && (lim.max_backfill <= 0.0 || holds(w)))
+    if let Some(h) = older
+        .iter()
+        .find(|w| w.priority > me.priority && !pool_full(w) && !pressure_held(w) && may_hold(w) && (lim.max_backfill <= 0.0 || holds(w)))
     {
         blockers.push(Blocker::Priority { key: h.key.clone(), priority: h.priority });
     }
@@ -1305,7 +1351,9 @@ pub fn decide(
     // one run finishes before the next one takes the room: twenty runs that
     // each move a little finish later than twenty runs in turn. A job of the
     // older run that cannot start holds nothing back, so no room is wasted.
-    if let Some(o) = older.iter().find(|w| runs_before(w, me) && room.left(m, lim, running, w, now, unknown_starts).0.is_empty()) {
+    if let Some(o) =
+        older.iter().find(|w| runs_before(w, me) && !pressure_held(w) && room.left(m, lim, running, w, now, unknown_starts).0.is_empty())
+    {
         blockers.push(Blocker::Pipeline { key: o.key.clone(), pipeline: o.pipeline.clone().unwrap_or_default() });
     }
     let (mine, early) = room.left(m, lim, running, me, now, unknown_starts);
@@ -4001,6 +4049,124 @@ mod tests {
         paused[0].paused_by_hand = true;
         me.need_cpu = 2.0;
         assert!(blockers(decide(&machine(0.0, 8), &LIM, &paused, std::slice::from_ref(&me), &me, 1000.0, &[])).is_empty());
+    }
+
+    #[test]
+    fn a_short_job_starts_under_cpu_pressure() {
+        // Started after the reading: near the limit, the next job waits for one.
+        let running = Entry { started_at: Some(1000.5), ..job(1, "r", 1.0, 1) };
+        let r = std::slice::from_ref(&running);
+        let mut me = job(2, "bun install", 1.0, 1);
+        me.est_dur_s = Some(1.0);
+        let d = |m: &MachineSample, me: &Entry| decide(m, &LIM, r, std::slice::from_ref(me), me, 1001.0, &[]);
+        let near = psi(20.0, 0.0, 1000.0, &[]);
+        let above = psi(41.0, 0.0, 1000.0, &[]);
+        let settling = psi(12.0, 0.0, 1000.0, &[(998.0, 40.0, 0.0)]);
+        for m in [&near, &above, &settling] {
+            assert!(blockers(d(m, &me)).is_empty(), "the short job starts");
+        }
+        // IO pressure still holds it.
+        assert_eq!(blockers(d(&psi(41.0, 14.0, 1000.0, &[]), &me)), vec!["io_pressure"]);
+        // It still has to fit memory, and the cores promised to running jobs.
+        let big = Entry { need_mem_kb: 30 * GB, ..me.clone() };
+        assert_eq!(blockers(d(&above, &big)), vec!["memory"]);
+        let promised: Vec<Entry> = (1..=11).map(|i| job(i, &format!("lint{i}"), 1.0, 1)).collect();
+        let wide = Entry { need_cpu: 2.0, ..me.clone() };
+        assert_eq!(blockers(decide(&above, &LIM, &promised, std::slice::from_ref(&wide), &wide, 1001.0, &[])), vec!["cpu"]);
+        // A job that takes longer, or has no history, still waits.
+        for heavy in [Entry { est_dur_s: Some(30.0), ..me.clone() }, Entry { est_dur_s: None, ..me.clone() }] {
+            for m in [&near, &above, &settling] {
+                assert_eq!(blockers(d(m, &heavy)), vec!["cpu_pressure"]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_job_pressure_holds_holds_no_short_job_back() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        let above = psi(41.0, 0.0, 1000.0, &[]);
+        let calm = psi(0.0, 0.0, 1000.0, &[]);
+        let short = |e: Entry| Entry { est_dur_s: Some(1.0), ..e };
+        let heavy = |e: Entry| Entry { est_dur_s: Some(30.0), ..e };
+
+        // A newer run's short job starts while an older run's heavy job
+        // waits on pressure.
+        let newer = short(in_run(job(2, "b:install", 1.0, 1), "turbo:20", 900.0));
+        let older = heavy(in_run(job(3, "a:build", 1.0, 1), "turbo:10", 800.0));
+        let waiting = [newer.clone(), older.clone()];
+        assert!(blockers(decide(&above, &LIM, r, &waiting, &newer, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&above, &LIM, r, &waiting, &older, 1000.0, &[])), vec!["cpu_pressure"]);
+        // Without pressure the older run goes first, as before.
+        assert_eq!(blockers(decide(&calm, &LIM, r, &waiting, &newer, 1000.0, &[])), vec!["pipeline"]);
+        // A short job of the older run passes the pressure too: it still goes first.
+        let older_short = short(older.clone());
+        assert_eq!(blockers(decide(&above, &LIM, r, &[newer.clone(), older_short.clone()], &newer, 1000.0, &[])), vec!["pipeline"]);
+        // Unless pressure holds it as the head of a chain.
+        let older_head = Entry { chain_head: true, ..older_short };
+        assert!(blockers(decide(&above, &LIM, r, &[newer.clone(), older_head], &newer, 1000.0, &[])).is_empty());
+
+        // A reservation that pressure holds holds no short job back.
+        let mut passed = heavy(job(4, "e2e", 1.0, 1));
+        (passed.queued_at, passed.bypassed_since) = (700.0, Some(750.0));
+        let lint = short(job(5, "lint", 1.0, 1));
+        let waiting = [passed.clone(), lint.clone()];
+        assert!(blockers(decide(&above, &LIM, r, &waiting, &lint, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&calm, &LIM, r, &waiting, &lint, 1000.0, &[])), vec!["reserved"]);
+
+        // Nor does a higher priority that pressure holds.
+        let urgent = Entry { priority: 1, ..heavy(job(6, "build", 1.0, 1)) };
+        let waiting = [urgent.clone(), lint.clone()];
+        assert!(blockers(decide(&above, &LIM, r, &waiting, &lint, 1000.0, &[])).is_empty());
+        assert_eq!(blockers(decide(&calm, &LIM, r, &waiting, &lint, 1000.0, &[])), vec!["priority"]);
+    }
+
+    #[test]
+    fn a_short_job_that_heads_an_unwrapped_chain_waits_on_cpu_pressure() {
+        let running = job(1, "r", 1.0, 1);
+        let r = std::slice::from_ref(&running);
+        let me = Entry { est_dur_s: Some(1.0), chain_head: true, ..job(2, "tsc", 1.0, 1) };
+        let d = |m: &MachineSample| decide(m, &LIM, r, std::slice::from_ref(&me), &me, 1000.0, &[]);
+        assert_eq!(blockers(d(&psi(41.0, 0.0, 1000.0, &[]))), vec!["cpu_pressure"]);
+        assert!(blockers(d(&psi(0.0, 0.0, 1000.0, &[]))).is_empty());
+    }
+
+    #[test]
+    fn at_most_two_short_jobs_pass_cpu_pressure_at_once() {
+        let short = |ticket: u64, started: f64| Entry { est_dur_s: Some(1.0), started_at: Some(started), ..job(ticket, "lint", 1.0, 1) };
+        let me = Entry { est_dur_s: Some(1.0), ..job(9, "bun install", 1.0, 1) };
+        let d = |m: &MachineSample, running: &[Entry]| decide(m, &LIM, running, std::slice::from_ref(&me), &me, 1001.0, &[]);
+        let above = psi(41.0, 0.0, 1000.0, &[]);
+        let heavy = Entry { started_at: Some(900.0), ..job(1, "r", 1.0, 1) };
+        // One short job runs: there is room in the lane.
+        assert!(blockers(d(&above, &[heavy.clone(), short(2, 999.0)])).is_empty());
+        // Two run: the next waits for one to end.
+        let two = [heavy.clone(), short(2, 999.0), short(3, 999.5)];
+        assert_eq!(blockers(d(&above, &two)), vec!["cpu_pressure"]);
+        // Without pressure the lane has no limit.
+        assert!(blockers(d(&psi(0.0, 0.0, 1000.0, &[]), &two)).is_empty());
+        // A short job that ran far past its learned duration is heavy, and
+        // leaves its place in the lane to the next.
+        let overran = [heavy, short(2, 990.0), short(3, 999.5)];
+        assert!(blockers(d(&above, &overran)).is_empty());
+    }
+
+    #[test]
+    fn a_running_short_job_is_heavy_once_it_runs_far_past_its_learned_duration() {
+        let at = |dur: f64, now: f64| {
+            let e = Entry { est_dur_s: Some(dur), started_at: Some(1000.0), ..job(1, "lint", 1.0, 1) };
+            running_short(&LIM, &e, now)
+        };
+        // Three times its learned duration, and at least cpu_min_duration.
+        assert!(at(1.0, 1004.9));
+        assert!(!at(1.0, 1005.1));
+        assert!(at(4.0, 1011.9));
+        assert!(!at(4.0, 1012.1));
+        // Paused time does not count.
+        let paused = Entry { est_dur_s: Some(1.0), started_at: Some(1000.0), paused_s: 10.0, ..job(1, "lint", 1.0, 1) };
+        assert!(running_short(&LIM, &paused, 1014.0));
+        // A job that is not short never was.
+        assert!(!at(30.0, 1001.0));
     }
 
     fn in_run(mut e: Entry, pipeline: &str, since: f64) -> Entry {

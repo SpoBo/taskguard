@@ -23,8 +23,21 @@ impl Env {
 
     fn cmd(&self, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_taskguard"));
-        c.args(args)
-            .current_dir(&self.cwd)
+        c.args(args);
+        self.setup(&mut c);
+        c
+    }
+
+    /// A shell that runs `script`, as a package.json script does.
+    fn sh(&self, script: &str) -> Command {
+        let mut c = Command::new("sh");
+        c.args(["-c", script]);
+        self.setup(&mut c);
+        c
+    }
+
+    fn setup(&self, c: &mut Command) {
+        c.current_dir(&self.cwd)
             .env("TASKGUARD_DIR", &self.dir)
             .env("TASKGUARD_CONF", &self.conf)
             .env("TASKGUARD_RECORDER_IDLE_EXIT", "3")
@@ -35,7 +48,6 @@ impl Env {
             .env_remove("TASKGUARD_HELD")
             .env_remove("npm_lifecycle_event")
             .env_remove("npm_package_json");
-        c
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -561,6 +573,37 @@ fn cpu_pressure_holds_the_next_job_and_status_says_why() {
     hot(&mut status);
     let status = String::from_utf8_lossy(&status.output().unwrap().stdout).into_owned();
     assert!(status.contains("PSI     cpu some 60.0% (limit 25%)   io full 0.0% (limit 10%)   HOLDS new jobs: CPU pressure"), "{status}");
+    assert!(first.wait_with_output().unwrap().status.success());
+}
+
+#[test]
+fn a_short_job_passes_cpu_pressure_unless_it_heads_a_shell_chain() {
+    let e = Env::new("learn_stagger = 0\n");
+    let hot = |c: &mut Command| {
+        c.env("TASKGUARD_CPU_PRESSURE", "60");
+    };
+    // One run teaches it that `true` is short. With nothing running it
+    // starts whatever the pressure, and the recorder it starts reads 60%.
+    let mut learn = e.cmd(&["--", "true"]);
+    hot(&mut learn);
+    assert!(learn.output().unwrap().status.success());
+    let mut first = e.cmd(&["--", "sh", "-c", "touch a_started; sleep 4"]);
+    hot(&mut first);
+    let first = first.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    wait_for(&e.file("a_started"));
+    // The short job starts next to it, whatever the pressure.
+    let mut alone = e.cmd(&["--st", "-2", "--", "true"]);
+    hot(&mut alone);
+    let out = alone.output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    // As the first command of a chain whose rest runs unwrapped, it waits,
+    // and says to wrap the whole chain.
+    let bin = env!("CARGO_BIN_EXE_taskguard");
+    let mut chain = e.sh(&format!("'{bin}' --st -2 -- true && true"));
+    hot(&mut chain);
+    let out = chain.output().unwrap();
+    assert_eq!(out.status.code(), Some(124), "{}", stderr(&out));
+    assert!(stderr(&out).contains("wrap the whole chain"), "{}", stderr(&out));
     assert!(first.wait_with_output().unwrap().status.success());
 }
 
