@@ -123,8 +123,9 @@ below).
   pressure (`/proc/pressure/io` "full avg10") above `io_pressure_max` (10),
   no new job starts (short jobs aside, see below), until the reading has
   stayed at or under its limit for `psi_settle` (5) seconds, so a reading
-  that dips once does not let a burst in. Running jobs are never stopped. With nothing of taskguard's running
-  but long-lived jobs past their start-up, the rule for nothing running
+  that dips once does not let a burst in. Running jobs are never stopped.
+  With nothing of taskguard's running but long-lived jobs past their
+  start-up, the rule for nothing running
   still starts the first in line, so load outside taskguard cannot stop the
   queue; it then runs one job at a time until the pressure eases.
   The 10-second average lags a burst, so the gate reads the higher of it
@@ -149,8 +150,8 @@ below).
   `cpu_max` and memory, and IO pressure still holds it. At most two short
   jobs run past the pressure at once; a short job that runs past three times
   its learned duration, and past `cpu_min_duration`, counts as heavy from
-  then on and leaves its place to the next. A job that CPU pressure holds no
-  longer holds the jobs behind it back, as a reserved job, a higher
+  then on and leaves its place to the next. A job that CPU or IO pressure
+  holds no longer holds the jobs behind it back, as a reserved job, a higher
   priority or an older task-runner run would: it cannot start, so a short job
   that can starts. One exception: a short job that is the first command of a
   shell chain whose rest runs without taskguard (`taskguard tsc && eslint .`
